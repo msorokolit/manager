@@ -6,10 +6,11 @@ from typing import Iterator
 from docker.errors import APIError, ImageNotFound
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..auth import User, authenticate, require_admin
 from ..docker_client import get_client
+from .registries import get_registry_auth
 
 router = APIRouter(prefix="/api/images", tags=["images"])
 
@@ -17,6 +18,9 @@ router = APIRouter(prefix="/api/images", tags=["images"])
 class PullRequest(BaseModel):
     repository: str
     tag: str | None = None
+    registry: str | None = Field(
+        None, description="Name of a stored registry credential set to use"
+    )
 
 
 def _summary(img) -> dict:
@@ -54,17 +58,29 @@ def inspect_image(image_id: str, _: User = Depends(authenticate)) -> dict:
 
 @router.post("/pull")
 def pull(req: PullRequest, _: User = Depends(require_admin)) -> StreamingResponse:
+    auth_config = get_registry_auth(req.registry) if req.registry else None
+    if req.registry and auth_config is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown registry '{req.registry}'. Add it under Registries first.",
+        )
     client = get_client()
 
     def gen() -> Iterator[bytes]:
+        import json as _json
+
         try:
             api = client.api
-            for line in api.pull(req.repository, tag=req.tag, stream=True, decode=True):
-                import json as _json
-
+            for line in api.pull(
+                req.repository,
+                tag=req.tag,
+                stream=True,
+                decode=True,
+                auth_config=auth_config,
+            ):
                 yield (_json.dumps(line) + "\n").encode("utf-8")
         except APIError as exc:
-            yield f'{{"error": {exc!r}}}\n'.encode()
+            yield (_json.dumps({"error": str(exc)}) + "\n").encode("utf-8")
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 

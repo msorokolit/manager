@@ -1,7 +1,11 @@
-"""System-level endpoints: info, version, df, ping."""
+"""System-level endpoints: info, version, df, ping, events."""
 from __future__ import annotations
 
+import json
+from typing import Iterator
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from docker.errors import APIError
 
 from ..auth import User, authenticate
@@ -57,3 +61,26 @@ def events(limit: int = 25, _: User = Depends(authenticate)) -> list[dict]:
     except APIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return out
+
+
+@router.get("/events/stream")
+def events_stream(_: User = Depends(authenticate)) -> StreamingResponse:
+    """Live tail of docker events. NDJSON, one event per line."""
+    client = get_client()
+    stream = client.events(decode=True)
+
+    def gen() -> Iterator[bytes]:
+        try:
+            for ev in stream:
+                yield (json.dumps(ev) + "\n").encode("utf-8")
+        except GeneratorExit:
+            return
+        except Exception as exc:
+            yield (json.dumps({"error": str(exc)}) + "\n").encode("utf-8")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")

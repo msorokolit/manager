@@ -14,10 +14,25 @@ from ..docker_client import get_client
 router = APIRouter(prefix="/api/containers", tags=["containers"])
 
 
+class Ulimit(BaseModel):
+    name: str
+    soft: int | None = None
+    hard: int | None = None
+
+
+class HealthcheckSpec(BaseModel):
+    test: list[str] | str | None = None
+    interval: int | None = Field(None, description="Nanoseconds")
+    timeout: int | None = Field(None, description="Nanoseconds")
+    retries: int | None = None
+    start_period: int | None = Field(None, description="Nanoseconds")
+
+
 class CreateContainer(BaseModel):
     image: str = Field(..., description="Image reference, e.g. nginx:latest")
     name: str | None = None
     command: str | list[str] | None = None
+    entrypoint: str | list[str] | None = None
     env: dict[str, str] | None = None
     ports: dict[str, int | str | None] | None = Field(
         default=None,
@@ -29,9 +44,61 @@ class CreateContainer(BaseModel):
     )
     restart_policy: str | None = Field(default=None, description="no|always|unless-stopped|on-failure")
     network: str | None = None
+    network_mode: str | None = Field(None, description="bridge|host|none|container:<id>|<name>")
     labels: dict[str, str] | None = None
     detach: bool = True
     pull: bool = Field(default=False, description="Pull image before run")
+
+    user: str | None = None
+    working_dir: str | None = None
+    hostname: str | None = None
+    domainname: str | None = None
+    init: bool | None = None
+    stop_signal: str | None = None
+    stop_grace_period: int | None = Field(None, description="Seconds")
+    tty: bool | None = None
+    stdin_open: bool | None = None
+    auto_remove: bool | None = None
+    read_only: bool | None = None
+
+    dns: list[str] | None = None
+    dns_search: list[str] | None = None
+    dns_opt: list[str] | None = None
+    extra_hosts: dict[str, str] | None = Field(
+        None, description='Hostname -> IP, e.g. {"db": "10.0.0.5"}'
+    )
+    mac_address: str | None = None
+
+    tmpfs: dict[str, str] | None = Field(
+        None, description='Container path -> mount opts, e.g. {"/run": "size=64m"}'
+    )
+
+    cpus: float | None = Field(None, description='Equivalent of --cpus, e.g. 1.5')
+    cpu_shares: int | None = None
+    cpuset_cpus: str | None = Field(None, description='e.g. "0,2-3"')
+    mem_limit: str | int | None = Field(None, description='e.g. "512m" or bytes')
+    mem_reservation: str | int | None = None
+    memswap_limit: str | int | None = None
+    pids_limit: int | None = None
+    shm_size: str | int | None = None
+    ulimits: list[Ulimit] | None = None
+    devices: list[str] | None = Field(
+        None, description='Each: "/host/dev:/container/dev[:rwm]"'
+    )
+    gpus: int | str | None = Field(
+        None, description='-1 or "all" for every GPU; positive int for a count'
+    )
+
+    privileged: bool | None = None
+    cap_add: list[str] | None = None
+    cap_drop: list[str] | None = None
+    security_opt: list[str] | None = None
+    sysctls: dict[str, str] | None = None
+
+    healthcheck: HealthcheckSpec | None = None
+
+    log_driver: str | None = None
+    log_opts: dict[str, str] | None = None
 
 
 def _summary(c: Any) -> dict:
@@ -137,6 +204,37 @@ def container_stats(container_id: str, _: User = Depends(authenticate)) -> dict:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@router.get("/{container_id}/stats/stream")
+def container_stats_stream(
+    container_id: str, _: User = Depends(authenticate)
+) -> StreamingResponse:
+    import json
+
+    client = get_client()
+    try:
+        c = client.containers.get(container_id)
+    except NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    stream = c.stats(stream=True, decode=True)
+
+    def gen() -> Iterator[bytes]:
+        try:
+            for sample in stream:
+                yield (json.dumps(sample) + "\n").encode("utf-8")
+        except GeneratorExit:
+            return
+        except Exception as exc:
+            yield (json.dumps({"error": str(exc)}) + "\n").encode("utf-8")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
 def _action(container_id: str, action: str) -> dict:
     client = get_client()
     try:
@@ -198,37 +296,104 @@ def remove(
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+def _build_run_kwargs(req: CreateContainer) -> dict[str, Any]:
+    from docker.types import DeviceRequest, Healthcheck, LogConfig
+    from docker.types import Ulimit as DUlimit
+
+    k: dict[str, Any] = {"image": req.image, "detach": req.detach}
+
+    for src, dst in [
+        ("name", "name"),
+        ("command", "command"),
+        ("entrypoint", "entrypoint"),
+        ("env", "environment"),
+        ("ports", "ports"),
+        ("volumes", "volumes"),
+        ("network", "network"),
+        ("network_mode", "network_mode"),
+        ("labels", "labels"),
+        ("user", "user"),
+        ("working_dir", "working_dir"),
+        ("hostname", "hostname"),
+        ("domainname", "domainname"),
+        ("init", "init"),
+        ("stop_signal", "stop_signal"),
+        ("tty", "tty"),
+        ("stdin_open", "stdin_open"),
+        ("auto_remove", "auto_remove"),
+        ("read_only", "read_only"),
+        ("dns", "dns"),
+        ("dns_search", "dns_search"),
+        ("dns_opt", "dns_opt"),
+        ("extra_hosts", "extra_hosts"),
+        ("mac_address", "mac_address"),
+        ("tmpfs", "tmpfs"),
+        ("cpu_shares", "cpu_shares"),
+        ("cpuset_cpus", "cpuset_cpus"),
+        ("mem_limit", "mem_limit"),
+        ("mem_reservation", "mem_reservation"),
+        ("memswap_limit", "memswap_limit"),
+        ("pids_limit", "pids_limit"),
+        ("shm_size", "shm_size"),
+        ("devices", "devices"),
+        ("privileged", "privileged"),
+        ("cap_add", "cap_add"),
+        ("cap_drop", "cap_drop"),
+        ("security_opt", "security_opt"),
+        ("sysctls", "sysctls"),
+    ]:
+        v = getattr(req, src)
+        if v not in (None, [], {}, ""):
+            k[dst] = v
+
+    if req.restart_policy:
+        k["restart_policy"] = {"Name": req.restart_policy}
+    if req.stop_grace_period is not None:
+        k["stop_timeout"] = int(req.stop_grace_period)
+    if req.cpus is not None:
+        k["nano_cpus"] = int(float(req.cpus) * 1_000_000_000)
+    if req.ulimits:
+        k["ulimits"] = [
+            DUlimit(name=u.name, soft=u.soft, hard=u.hard) for u in req.ulimits
+        ]
+    if req.gpus not in (None, 0, ""):
+        count = -1 if str(req.gpus).lower() in ("all", "-1") else int(req.gpus)
+        k["device_requests"] = [
+            DeviceRequest(count=count, capabilities=[["gpu"]])
+        ]
+    if req.healthcheck:
+        hc: dict[str, Any] = {}
+        if req.healthcheck.test is not None:
+            hc["test"] = (
+                req.healthcheck.test
+                if isinstance(req.healthcheck.test, list)
+                else ["CMD-SHELL", req.healthcheck.test]
+            )
+        for f in ("interval", "timeout", "retries", "start_period"):
+            v = getattr(req.healthcheck, f)
+            if v is not None:
+                hc[f] = v
+        k["healthcheck"] = Healthcheck(**hc) if hc else None
+    if req.log_driver:
+        k["log_config"] = LogConfig(type=req.log_driver, config=req.log_opts or {})
+
+    return k
+
+
 @router.post("")
 def create_and_run(req: CreateContainer, _: User = Depends(require_admin)) -> dict:
     client = get_client()
     try:
         if req.pull:
             client.images.pull(req.image)
-
-        kwargs: dict[str, Any] = {
-            "image": req.image,
-            "detach": req.detach,
-        }
-        if req.name:
-            kwargs["name"] = req.name
-        if req.command:
-            kwargs["command"] = req.command
-        if req.env:
-            kwargs["environment"] = req.env
-        if req.ports:
-            kwargs["ports"] = req.ports
-        if req.volumes:
-            kwargs["volumes"] = req.volumes
-        if req.restart_policy:
-            kwargs["restart_policy"] = {"Name": req.restart_policy}
-        if req.network:
-            kwargs["network"] = req.network
-        if req.labels:
-            kwargs["labels"] = req.labels
-
+        kwargs = _build_run_kwargs(req)
         c = client.containers.run(**kwargs)
         if not req.detach:
-            return {"output": (c if isinstance(c, (bytes, str)) else b"").decode("utf-8", errors="replace")}
+            return {
+                "output": (c if isinstance(c, (bytes, str)) else b"").decode(
+                    "utf-8", errors="replace"
+                )
+            }
         c.reload()
         return _summary(c)
     except APIError as exc:

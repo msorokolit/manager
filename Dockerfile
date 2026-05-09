@@ -33,9 +33,12 @@ COPY frontend /app/frontend
 RUN mkdir -p /data/stacks
 
 ENV STATIC_DIR=/app/frontend \
+    DATA_DIR=/data \
     STACKS_DIR=/data/stacks \
+    REGISTRIES_FILE=/data/registries.json \
     COMPOSE_BIN=docker-compose \
     EXEC_DEFAULT_SHELL=/bin/sh \
+    BROWSER_IMAGE=python:3-alpine \
     ADMIN_USER=admin \
     ADMIN_PASSWORD=admin \
     ALLOW_DESTRUCTIVE=true

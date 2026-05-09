@@ -10,7 +10,17 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .config import settings
-from .routers import containers, exec as exec_router, images, networks, stacks, system, volumes
+from .routers import (
+    containers,
+    exec as exec_router,
+    images,
+    networks,
+    registries,
+    stacks,
+    system,
+    volume_browser,
+    volumes,
+)
 
 app = FastAPI(
     title="Docker Manager",
@@ -33,6 +43,8 @@ app.include_router(images.router)
 app.include_router(networks.router)
 app.include_router(volumes.router)
 app.include_router(stacks.router)
+app.include_router(registries.router)
+app.include_router(volume_browser.router)
 app.include_router(exec_router.router)
 
 
@@ -51,6 +63,8 @@ def public_config() -> dict:
         "compose_available": _shutil.which(settings.compose_bin) is not None,
         "stacks_dir": settings.stacks_dir,
         "exec_default_shell": settings.exec_default_shell,
+        "browser_image": settings.browser_image,
+        "registries_file": settings.registries_file,
     }
 
 

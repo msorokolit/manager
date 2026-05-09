@@ -19,6 +19,19 @@ class CreateNetwork(BaseModel):
     labels: dict[str, str] | None = None
 
 
+class ConnectRequest(BaseModel):
+    container: str
+    aliases: list[str] | None = None
+    ipv4_address: str | None = None
+    ipv6_address: str | None = None
+    links: list[str] | None = None
+
+
+class DisconnectRequest(BaseModel):
+    container: str
+    force: bool = False
+
+
 def _summary(n) -> dict:
     attrs = n.attrs or {}
     return {
@@ -83,5 +96,43 @@ def remove(network_id: str, _: User = Depends(require_admin)) -> dict:
 def prune(_: User = Depends(require_admin)) -> dict:
     try:
         return get_client().networks.prune()
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/{network_id}/connect")
+def connect_container(
+    network_id: str,
+    req: ConnectRequest,
+    _: User = Depends(require_admin),
+) -> dict:
+    try:
+        n = get_client().networks.get(network_id)
+        n.connect(
+            req.container,
+            aliases=req.aliases,
+            ipv4_address=req.ipv4_address,
+            ipv6_address=req.ipv6_address,
+            links=req.links,
+        )
+        return {"network": network_id, "container": req.container, "connected": True}
+    except NotFound:
+        raise HTTPException(status_code=404, detail="Network not found")
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/{network_id}/disconnect")
+def disconnect_container(
+    network_id: str,
+    req: DisconnectRequest,
+    _: User = Depends(require_admin),
+) -> dict:
+    try:
+        n = get_client().networks.get(network_id)
+        n.disconnect(req.container, force=req.force)
+        return {"network": network_id, "container": req.container, "disconnected": True}
+    except NotFound:
+        raise HTTPException(status_code=404, detail="Network not found")
     except APIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))

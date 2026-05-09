@@ -26,6 +26,9 @@ class Settings:
     stacks_dir: str
     compose_bin: str
     exec_default_shell: str
+    registries_file: str
+    browser_image: str
+    data_dir: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -46,6 +49,11 @@ class Settings:
             stacks_dir=os.getenv("STACKS_DIR", "/data/stacks"),
             compose_bin=os.getenv("COMPOSE_BIN", "docker-compose"),
             exec_default_shell=os.getenv("EXEC_DEFAULT_SHELL", "/bin/sh"),
+            data_dir=os.getenv("DATA_DIR", "/data"),
+            registries_file=os.getenv(
+                "REGISTRIES_FILE", os.getenv("DATA_DIR", "/data") + "/registries.json"
+            ),
+            browser_image=os.getenv("BROWSER_IMAGE", "python:3-alpine"),
         )
 
 

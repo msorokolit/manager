@@ -17,6 +17,8 @@
     { id: 'images', label: 'Images', icon: '🗂️' },
     { id: 'networks', label: 'Networks', icon: '🌐' },
     { id: 'volumes', label: 'Volumes', icon: '💾' },
+    { id: 'activity', label: 'Activity', icon: '📈' },
+    { id: 'registries', label: 'Registries', icon: '🔑' },
     { id: 'system', label: 'System', icon: '⚙️' },
   ];
 
@@ -603,11 +605,37 @@
     if (abortCtrl) abortCtrl.abort();
   }
 
+  function _section(title, openByDefault, html) {
+    return `
+      <details ${openByDefault ? 'open' : ''} class="rounded-lg border border-slate-800 bg-slate-900/40">
+        <summary class="cursor-pointer select-none px-4 py-2 text-xs font-semibold uppercase tracking-wider text-slate-300 hover:text-white">${escapeHtml(title)}</summary>
+        <div class="grid gap-3 md:grid-cols-2 px-4 pt-2 pb-4">${html}</div>
+      </details>`;
+  }
+  function _kvLines(text) {
+    const out = {};
+    for (const line of (text || '').split('\n').map(l => l.trim()).filter(Boolean)) {
+      const i = line.indexOf('=');
+      if (i > 0) out[line.slice(0, i)] = line.slice(i + 1);
+    }
+    return out;
+  }
+  function _list(text) {
+    return (text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  }
+  function _parseSize(s) {
+    if (!s) return null;
+    const m = String(s).trim().match(/^(\d+(?:\.\d+)?)\s*([kmgtKMGT]?)([bB]?)$/);
+    if (!m) return s;
+    return s;
+  }
+
   async function runContainerDialog() {
     const form = document.createElement('div');
+    form.className = 'space-y-3';
     form.innerHTML = `
-      <div class="grid gap-3 md:grid-cols-2">
-        <label class="block md:col-span-2"><span class="text-xs text-slate-400">Image *</span>
+      ${_section('Basic', true, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Image *</span>
           <input name="image" required placeholder="nginx:latest" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
         <label class="block"><span class="text-xs text-slate-400">Name</span>
           <input name="name" placeholder="(auto)" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
@@ -617,74 +645,237 @@
             <option value="unless-stopped">unless-stopped</option>
             <option value="always">always</option><option value="on-failure">on-failure</option>
           </select></label>
-        <label class="block md:col-span-2"><span class="text-xs text-slate-400">Command (optional)</span>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Command (overrides image CMD)</span>
           <input name="command" placeholder='e.g. "tail -f /dev/null"' class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
-        <label class="block md:col-span-2"><span class="text-xs text-slate-400">Port mappings (one per line: <span class="kbd">host:container/proto</span>)</span>
-          <textarea name="ports" rows="3" placeholder="8080:80/tcp&#10;8443:443/tcp" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
-        <label class="block md:col-span-2"><span class="text-xs text-slate-400">Environment (KEY=VALUE per line)</span>
-          <textarea name="env" rows="3" placeholder="POSTGRES_PASSWORD=secret&#10;TZ=UTC" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
-        <label class="block md:col-span-2"><span class="text-xs text-slate-400">Volumes (one per line: <span class="kbd">/host/path:/container/path[:ro]</span>)</span>
-          <textarea name="volumes" rows="2" placeholder="/var/data:/data&#10;myvolume:/var/lib/data" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
-        <label class="block"><span class="text-xs text-slate-400">Network</span>
-          <input name="network" placeholder="bridge" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
-        <label class="flex items-center gap-2 text-xs text-slate-300 mt-6">
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Entrypoint (overrides image ENTRYPOINT)</span>
+          <input name="entrypoint" placeholder='e.g. "/usr/local/bin/wrapper.sh"' class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="flex items-center gap-2 text-xs text-slate-300 mt-2 md:col-span-2">
           <input name="pull" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Pull image first
         </label>
-      </div>
-      <div id="run-error" class="hidden mt-3 rounded bg-rose-500/10 px-3 py-2 text-xs text-rose-300"></div>`;
+      `)}
+
+      ${_section('Networking', false, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Port mappings (one per line: <span class="kbd">host:container/proto</span>)</span>
+          <textarea name="ports" rows="3" placeholder="8080:80/tcp&#10;8443:443/tcp" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="block"><span class="text-xs text-slate-400">Network (name)</span>
+          <input name="network" placeholder="bridge" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Network mode</span>
+          <input name="network_mode" placeholder="(empty) | host | none | container:&lt;id&gt;" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Hostname</span>
+          <input name="hostname" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">MAC address</span>
+          <input name="mac_address" placeholder="02:42:ac:11:00:02" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">DNS servers (one per line)</span>
+          <textarea name="dns" rows="2" placeholder="1.1.1.1&#10;8.8.8.8" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="block"><span class="text-xs text-slate-400">DNS search domains (one per line)</span>
+          <textarea name="dns_search" rows="2" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Extra hosts (HOST=IP per line)</span>
+          <textarea name="extra_hosts" rows="2" placeholder="db=10.0.0.5&#10;cache=10.0.0.6" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+      `)}
+
+      ${_section('Storage', false, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Volumes (one per line: <span class="kbd">/host/path:/container/path[:ro]</span>)</span>
+          <textarea name="volumes" rows="3" placeholder="/var/data:/data&#10;myvolume:/var/lib/data" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">tmpfs mounts (PATH=opts per line, opts optional)</span>
+          <textarea name="tmpfs" rows="2" placeholder="/run=size=64m&#10;/tmp=" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="flex items-center gap-2 text-xs text-slate-300 md:col-span-2">
+          <input name="read_only" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Read-only root filesystem
+        </label>
+      `)}
+
+      ${_section('Environment & process', false, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Environment (KEY=VALUE per line)</span>
+          <textarea name="env" rows="3" placeholder="POSTGRES_PASSWORD=secret&#10;TZ=UTC" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="block"><span class="text-xs text-slate-400">User (uid[:gid] or name)</span>
+          <input name="user" placeholder="1000:1000" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Working directory</span>
+          <input name="working_dir" placeholder="/app" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Stop signal</span>
+          <input name="stop_signal" placeholder="SIGTERM" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Stop grace period (seconds)</span>
+          <input name="stop_grace_period" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input name="init" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Run an init process inside (--init)
+        </label>
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input name="tty" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Allocate TTY (-t)
+        </label>
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input name="stdin_open" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Keep STDIN open (-i)
+        </label>
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input name="auto_remove" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Auto-remove on exit (--rm)
+        </label>
+      `)}
+
+      ${_section('Resources', false, `
+        <label class="block"><span class="text-xs text-slate-400">CPUs (e.g. 1.5)</span>
+          <input name="cpus" type="number" step="0.1" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">CPU shares</span>
+          <input name="cpu_shares" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Cpuset CPUs</span>
+          <input name="cpuset_cpus" placeholder="0,2-3" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Memory limit</span>
+          <input name="mem_limit" placeholder="512m / 2g / bytes" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Memory reservation</span>
+          <input name="mem_reservation" placeholder="256m" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Memswap limit</span>
+          <input name="memswap_limit" placeholder="-1 to disable" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">PIDs limit</span>
+          <input name="pids_limit" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">SHM size</span>
+          <input name="shm_size" placeholder="64m" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">ulimits (NAME=soft[:hard] per line)</span>
+          <textarea name="ulimits" rows="2" placeholder="nofile=1024:4096&#10;nproc=512" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Devices (one per line: <span class="kbd">/host/dev:/container/dev[:rwm]</span>)</span>
+          <textarea name="devices" rows="2" placeholder="/dev/dri:/dev/dri" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="block"><span class="text-xs text-slate-400">GPUs</span>
+          <input name="gpus" placeholder='"all", "-1" or a count' class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+      `)}
+
+      ${_section('Security', false, `
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input name="privileged" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Privileged
+        </label>
+        <div></div>
+        <label class="block"><span class="text-xs text-slate-400">Capabilities to add (comma- or newline-separated)</span>
+          <textarea name="cap_add" rows="2" placeholder="NET_ADMIN&#10;SYS_PTRACE" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="block"><span class="text-xs text-slate-400">Capabilities to drop</span>
+          <textarea name="cap_drop" rows="2" placeholder="ALL" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">security_opt (one per line)</span>
+          <textarea name="security_opt" rows="2" placeholder="no-new-privileges:true&#10;seccomp=unconfined" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">sysctls (KEY=VALUE per line)</span>
+          <textarea name="sysctls" rows="2" placeholder="net.ipv4.ip_forward=1" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+      `)}
+
+      ${_section('Healthcheck override', false, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Test command (CMD-SHELL)</span>
+          <input name="hc_test" placeholder='e.g. "curl -f http://localhost/ || exit 1"' class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Interval (seconds)</span>
+          <input name="hc_interval" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Timeout (seconds)</span>
+          <input name="hc_timeout" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Retries</span>
+          <input name="hc_retries" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Start period (seconds)</span>
+          <input name="hc_start_period" type="number" min="0" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+      `)}
+
+      ${_section('Logging', false, `
+        <label class="block"><span class="text-xs text-slate-400">Log driver</span>
+          <select name="log_driver" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+            <option value="">(default)</option>
+            <option>json-file</option><option>local</option><option>journald</option>
+            <option>syslog</option><option>fluentd</option><option>gelf</option><option>awslogs</option>
+            <option>splunk</option><option>etwlogs</option><option>none</option>
+          </select></label>
+        <div></div>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Log driver options (KEY=VALUE per line)</span>
+          <textarea name="log_opts" rows="3" placeholder="max-size=10m&#10;max-file=3" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+      `)}
+
+      ${_section('Labels', false, `
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Labels (KEY=VALUE per line)</span>
+          <textarea name="labels" rows="3" placeholder="traefik.enable=true&#10;com.example.app=web" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
+      `)}
+
+      <div id="run-error" class="hidden rounded bg-rose-500/10 px-3 py-2 text-xs text-rose-300"></div>`;
 
     const created = await modal({
       title: 'Run a new container',
       body: form,
-      size: 'lg',
+      size: 'xl',
       actions: [
         { label: 'Cancel', value: false, kind: 'secondary' },
         { label: 'Run', kind: 'primary', value: true, onClick: async () => {
           const get = (n) => form.querySelector(`[name="${n}"]`);
           const errBox = form.querySelector('#run-error');
           errBox.classList.add('hidden');
-          const payload = {
-            image: get('image').value.trim(),
-            name: get('name').value.trim() || null,
-            command: get('command').value.trim() || null,
-            restart_policy: get('restart_policy').value || null,
-            network: get('network').value.trim() || null,
-            pull: get('pull').checked,
-          };
-          if (!payload.image) { errBox.textContent = 'Image is required'; errBox.classList.remove('hidden'); return false; }
+          const showErr = (m) => { errBox.textContent = m; errBox.classList.remove('hidden'); return false; };
 
-          const env = {};
-          for (const line of get('env').value.split('\n').map(l => l.trim()).filter(Boolean)) {
-            const idx = line.indexOf('=');
-            if (idx > 0) env[line.slice(0, idx)] = line.slice(idx + 1);
+          const text = (n) => (get(n)?.value || '').trim();
+          const num = (n) => { const v = text(n); return v === '' ? null : Number(v); };
+          const bool = (n) => !!get(n)?.checked;
+
+          const payload = { image: text('image'), pull: bool('pull') };
+          if (!payload.image) return showErr('Image is required');
+          for (const f of ['name','command','entrypoint','restart_policy','network','network_mode','hostname','mac_address','user','working_dir','stop_signal','cpuset_cpus','mem_limit','mem_reservation','memswap_limit','shm_size','log_driver']) {
+            const v = text(f); if (v) payload[f] = v;
           }
-          if (Object.keys(env).length) payload.env = env;
+          for (const f of ['init','tty','stdin_open','auto_remove','read_only','privileged']) {
+            if (get(f) && get(f).checked) payload[f] = true;
+          }
+          if (text('cpus')) payload.cpus = Number(text('cpus'));
+          if (text('cpu_shares')) payload.cpu_shares = Number(text('cpu_shares'));
+          if (text('pids_limit')) payload.pids_limit = Number(text('pids_limit'));
+          if (text('stop_grace_period')) payload.stop_grace_period = Number(text('stop_grace_period'));
+          if (text('gpus')) payload.gpus = isNaN(Number(text('gpus'))) ? text('gpus') : Number(text('gpus'));
+
+          const env = _kvLines(text('env')); if (Object.keys(env).length) payload.env = env;
+          const labels = _kvLines(text('labels')); if (Object.keys(labels).length) payload.labels = labels;
+          const sysctls = _kvLines(text('sysctls')); if (Object.keys(sysctls).length) payload.sysctls = sysctls;
+          const log_opts = _kvLines(text('log_opts')); if (Object.keys(log_opts).length) payload.log_opts = log_opts;
+          const extra_hosts = _kvLines(text('extra_hosts')); if (Object.keys(extra_hosts).length) payload.extra_hosts = extra_hosts;
+
+          const dns = _list(text('dns')); if (dns.length) payload.dns = dns;
+          const dns_search = _list(text('dns_search')); if (dns_search.length) payload.dns_search = dns_search;
+          const sec_opt = _list(text('security_opt')); if (sec_opt.length) payload.security_opt = sec_opt;
+          const devices = _list(text('devices')); if (devices.length) payload.devices = devices;
+          const cap_add = _list(text('cap_add').replace(/,/g, '\n')); if (cap_add.length) payload.cap_add = cap_add;
+          const cap_drop = _list(text('cap_drop').replace(/,/g, '\n')); if (cap_drop.length) payload.cap_drop = cap_drop;
 
           const ports = {};
-          for (const line of get('ports').value.split('\n').map(l => l.trim()).filter(Boolean)) {
-            const m = line.match(/^(\d+):(\d+)(?:\/(tcp|udp))?$/);
-            if (!m) { errBox.textContent = `Invalid port mapping: ${line}`; errBox.classList.remove('hidden'); return false; }
-            const [, host, ctr, proto] = m;
-            ports[`${ctr}/${proto || 'tcp'}`] = Number(host);
+          for (const line of _list(text('ports'))) {
+            const m = line.match(/^(\d+):(\d+)(?:\/(tcp|udp|sctp))?$/);
+            if (!m) return showErr(`Invalid port mapping: ${line}`);
+            ports[`${m[2]}/${m[3] || 'tcp'}`] = Number(m[1]);
           }
           if (Object.keys(ports).length) payload.ports = ports;
 
           const vols = {};
-          for (const line of get('volumes').value.split('\n').map(l => l.trim()).filter(Boolean)) {
+          for (const line of _list(text('volumes'))) {
             const parts = line.split(':');
-            if (parts.length < 2) { errBox.textContent = `Invalid volume: ${line}`; errBox.classList.remove('hidden'); return false; }
+            if (parts.length < 2) return showErr(`Invalid volume: ${line}`);
             const [host, ctr, mode] = parts;
             vols[host] = { bind: ctr, mode: mode || 'rw' };
           }
           if (Object.keys(vols).length) payload.volumes = vols;
 
+          const tmpfs = {};
+          for (const line of _list(text('tmpfs'))) {
+            const i = line.indexOf('=');
+            if (i < 0) tmpfs[line] = '';
+            else tmpfs[line.slice(0, i)] = line.slice(i + 1);
+          }
+          if (Object.keys(tmpfs).length) payload.tmpfs = tmpfs;
+
+          const ulimits = [];
+          for (const line of _list(text('ulimits'))) {
+            const m = line.match(/^([A-Za-z_][\w-]*)=(\d+)(?::(\d+))?$/);
+            if (!m) return showErr(`Invalid ulimit: ${line}`);
+            const u = { name: m[1], soft: Number(m[2]) };
+            if (m[3]) u.hard = Number(m[3]); else u.hard = Number(m[2]);
+            ulimits.push(u);
+          }
+          if (ulimits.length) payload.ulimits = ulimits;
+
+          const hcTest = text('hc_test');
+          if (hcTest || text('hc_interval') || text('hc_retries')) {
+            const hc = {};
+            if (hcTest) hc.test = ['CMD-SHELL', hcTest];
+            const sec = (n) => text(n) ? Number(text(n)) * 1_000_000_000 : null;
+            const ns = sec('hc_interval'); if (ns != null) hc.interval = ns;
+            const tns = sec('hc_timeout'); if (tns != null) hc.timeout = tns;
+            const sps = sec('hc_start_period'); if (sps != null) hc.start_period = sps;
+            if (text('hc_retries')) hc.retries = Number(text('hc_retries'));
+            payload.healthcheck = hc;
+          }
+
           try {
             await api('/api/containers', { method: 'POST', body: JSON.stringify(payload) });
             toast('Container created', 'success');
           } catch (e) {
-            errBox.textContent = e.message;
-            errBox.classList.remove('hidden');
-            return false;
+            return showErr(e.message);
           }
         }},
       ],
@@ -760,6 +951,9 @@
   };
 
   async function pullImageDialog() {
+    let registries = [];
+    try { registries = await api('/api/registries'); } catch {}
+
     const wrap = document.createElement('div');
     wrap.innerHTML = `
       <div class="grid gap-3 md:grid-cols-3">
@@ -767,6 +961,13 @@
           <input id="repo" required placeholder="library/nginx" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
         <label class="block"><span class="text-xs text-slate-400">Tag</span>
           <input id="tag" placeholder="latest" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="md:col-span-3 block"><span class="text-xs text-slate-400">Registry credentials</span>
+          <select id="reg" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+            <option value="">(none — public / daemon-cached login)</option>
+            ${registries.map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)} — ${escapeHtml(r.url)} (${escapeHtml(r.username)})</option>`).join('')}
+          </select>
+          <p class="mt-1 text-[11px] text-slate-500">Manage credentials under the Registries tab.</p>
+        </label>
       </div>
       <pre id="progress" class="log-pane mt-3 hidden h-48 overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-300"></pre>`;
     const ok = await modal({
@@ -778,13 +979,14 @@
         { label: 'Pull', kind: 'primary', value: true, onClick: async () => {
           const repo = wrap.querySelector('#repo').value.trim();
           const tag = wrap.querySelector('#tag').value.trim() || null;
+          const registry = wrap.querySelector('#reg').value || null;
           if (!repo) return false;
           const pane = wrap.querySelector('#progress'); pane.classList.remove('hidden'); pane.textContent = '';
           try {
             const res = await fetch('/api/images/pull', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Basic ${state.auth.basic}` },
-              body: JSON.stringify({ repository: repo, tag }),
+              body: JSON.stringify({ repository: repo, tag, registry }),
             });
             if (!res.ok) throw new Error(`Pull failed: ${res.status}`);
             const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
@@ -854,8 +1056,8 @@
       const id = t.dataset.id; const act = t.dataset.act;
       try {
         if (act === 'inspect') {
-          const data = await api(`/api/networks/${id}`);
-          await modal({ title: `Inspect network`, body: jsonView(data), size: 'xl' });
+          await openNetworkDialog(id);
+          load();
         } else if (act === 'remove') {
           const ok = await confirmModal('Remove this network?', { danger: true, confirmLabel: 'Remove' });
           if (!ok) return;
@@ -910,6 +1112,91 @@
     await load();
   };
 
+  async function openNetworkDialog(networkId) {
+    let data;
+    try { data = await api(`/api/networks/${networkId}`); }
+    catch (e) { toast(e.message, 'error'); return; }
+
+    const containers = Object.entries(data.Containers || {});
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="grid gap-4 md:grid-cols-2">
+        <div>
+          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Connected containers</h4>
+          <div id="conn-list" class="space-y-2"></div>
+          <div class="mt-4 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+            <h5 class="mb-2 text-xs font-semibold text-slate-300">Connect a container</h5>
+            <div class="grid gap-2">
+              <label class="block"><span class="text-[11px] text-slate-400">Container ID or name</span>
+                <input id="cn-cont" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+              <label class="block"><span class="text-[11px] text-slate-400">Aliases (comma-separated, optional)</span>
+                <input id="cn-aliases" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+              <label class="block"><span class="text-[11px] text-slate-400">IPv4 address (optional)</span>
+                <input id="cn-ipv4" placeholder="172.20.0.10" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+              <button id="cn-go" class="mt-1 rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-xs font-medium">Connect</button>
+            </div>
+          </div>
+        </div>
+        <div>
+          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Inspect</h4>
+          <div id="inspect-host"></div>
+        </div>
+      </div>`;
+
+    function renderConns(d) {
+      const host = wrap.querySelector('#conn-list');
+      const conns = Object.entries(d.Containers || {});
+      if (!conns.length) { host.innerHTML = '<div class="text-xs text-slate-500">No containers attached</div>'; return; }
+      host.innerHTML = conns.map(([cid, info]) => `
+        <div class="rounded border border-slate-800 bg-slate-900/50 p-2 text-xs flex items-center justify-between gap-2">
+          <div class="min-w-0">
+            <div class="font-medium text-slate-200 truncate">${escapeHtml(info.Name || cid.slice(0,12))}</div>
+            <div class="text-[10px] text-slate-500 font-mono truncate">${escapeHtml(info.IPv4Address || info.IPv6Address || '')}</div>
+          </div>
+          <button data-disc="${cid}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-[11px]">Disconnect</button>
+        </div>`).join('');
+      host.querySelectorAll('[data-disc]').forEach((b) => {
+        b.onclick = async () => {
+          const cid = b.dataset.disc;
+          const ok = await confirmModal(`Disconnect ${cid.slice(0,12)} from this network?`, { danger: true, confirmLabel: 'Disconnect' });
+          if (!ok) return;
+          try {
+            await api(`/api/networks/${networkId}/disconnect`, {
+              method: 'POST', body: JSON.stringify({ container: cid, force: false }),
+            });
+            toast('Disconnected', 'success');
+            const fresh = await api(`/api/networks/${networkId}`);
+            renderConns(fresh);
+            wrap.querySelector('#inspect-host').replaceChildren(jsonView(fresh));
+          } catch (e) { toast(e.message, 'error'); }
+        };
+      });
+    }
+    renderConns(data);
+    wrap.querySelector('#inspect-host').appendChild(jsonView(data));
+
+    wrap.querySelector('#cn-go').onclick = async () => {
+      const payload = { container: wrap.querySelector('#cn-cont').value.trim() };
+      const aliases = wrap.querySelector('#cn-aliases').value.split(',').map(s => s.trim()).filter(Boolean);
+      const ipv4 = wrap.querySelector('#cn-ipv4').value.trim();
+      if (aliases.length) payload.aliases = aliases;
+      if (ipv4) payload.ipv4_address = ipv4;
+      if (!payload.container) { toast('Container is required', 'warn'); return; }
+      try {
+        await api(`/api/networks/${networkId}/connect`, { method: 'POST', body: JSON.stringify(payload) });
+        toast('Connected', 'success');
+        wrap.querySelector('#cn-cont').value = '';
+        wrap.querySelector('#cn-aliases').value = '';
+        wrap.querySelector('#cn-ipv4').value = '';
+        const fresh = await api(`/api/networks/${networkId}`);
+        renderConns(fresh);
+        wrap.querySelector('#inspect-host').replaceChildren(jsonView(fresh));
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    await modal({ title: `Network: ${data.Name}`, body: wrap, size: 'xl' });
+  }
+
   // ---------- Volumes ----------
   views.volumes = async (root) => {
     root.innerHTML = pageHeader(
@@ -935,6 +1222,7 @@
             <td class="px-4 py-2 text-slate-400">${fmtDate(v.created_at)}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
+                <button data-act="browse" data-id="${v.name}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>
                 <button data-act="inspect" data-id="${v.name}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
                 <button data-act="remove" data-id="${v.name}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
               </div>
@@ -950,7 +1238,9 @@
       const t = e.target.closest('[data-act]'); if (!t) return;
       const id = t.dataset.id; const act = t.dataset.act;
       try {
-        if (act === 'inspect') {
+        if (act === 'browse') {
+          await openVolumeBrowser(id);
+        } else if (act === 'inspect') {
           const data = await api(`/api/volumes/${encodeURIComponent(id)}`);
           await modal({ title: `Inspect volume`, body: jsonView(data), size: 'xl' });
         } else if (act === 'remove') {
@@ -1347,6 +1637,453 @@
     }
     return await modal({ title: `Stack: ${name}`, body: wrap, size: 'xl', actions }) === true;
   }
+
+  // ---------- Volume browser ----------
+  async function openVolumeBrowser(volumeName) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="mb-3 flex flex-wrap items-center gap-2">
+        <button id="vb-up" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">↑ Up</button>
+        <input id="vb-path" value="/" class="flex-1 min-w-[200px] rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+        <button id="vb-go" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">Go</button>
+        <button id="vb-mkdir" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">+ New folder</button>
+        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer">⤒ Upload
+          <input id="vb-upload" type="file" class="hidden"/>
+        </label>
+        <button id="vb-stop" class="ml-auto rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">Stop sidecar</button>
+      </div>
+      <div id="vb-status" class="mb-2 hidden rounded bg-slate-800/60 px-3 py-2 text-xs text-slate-300"></div>
+      <div id="vb-list" class="rounded border border-slate-800 bg-slate-950/60 max-h-[55vh] overflow-auto scroll-thin"></div>`;
+
+    let cur = '/';
+
+    function setStatus(msg, kind = 'info') {
+      const el = wrap.querySelector('#vb-status');
+      if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
+      el.classList.remove('hidden');
+      el.textContent = msg;
+      el.className = 'mb-2 rounded px-3 py-2 text-xs ' + (
+        kind === 'err' ? 'bg-rose-500/15 text-rose-200'
+        : kind === 'ok' ? 'bg-emerald-500/15 text-emerald-200'
+        : 'bg-slate-800/60 text-slate-300');
+    }
+
+    function rowFor(entry) {
+      const icon = entry.is_dir ? '📁' : (entry.is_link ? '🔗' : '📄');
+      const sizeCol = entry.is_dir ? '' : fmtBytes(entry.size);
+      const date = entry.mtime ? new Date(entry.mtime * 1000).toLocaleString() : '';
+      return `
+        <div data-name="${escapeHtml(entry.name)}" data-dir="${entry.is_dir ? '1' : ''}" class="vb-row flex items-center gap-3 border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+          <span>${icon}</span>
+          <span class="flex-1 ${entry.is_dir ? 'text-sky-300 cursor-pointer' : 'text-slate-200'} truncate">${escapeHtml(entry.name)}</span>
+          <span class="w-24 text-right text-slate-400 font-mono">${sizeCol}</span>
+          <span class="w-44 text-right text-slate-500">${date}</span>
+          <span class="flex gap-1">
+            ${entry.is_dir ? '' : `<button data-act="dl" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-0.5 border border-slate-700">Download</button>`}
+            <button data-act="rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-0.5">Delete</button>
+          </span>
+        </div>`;
+    }
+
+    async function load(path) {
+      cur = path || '/';
+      wrap.querySelector('#vb-path').value = cur;
+      const host = wrap.querySelector('#vb-list');
+      host.innerHTML = '<div class="px-3 py-3 text-xs text-slate-400">Loading…</div>';
+      setStatus('');
+      try {
+        const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?path=${encodeURIComponent(cur)}`);
+        cur = data.path || cur;
+        wrap.querySelector('#vb-path').value = cur;
+        const entries = data.entries || [];
+        if (!entries.length) {
+          host.innerHTML = '<div class="px-3 py-6 text-center text-xs text-slate-500">Empty</div>';
+        } else {
+          host.innerHTML = entries.map(rowFor).join('');
+        }
+      } catch (e) {
+        host.innerHTML = '';
+        setStatus(e.message, 'err');
+      }
+    }
+
+    wrap.querySelector('#vb-list').addEventListener('click', async (e) => {
+      const row = e.target.closest('.vb-row');
+      if (!row) return;
+      const name = row.dataset.name;
+      const isDir = row.dataset.dir === '1';
+      const child = (cur === '/' ? '/' : cur + '/') + name;
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act === 'rm') {
+        const ok = await confirmModal(`Delete ${name}?`, { danger: true, confirmLabel: 'Delete' });
+        if (!ok) return;
+        try {
+          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(child)}`, { method: 'DELETE' });
+          toast('Deleted', 'success'); load(cur);
+        } catch (ex) { toast(ex.message, 'error'); }
+        return;
+      }
+      if (act === 'dl') {
+        try {
+          const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(child)}`, {
+            headers: { Authorization: `Basic ${state.auth.basic}` },
+          });
+          if (!res.ok) throw new Error(`Download failed (${res.status})`);
+          const blob = await res.blob();
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob); a.download = name;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        } catch (ex) { toast(ex.message, 'error'); }
+        return;
+      }
+      if (isDir) load(child);
+    });
+
+    wrap.querySelector('#vb-up').onclick = () => {
+      if (cur === '/' || cur === '') return;
+      const idx = cur.replace(/\/+$/, '').lastIndexOf('/');
+      load(idx <= 0 ? '/' : cur.slice(0, idx));
+    };
+    wrap.querySelector('#vb-go').onclick = () => load(wrap.querySelector('#vb-path').value || '/');
+    wrap.querySelector('#vb-path').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); load(wrap.querySelector('#vb-path').value || '/'); }
+    });
+
+    wrap.querySelector('#vb-mkdir').onclick = async () => {
+      const name = prompt('New folder name:');
+      if (!name) return;
+      const child = (cur === '/' ? '/' : cur + '/') + name;
+      try {
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(child)}`, { method: 'POST' });
+        toast('Folder created', 'success'); load(cur);
+      } catch (ex) { toast(ex.message, 'error'); }
+    };
+
+    wrap.querySelector('#vb-upload').addEventListener('change', async (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      setStatus(`Uploading ${file.name}…`);
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
+          method: 'POST',
+          headers: { Authorization: `Basic ${state.auth.basic}` },
+          body: fd,
+        });
+        if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
+        toast('Uploaded', 'success'); setStatus('');
+        load(cur);
+      } catch (ex) { setStatus(ex.message, 'err'); }
+      e.target.value = '';
+    });
+
+    wrap.querySelector('#vb-stop').onclick = async () => {
+      try {
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/stop`, { method: 'POST' });
+        toast('Sidecar stopped', 'success');
+      } catch (ex) { toast(ex.message, 'error'); }
+    };
+
+    setStatus(`A small "${state.config.browser_image}" sidecar will be started with this volume mounted at /target. Click "Stop sidecar" when done.`, 'info');
+    load('/');
+
+    await modal({ title: `Browse: ${volumeName}`, body: wrap, size: 'xl' });
+  }
+
+  // ---------- Registries ----------
+  views.registries = async (root) => {
+    root.innerHTML = pageHeader(
+      'Registries',
+      'Stored credentials used by the image-pull dialog',
+      `${btn('+ Add registry', { kind: 'primary', id: 'add-reg' })}
+       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
+    );
+    const list = document.createElement('div'); root.appendChild(list);
+
+    async function load() {
+      list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        const items = await api('/api/registries');
+        const rows = items.map((r) => `
+          <tr class="hover:bg-slate-900/60">
+            <td class="px-4 py-2 font-medium">${escapeHtml(r.name)}</td>
+            <td class="px-4 py-2 text-slate-300 font-mono text-xs">${escapeHtml(r.url)}</td>
+            <td class="px-4 py-2 text-slate-300">${escapeHtml(r.username)}</td>
+            <td class="px-4 py-2 text-slate-400">${escapeHtml(r.email || '')}</td>
+            <td class="px-4 py-2 text-right">
+              <div class="flex justify-end gap-1">
+                <button data-act="test" data-name="${escapeHtml(r.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Test login</button>
+                <button data-act="edit" data-name="${escapeHtml(r.name)}" data-url="${escapeHtml(r.url)}" data-user="${escapeHtml(r.username)}" data-email="${escapeHtml(r.email || '')}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Edit</button>
+                <button data-act="rm" data-name="${escapeHtml(r.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+              </div>
+            </td>
+          </tr>`);
+        list.innerHTML = `
+          <p class="mb-3 text-xs text-slate-500">Passwords are stored on the manager host in <code>${escapeHtml(state.config.registries_file || '/data/registries.json')}</code> with mode 0600. Always front this UI with TLS.</p>
+        ` + table(['Name', 'URL', 'Username', 'Email', ''], rows);
+      } catch (e) {
+        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    list.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-act]'); if (!t) return;
+      const name = t.dataset.name; const act = t.dataset.act;
+      try {
+        if (act === 'rm') {
+          const ok = await confirmModal(`Remove credentials for "${name}"?`, { danger: true, confirmLabel: 'Remove' });
+          if (!ok) return;
+          await api(`/api/registries/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          toast('Removed', 'success'); load();
+        } else if (act === 'test') {
+          const r = await api(`/api/registries/${encodeURIComponent(name)}/test`, { method: 'POST' });
+          await modal({ title: 'Login result', body: jsonView(r), size: 'md' });
+        } else if (act === 'edit') {
+          await registryDialog({ name, url: t.dataset.url, username: t.dataset.user, email: t.dataset.email });
+          load();
+        }
+      } catch (ex) { toast(ex.message, 'error'); }
+    });
+
+    document.getElementById('refresh').onclick = load;
+    document.getElementById('add-reg').onclick = () => registryDialog().then((ok) => { if (ok) load(); });
+
+    await load();
+  };
+
+  async function registryDialog(initial = null) {
+    const editing = !!initial;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="grid gap-3 md:grid-cols-2">
+        <label class="block"><span class="text-xs text-slate-400">Name *</span>
+          <input id="r-name" required value="${escapeHtml(initial?.name || '')}" ${editing ? 'readonly' : ''} placeholder="ghcr-personal" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm ${editing ? 'opacity-70' : ''}"/></label>
+        <label class="block"><span class="text-xs text-slate-400">URL</span>
+          <input id="r-url" value="${escapeHtml(initial?.url || 'https://index.docker.io/v1/')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Username *</span>
+          <input id="r-user" required value="${escapeHtml(initial?.username || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">Password / token *</span>
+          <input id="r-pass" required type="password" placeholder="${editing ? 'Leave blank to keep, set to change' : ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
+        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Email (optional)</span>
+          <input id="r-email" value="${escapeHtml(initial?.email || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+      </div>`;
+    let success = false;
+    await modal({
+      title: editing ? `Edit registry: ${initial.name}` : 'Add registry',
+      body: wrap, size: 'lg',
+      actions: [
+        { label: 'Cancel', value: false, kind: 'secondary' },
+        { label: editing ? 'Save' : 'Add', kind: 'primary', value: true, onClick: async () => {
+          const payload = {
+            name: wrap.querySelector('#r-name').value.trim(),
+            url: wrap.querySelector('#r-url').value.trim() || 'https://index.docker.io/v1/',
+            username: wrap.querySelector('#r-user').value.trim(),
+            password: wrap.querySelector('#r-pass').value,
+            email: wrap.querySelector('#r-email').value.trim() || null,
+          };
+          if (!payload.name || !payload.username) { toast('Name and username are required', 'warn'); return false; }
+          if (!payload.password && !editing) { toast('Password is required for new entries', 'warn'); return false; }
+          try {
+            if (editing) {
+              await api(`/api/registries/${encodeURIComponent(payload.name)}`, { method: 'PUT', body: JSON.stringify(payload) });
+            } else {
+              await api(`/api/registries`, { method: 'POST', body: JSON.stringify(payload) });
+            }
+            success = true;
+            toast(editing ? 'Saved' : 'Added', 'success');
+          } catch (e) { toast(e.message, 'error'); return false; }
+        }},
+      ],
+    });
+    return success;
+  }
+
+  // ---------- Activity (live events + per-container live stats) ----------
+  views.activity = async (root) => {
+    root.innerHTML = pageHeader('Activity', 'Live docker events and per-container stats');
+    const wrap = document.createElement('div');
+    wrap.className = 'grid gap-4 lg:grid-cols-2';
+    wrap.innerHTML = `
+      <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+        <div class="mb-2 flex items-center justify-between">
+          <h3 class="text-sm font-semibold">Live events</h3>
+          <button id="ev-toggle" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs">▶ Stream</button>
+        </div>
+        <div id="ev-feed" class="log-pane h-[60vh] overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/60 p-3 text-slate-300"></div>
+      </div>
+      <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+        <div class="mb-2 flex items-center gap-2">
+          <h3 class="text-sm font-semibold">Live stats</h3>
+          <select id="stat-pick" class="ml-auto rounded border-slate-700 bg-slate-950 text-xs">
+            <option value="">Select container…</option>
+          </select>
+          <button id="stat-toggle" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs" disabled>▶ Stream</button>
+        </div>
+        <div class="grid grid-cols-2 gap-3" id="stat-cards"></div>
+        <div class="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <div class="mb-1 text-[11px] text-slate-400">CPU %</div>
+            <canvas id="cpu-spark" width="320" height="80" class="w-full rounded border border-slate-800 bg-slate-950"></canvas>
+          </div>
+          <div>
+            <div class="mb-1 text-[11px] text-slate-400">Memory %</div>
+            <canvas id="mem-spark" width="320" height="80" class="w-full rounded border border-slate-800 bg-slate-950"></canvas>
+          </div>
+        </div>
+      </div>`;
+    root.appendChild(wrap);
+
+    let containers = [];
+    try { containers = await api('/api/containers?all=true'); } catch {}
+    const sel = wrap.querySelector('#stat-pick');
+    containers.filter(c => c.state === 'running').forEach((c) => {
+      const o = document.createElement('option');
+      o.value = c.id; o.textContent = `${c.name} (${shortId(c.id)})`;
+      sel.appendChild(o);
+    });
+
+    // Events streaming
+    let evCtrl = null;
+    const feed = wrap.querySelector('#ev-feed');
+    function fmtEv(ev) {
+      const t = ev.time ? new Date(ev.time * 1000).toLocaleTimeString() : '';
+      const actor = (ev.Actor && ev.Actor.Attributes && (ev.Actor.Attributes.name || ev.Actor.ID)) || ev.id || '';
+      return `${t} ${ev.Type || ''} ${ev.Action || ev.status || ''} ${actor}`;
+    }
+    async function startEvents() {
+      if (evCtrl) { evCtrl.abort(); evCtrl = null; wrap.querySelector('#ev-toggle').textContent = '▶ Stream'; return; }
+      evCtrl = new AbortController();
+      wrap.querySelector('#ev-toggle').textContent = '⏹ Stop';
+      try {
+        const res = await fetch('/api/system/events/stream', {
+          headers: { Authorization: `Basic ${state.auth.basic}` }, signal: evCtrl.signal,
+        });
+        if (!res.ok) throw new Error(`Events stream failed (${res.status})`);
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const ev = JSON.parse(line);
+              const div = document.createElement('div');
+              div.textContent = fmtEv(ev);
+              feed.insertBefore(div, feed.firstChild);
+              while (feed.children.length > 500) feed.removeChild(feed.lastChild);
+            } catch {}
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          const div = document.createElement('div');
+          div.textContent = `[error] ${e.message}`; div.className = 'text-rose-300';
+          feed.insertBefore(div, feed.firstChild);
+        }
+      } finally {
+        evCtrl = null;
+        const btn = wrap.querySelector('#ev-toggle'); if (btn) btn.textContent = '▶ Stream';
+      }
+    }
+    wrap.querySelector('#ev-toggle').onclick = startEvents;
+
+    // Stats streaming
+    let statCtrl = null; let statHistory = { cpu: [], mem: [] };
+    function drawSpark(canvas, data, max) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      if (!data.length) return;
+      const M = max || Math.max(...data, 1);
+      ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / Math.max(1, data.length - 1)) * w;
+        const y = h - (v / M) * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(14, 165, 233, 0.15)';
+      ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath(); ctx.fill();
+    }
+    function statCards(s) {
+      function cpuPct(s) {
+        const cd = s.cpu_stats?.cpu_usage?.total_usage - (s.precpu_stats?.cpu_usage?.total_usage || 0);
+        const sd = s.cpu_stats?.system_cpu_usage - (s.precpu_stats?.system_cpu_usage || 0);
+        const n = s.cpu_stats?.online_cpus || (s.cpu_stats?.cpu_usage?.percpu_usage || []).length || 1;
+        return (sd > 0 && cd > 0) ? (cd / sd) * n * 100 : 0;
+      }
+      const cpu = cpuPct(s);
+      const memUsage = (s.memory_stats?.usage || 0) - (s.memory_stats?.stats?.cache || 0);
+      const memLimit = s.memory_stats?.limit || 0;
+      const memPct = memLimit ? (memUsage / memLimit) * 100 : 0;
+      let netRx = 0, netTx = 0;
+      for (const v of Object.values(s.networks || {})) { netRx += v.rx_bytes || 0; netTx += v.tx_bytes || 0; }
+      let blkR = 0, blkW = 0;
+      for (const e of (s.blkio_stats?.io_service_bytes_recursive || [])) {
+        if (e.op === 'Read' || e.op === 'read') blkR += e.value || 0;
+        if (e.op === 'Write' || e.op === 'write') blkW += e.value || 0;
+      }
+      return { cpu, memUsage, memLimit, memPct, netRx, netTx, blkR, blkW };
+    }
+    function renderCards(c) {
+      wrap.querySelector('#stat-cards').innerHTML = [
+        statCard('CPU', `${c.cpu.toFixed(1)} %`),
+        statCard('Memory', `${fmtBytes(c.memUsage)} / ${fmtBytes(c.memLimit)}`, `${c.memPct.toFixed(1)} %`),
+        statCard('Network', `↓ ${fmtBytes(c.netRx)}`, `↑ ${fmtBytes(c.netTx)}`),
+        statCard('Block IO', `R ${fmtBytes(c.blkR)}`, `W ${fmtBytes(c.blkW)}`),
+      ].join('');
+    }
+    async function startStats() {
+      const id = sel.value; if (!id) return;
+      if (statCtrl) { statCtrl.abort(); statCtrl = null; wrap.querySelector('#stat-toggle').textContent = '▶ Stream'; return; }
+      statCtrl = new AbortController();
+      wrap.querySelector('#stat-toggle').textContent = '⏹ Stop';
+      statHistory = { cpu: [], mem: [] };
+      try {
+        const res = await fetch(`/api/containers/${encodeURIComponent(id)}/stats/stream`, {
+          headers: { Authorization: `Basic ${state.auth.basic}` }, signal: statCtrl.signal,
+        });
+        if (!res.ok) throw new Error(`Stats stream failed (${res.status})`);
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const sample = JSON.parse(line);
+              const c = statCards(sample);
+              renderCards(c);
+              statHistory.cpu.push(c.cpu); statHistory.mem.push(c.memPct);
+              if (statHistory.cpu.length > 120) statHistory.cpu.shift();
+              if (statHistory.mem.length > 120) statHistory.mem.shift();
+              drawSpark(wrap.querySelector('#cpu-spark'), statHistory.cpu, 100);
+              drawSpark(wrap.querySelector('#mem-spark'), statHistory.mem, 100);
+            } catch {}
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') toast(e.message, 'error');
+      } finally {
+        statCtrl = null;
+        const b = wrap.querySelector('#stat-toggle'); if (b) b.textContent = '▶ Stream';
+      }
+    }
+    sel.addEventListener('change', () => {
+      wrap.querySelector('#stat-toggle').disabled = !sel.value;
+      if (statCtrl) { statCtrl.abort(); statCtrl = null; }
+    });
+    wrap.querySelector('#stat-toggle').onclick = startStats;
+
+    const cleanup = () => {
+      if (evCtrl) evCtrl.abort();
+      if (statCtrl) statCtrl.abort();
+    };
+    window.addEventListener('hashchange', cleanup, { once: true });
+  };
 
   // ---------- System ----------
   views.system = async (root) => {

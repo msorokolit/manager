@@ -17,8 +17,13 @@ The stack is intentionally small and easy to audit:
 - **Dashboard** with engine/host stats and recent containers
 - **Containers** — list, inspect, start/stop/restart/pause/kill, remove, prune
   - One-click follow-mode log streaming
-  - "Run container" form with image, name, command, env, ports, volumes,
-    restart policy, network, and pre-pull
+  - **Comprehensive "Run container" form** with collapsible sections covering
+    image / name / cmd / entrypoint, port mappings, volumes, tmpfs, env, user,
+    working dir, hostname, MAC, DNS, extra hosts, restart policy, networks
+    and network mode, CPU / memory / pids / shm / GPU / ulimits / devices,
+    privileged / capabilities / security_opt / sysctls, healthcheck override,
+    log driver and options, labels, init / TTY / STDIN / auto-remove /
+    read-only / stop-signal & grace
   - **In-browser interactive terminal** (xterm.js + WebSocket; full TTY,
     auto-resize, choose any command e.g. `/bin/bash`)
 - **Stacks (docker-compose)** — store compose files on the manager and
@@ -33,7 +38,17 @@ The stack is intentionally small and easy to audit:
     `com.docker.compose.project` labels) are listed read-only
 - **Images** — list, inspect, pull (with streaming progress), remove, prune dangling
 - **Networks** — list, inspect, create (bridge/overlay/macvlan/ipvlan/host), remove, prune
+  - **Connect / disconnect** containers from the network inspect modal
 - **Volumes** — list, inspect, create, remove, prune
+  - **Volume browser**: spins up a small sidecar with the volume mounted at
+    `/target` and lets you list directories, download files, upload files,
+    create folders, and delete entries
+- **Registries** — store per-registry credentials (Docker Hub, ghcr.io, ECR,
+  GitLab Registry, private registries…), test login, then select them from the
+  image-pull dialog. Stored at `REGISTRIES_FILE` with file mode `0600`.
+- **Activity** — live tail of `docker events` and a per-container live stats
+  panel (CPU %, memory usage / %, network rx/tx, block IO) with rolling
+  sparklines fed from the streaming stats endpoint
 - **System** — engine info, version, disk usage breakdown
 - Live daemon-status indicator (green/red) with periodic ping
 - Two roles:
@@ -86,6 +101,9 @@ All configuration is via environment variables.
 | `STACKS_DIR`         | `/data/stacks`   | Where managed compose stacks are persisted (one subdir per stack)     |
 | `COMPOSE_BIN`        | `docker-compose` | Path to a compose v2 binary; resolved from `$PATH` if relative        |
 | `EXEC_DEFAULT_SHELL` | `/bin/sh`        | Pre-filled command in the in-browser terminal                         |
+| `DATA_DIR`           | `/data`          | Base directory for the registries file                                |
+| `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
+| `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
 
 ## Security notes
 
@@ -104,6 +122,14 @@ All configuration is via environment variables.
   header to `new WebSocket(...)`, so authentication uses a one-shot ticket
   (`POST /api/exec/ticket`) that is consumed on connect and expires in 60s.
   Tickets are bound to the issuing role and only admins can mint them.
+- Registry credentials are stored in plain text on disk so the daemon can
+  consume them on pull. The file is created with mode `0600` and lives on the
+  manager host; back it up like any other secret material. Never store
+  credentials for accounts more powerful than the manager itself.
+- The volume browser starts a sidecar with the volume mounted read-write at
+  `/target` and runs `mkdir`/`rm`/`python3` execs against it. Anyone with
+  admin can create or delete files inside any volume by design — the same
+  level of trust as `docker run -v`.
 
 ## Project layout
 
@@ -121,6 +147,8 @@ backend/
       networks.py      list/inspect/create/remove/prune
       volumes.py       list/inspect/create/remove/prune
       stacks.py        list/get/create/update/up/down/restart/pull/logs/delete
+      registries.py    list/upsert/delete/test (file-backed credential store)
+      volume_browser.py list/get/upload/mkdir/delete/stop (sidecar-backed)
       exec.py          POST /api/exec/ticket + WS /api/containers/{id}/exec
   requirements.txt
 frontend/

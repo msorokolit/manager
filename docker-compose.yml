@@ -15,8 +15,8 @@ services:
     volumes:
       # Mount the host docker socket so the manager can talk to the daemon.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persist user-defined compose stacks across container restarts.
-      - docker-manager-stacks:/data/stacks
+      # Persist user-defined compose stacks + registry creds across restarts.
+      - docker-manager-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
       interval: 30s
@@ -24,4 +24,4 @@ services:
       retries: 3
 
 volumes:
-  docker-manager-stacks:
+  docker-manager-data:
