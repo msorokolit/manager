@@ -275,6 +275,59 @@ def logs(name: str, tail: int = 200, _: User = Depends(authenticate)) -> Streami
     return _stream_compose(name, "logs", "--no-color", "--tail", str(max(1, min(tail, 5000))))
 
 
+@router.post("/{name}/validate")
+def validate(name: str, _: User = Depends(authenticate)) -> dict:
+    """Run ``compose config -q`` on the stored compose file."""
+    argv, cwd = _compose_argv(name, "config", "-q")
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "ok": proc.returncode == 0,
+        "stdout": proc.stdout.decode("utf-8", errors="replace"),
+        "stderr": proc.stderr.decode("utf-8", errors="replace"),
+    }
+
+
+_SERVICE_ACTIONS = {"start", "stop", "restart", "pull", "up", "rm"}
+
+
+@router.post("/{name}/services/{service}/{action}")
+def service_action(
+    name: str,
+    service: str,
+    action: str,
+    _: User = Depends(require_admin),
+) -> StreamingResponse:
+    if action not in _SERVICE_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown service action '{action}'. Allowed: {sorted(_SERVICE_ACTIONS)}",
+        )
+    if not service or "/" in service or service.startswith("-"):
+        raise HTTPException(status_code=400, detail="Invalid service name")
+    if action == "up":
+        return _stream_compose(name, "up", "-d", service)
+    if action == "rm":
+        return _stream_compose(name, "rm", "-sf", service)
+    return _stream_compose(name, action, service)
+
+
+@router.get("/{name}/services/{service}/logs")
+def service_logs(
+    name: str,
+    service: str,
+    tail: int = 200,
+    _: User = Depends(authenticate),
+) -> StreamingResponse:
+    if not service or "/" in service or service.startswith("-"):
+        raise HTTPException(status_code=400, detail="Invalid service name")
+    return _stream_compose(
+        name, "logs", "--no-color", "--tail", str(max(1, min(tail, 5000))), service
+    )
+
+
 @router.delete("/{name}")
 def delete_stack(name: str, _: User = Depends(require_admin)) -> dict:
     if not _is_managed(name):

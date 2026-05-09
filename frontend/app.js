@@ -530,11 +530,331 @@
     await load();
   };
 
+  // ---------- Container inspect (structured + tabbed) ----------
+  function _ago(iso) {
+    if (!iso || iso.startsWith('0001-')) return '—';
+    const t = new Date(iso).getTime();
+    if (isNaN(t)) return iso;
+    const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+    return `${Math.floor(s/86400)}d ago`;
+  }
+  function _dur(startIso, endIso) {
+    if (!startIso || startIso.startsWith('0001-')) return '—';
+    const start = new Date(startIso).getTime();
+    const end = endIso && !endIso.startsWith('0001-') ? new Date(endIso).getTime() : Date.now();
+    let s = Math.max(0, Math.floor((end - start) / 1000));
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600);  s -= h * 3600;
+    const m = Math.floor(s / 60);    s -= m * 60;
+    return [d && `${d}d`, h && `${h}h`, m && `${m}m`, `${s}s`].filter(Boolean).join(' ');
+  }
+  function _healthTone(s) {
+    s = (s || '').toLowerCase();
+    if (s === 'healthy') return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30';
+    if (s === 'unhealthy') return 'bg-rose-500/15 text-rose-300 border border-rose-500/30';
+    if (s === 'starting') return 'bg-amber-500/15 text-amber-300 border border-amber-500/30';
+    return 'bg-slate-700/40 text-slate-300 border border-slate-600/40';
+  }
+  function _defList(items) {
+    const rows = items
+      .filter(([, v]) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0))
+      .map(([k, v, opts = {}]) => {
+        const valHtml = opts.html ? v : `<span class="${opts.mono ? 'font-mono text-xs break-all' : ''}">${escapeHtml(String(v))}</span>`;
+        return `<dt class="text-slate-400">${escapeHtml(k)}</dt><dd>${valHtml}</dd>`;
+      });
+    if (!rows.length) return `<p class="text-xs text-slate-500">No data.</p>`;
+    return `<dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-sm">${rows.join('')}</dl>`;
+  }
+  function _kvTable(title, obj, { mono = false, masked = false } = {}) {
+    const entries = Object.entries(obj || {});
+    if (!entries.length) {
+      return `<div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3 text-xs text-slate-500">${escapeHtml(title)}: none</div>`;
+    }
+    const looksSecret = (k) => /(password|secret|token|key|auth|api[_-]?key|credential)/i.test(k);
+    const rows = entries.map(([k, v]) => {
+      const masked2 = masked && looksSecret(k);
+      return `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-3 py-1 align-top font-mono text-xs text-slate-300 whitespace-nowrap">${escapeHtml(k)}</td>
+          <td class="px-3 py-1 ${mono ? 'font-mono text-xs' : 'text-sm'} text-slate-200 break-all">
+            ${masked2
+              ? `<span class="text-slate-500 italic">•••••• <button data-reveal class="ml-2 underline text-sky-400 text-[11px]">show</button></span><span class="hidden">${escapeHtml(String(v))}</span>`
+              : escapeHtml(String(v))}
+          </td>
+        </tr>`;
+    }).join('');
+    return `
+      <div class="rounded-lg border border-slate-800 bg-slate-950/40 overflow-hidden">
+        <div class="border-b border-slate-800 bg-slate-900/60 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">${escapeHtml(title)} (${entries.length})</div>
+        <table class="w-full text-sm"><tbody class="divide-y divide-slate-800/70">${rows}</tbody></table>
+      </div>`;
+  }
+  function _miniTable(title, headers, rows) {
+    if (!rows.length) {
+      return `<div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3 text-xs text-slate-500">${escapeHtml(title)}: none</div>`;
+    }
+    return `
+      <div class="rounded-lg border border-slate-800 bg-slate-950/40 overflow-hidden">
+        <div class="border-b border-slate-800 bg-slate-900/60 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">${escapeHtml(title)} (${rows.length})</div>
+        <table class="w-full text-sm">
+          <thead class="bg-slate-900/40 text-[11px] uppercase tracking-wider text-slate-400">
+            <tr>${headers.map(h => `<th class="px-3 py-1 text-left font-medium">${h}</th>`).join('')}</tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/70">${rows.join('')}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function _ciOverview(d) {
+    const cfg = d.Config || {}, st = d.State || {}, host = d.HostConfig || {};
+    const items = [
+      ['Status', `${statusBadge(st.Status)}`, { html: true }],
+      ['Uptime', st.Status === 'running' ? _dur(st.StartedAt, null) : '—'],
+      ['Image', `${escapeHtml(cfg.Image || '')} <span class="text-slate-500 font-mono text-xs">(${shortId(d.Image)})</span>`, { html: true }],
+      ['Command', (cfg.Cmd || []).join(' '), { mono: true }],
+      ['Entrypoint', (cfg.Entrypoint || []).join(' '), { mono: true }],
+      ['Working dir', cfg.WorkingDir],
+      ['User', cfg.User],
+      ['Restart policy', host.RestartPolicy?.Name + (host.RestartPolicy?.MaximumRetryCount ? ` (max ${host.RestartPolicy.MaximumRetryCount})` : '')],
+      ['Restart count', d.RestartCount ?? 0],
+      ['Created', `${fmtDate(d.Created)} <span class="text-slate-500">(${_ago(d.Created)})</span>`, { html: true }],
+      ['Started', `${fmtDate(st.StartedAt)} <span class="text-slate-500">(${_ago(st.StartedAt)})</span>`, { html: true }],
+    ];
+    if (st.FinishedAt && !st.FinishedAt.startsWith('0001-')) {
+      items.push(['Finished', `${fmtDate(st.FinishedAt)} <span class="text-slate-500">(${_ago(st.FinishedAt)})</span>`, { html: true }]);
+      items.push(['Exit code', st.ExitCode]);
+      if (st.Error) items.push(['Error', st.Error]);
+    }
+    if (cfg.Hostname) items.push(['Hostname', cfg.Hostname]);
+    if (cfg.Domainname) items.push(['Domain', cfg.Domainname]);
+    if (cfg.MacAddress) items.push(['MAC address', cfg.MacAddress]);
+    if (cfg.StopSignal) items.push(['Stop signal', cfg.StopSignal]);
+
+    let healthHtml = '';
+    if (st.Health) {
+      const tone = _healthTone(st.Health.Status);
+      const recent = (st.Health.Log || []).slice(-5).reverse().map((l) => `
+        <li class="flex items-center gap-2 text-xs">
+          <span class="${l.ExitCode === 0 ? 'text-emerald-400' : 'text-rose-400'}">${l.ExitCode === 0 ? '✓' : '✗'}</span>
+          <span class="text-slate-500 font-mono">${fmtDate(l.Start).split(',')[1]?.trim() || ''}</span>
+          <span class="text-slate-300 truncate flex-1">${escapeHtml((l.Output || '').slice(0, 120) || '(no output)')}</span>
+        </li>`).join('');
+      healthHtml = `
+        <div class="mt-4 rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+          <div class="mb-2 flex items-center gap-2 text-sm">
+            <span class="text-slate-400">Health:</span>
+            <span class="badge ${tone}">${escapeHtml(st.Health.Status)}</span>
+            <span class="text-slate-500 text-xs">(${st.Health.FailingStreak || 0} failing)</span>
+          </div>
+          ${recent ? `<ul class="space-y-1">${recent}</ul>` : '<p class="text-xs text-slate-500">No health-check history.</p>'}
+        </div>`;
+    }
+    return `<div>${_defList(items)}${healthHtml}</div>`;
+  }
+
+  function _ciNetworking(d) {
+    const ns = d.NetworkSettings || {};
+    const cfg = d.Config || {};
+    const host = d.HostConfig || {};
+    const networks = Object.entries(ns.Networks || {});
+
+    const netRows = networks.map(([name, n]) => `
+      <tr class="hover:bg-slate-900/60">
+        <td class="px-3 py-1 font-medium text-slate-200">${escapeHtml(name)}</td>
+        <td class="px-3 py-1 text-slate-300 font-mono text-xs">${escapeHtml(n.IPAddress || '')}${n.IPPrefixLen ? '/'+n.IPPrefixLen : ''}</td>
+        <td class="px-3 py-1 text-slate-400 font-mono text-xs">${escapeHtml(n.Gateway || '')}</td>
+        <td class="px-3 py-1 text-slate-400 font-mono text-xs">${escapeHtml(n.MacAddress || '')}</td>
+        <td class="px-3 py-1 text-slate-400 text-xs">${(n.Aliases || []).map(escapeHtml).join(', ') || '—'}</td>
+      </tr>`);
+
+    const portRows = Object.entries(ns.Ports || {}).map(([cp, bindings]) => {
+      const bs = (bindings || []).map(b => `${b.HostIp || '0.0.0.0'}:${b.HostPort}`).join(', ') || '<span class="text-slate-500">(unpublished)</span>';
+      return `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-3 py-1 font-mono text-xs text-slate-200">${escapeHtml(cp)}</td>
+          <td class="px-3 py-1 font-mono text-xs text-slate-300">${bs}</td>
+        </tr>`;
+    });
+
+    const exposed = Object.keys(cfg.ExposedPorts || {});
+    const dns = (host.Dns || []).join(', ');
+    const dnsSearch = (host.DnsSearch || []).join(', ');
+    const extraHosts = (host.ExtraHosts || []).reduce((acc, e) => {
+      const i = e.indexOf(':'); if (i > 0) acc[e.slice(0, i)] = e.slice(i+1); return acc;
+    }, {});
+
+    return `
+      <div class="space-y-3">
+        ${_defList([
+          ['Network mode', host.NetworkMode],
+          ['Hostname', cfg.Hostname],
+          ['DNS', dns],
+          ['DNS search', dnsSearch],
+          ['Exposed ports', exposed.join(', ')],
+        ])}
+        ${_miniTable('Attached networks', ['Network', 'IP', 'Gateway', 'MAC', 'Aliases'], netRows)}
+        ${_miniTable('Published ports', ['Container', 'Host bindings'], portRows)}
+        ${_kvTable('Extra hosts (/etc/hosts)', extraHosts, { mono: true })}
+      </div>`;
+  }
+
+  function _ciStorage(d) {
+    const mounts = (d.Mounts || []).map(m => `
+      <tr class="hover:bg-slate-900/60">
+        <td class="px-3 py-1 text-xs"><span class="badge bg-slate-700/40 text-slate-300 border border-slate-600/40">${escapeHtml(m.Type || '')}</span></td>
+        <td class="px-3 py-1 font-mono text-xs text-slate-300 break-all">${escapeHtml(m.Source || m.Name || '')}</td>
+        <td class="px-3 py-1 font-mono text-xs text-slate-300 break-all">${escapeHtml(m.Destination || '')}</td>
+        <td class="px-3 py-1 text-xs text-slate-400">${m.Mode || ''}${m.RW === false ? ' (ro)' : ''}</td>
+      </tr>`);
+    const tmpfs = d.HostConfig?.Tmpfs || {};
+    return `
+      <div class="space-y-3">
+        ${_miniTable('Mounts', ['Type', 'Source', 'Destination', 'Mode'], mounts)}
+        ${_kvTable('tmpfs', tmpfs, { mono: true })}
+        ${_defList([
+          ['Read-only root', d.HostConfig?.ReadonlyRootfs ? 'yes' : null],
+          ['SHM size', d.HostConfig?.ShmSize ? fmtBytes(d.HostConfig.ShmSize) : null],
+        ])}
+      </div>`;
+  }
+
+  function _ciEnv(d) {
+    const env = {};
+    for (const e of (d.Config?.Env || [])) {
+      const i = e.indexOf('=');
+      if (i > 0) env[e.slice(0, i)] = e.slice(i + 1);
+      else env[e] = '';
+    }
+    return `
+      <div class="space-y-3">
+        ${_kvTable('Environment', env, { mono: true, masked: true })}
+        ${_kvTable('Labels', d.Config?.Labels || {})}
+      </div>`;
+  }
+
+  function _ciResources(d) {
+    const h = d.HostConfig || {};
+    const items = [
+      ['CPUs (nano)', h.NanoCpus ? (h.NanoCpus / 1e9).toFixed(2) : null],
+      ['CPU shares', h.CpuShares || null],
+      ['Cpuset CPUs', h.CpusetCpus || null],
+      ['CPU period / quota', (h.CpuPeriod || h.CpuQuota) ? `${h.CpuPeriod || '—'} / ${h.CpuQuota || '—'}` : null],
+      ['Memory limit', h.Memory ? fmtBytes(h.Memory) : null],
+      ['Memory reservation', h.MemoryReservation ? fmtBytes(h.MemoryReservation) : null],
+      ['Memory + swap', h.MemorySwap > 0 ? fmtBytes(h.MemorySwap) : (h.MemorySwap === -1 ? 'unlimited' : null)],
+      ['PIDs limit', h.PidsLimit || null],
+      ['OOM score adj', h.OomScoreAdj || null],
+      ['Privileged', h.Privileged ? 'yes' : null],
+      ['Init', h.Init ? 'yes' : null],
+      ['Auto-remove', h.AutoRemove ? 'yes' : null],
+      ['Log driver', h.LogConfig?.Type || null],
+    ];
+    const ulimits = (h.Ulimits || []).map(u => `
+      <tr class="hover:bg-slate-900/60">
+        <td class="px-3 py-1 font-mono text-xs">${escapeHtml(u.Name)}</td>
+        <td class="px-3 py-1 font-mono text-xs">${u.Soft}</td>
+        <td class="px-3 py-1 font-mono text-xs">${u.Hard}</td>
+      </tr>`);
+    const devices = (h.Devices || []).map(dv => `
+      <tr class="hover:bg-slate-900/60">
+        <td class="px-3 py-1 font-mono text-xs">${escapeHtml(dv.PathOnHost || '')}</td>
+        <td class="px-3 py-1 font-mono text-xs">${escapeHtml(dv.PathInContainer || '')}</td>
+        <td class="px-3 py-1 font-mono text-xs text-slate-400">${escapeHtml(dv.CgroupPermissions || '')}</td>
+      </tr>`);
+    const sysctls = h.Sysctls || {};
+    const logOpts = h.LogConfig?.Config || {};
+    return `
+      <div class="space-y-3">
+        ${_defList(items)}
+        ${_miniTable('Ulimits', ['Name', 'Soft', 'Hard'], ulimits)}
+        ${_miniTable('Devices', ['Host', 'Container', 'Cgroup perms'], devices)}
+        ${_kvTable('Sysctls', sysctls, { mono: true })}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+            <div class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Capabilities added</div>
+            <div class="flex flex-wrap gap-1">${(h.CapAdd || []).map(c => `<span class="badge bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">${escapeHtml(c)}</span>`).join('') || '<span class="text-xs text-slate-500">none</span>'}</div>
+          </div>
+          <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+            <div class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Capabilities dropped</div>
+            <div class="flex flex-wrap gap-1">${(h.CapDrop || []).map(c => `<span class="badge bg-rose-500/15 text-rose-300 border border-rose-500/30">${escapeHtml(c)}</span>`).join('') || '<span class="text-xs text-slate-500">none</span>'}</div>
+          </div>
+        </div>
+        <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+          <div class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Security options</div>
+          <div class="flex flex-wrap gap-1">${(h.SecurityOpt || []).map(c => `<span class="badge bg-slate-700/40 text-slate-300 border border-slate-600/40">${escapeHtml(c)}</span>`).join('') || '<span class="text-xs text-slate-500">none</span>'}</div>
+        </div>
+        ${_kvTable('Log driver options', logOpts, { mono: true })}
+      </div>`;
+  }
+
   async function showContainerInspect(id) {
-    try {
-      const data = await api(`/api/containers/${id}`);
-      await modal({ title: `Inspect: ${data.Name?.replace(/^\//, '') || id}`, body: jsonView(data), size: 'xl' });
-    } catch (e) { toast(e.message, 'error'); }
+    let data;
+    try { data = await api(`/api/containers/${id}`); }
+    catch (e) { toast(e.message, 'error'); return; }
+
+    const TABS = [
+      { id: 'overview',   label: 'Overview',     render: () => _ciOverview(data) },
+      { id: 'networking', label: 'Networking',   render: () => _ciNetworking(data) },
+      { id: 'storage',    label: 'Storage',      render: () => _ciStorage(data) },
+      { id: 'env',        label: 'Env & labels', render: () => _ciEnv(data) },
+      { id: 'resources',  label: 'Resources',    render: () => _ciResources(data) },
+      { id: 'raw',        label: 'Raw JSON',     render: () => null },
+    ];
+
+    const wrap = document.createElement('div');
+    const cfg = data.Config || {}, st = data.State || {};
+    const titleName = (data.Name || id).replace(/^\//, '');
+    wrap.innerHTML = `
+      <div class="mb-4 flex flex-wrap items-center gap-3">
+        <div class="min-w-0">
+          <div class="text-base font-semibold text-slate-100 truncate">${escapeHtml(titleName)}</div>
+          <div class="text-[11px] text-slate-500 font-mono">${shortId(data.Id)} <span class="text-slate-600">·</span> ${escapeHtml(cfg.Image || '')}</div>
+        </div>
+        ${statusBadge(st.Status)}
+        ${st.Health ? `<span class="badge ${_healthTone(st.Health.Status)}">${escapeHtml(st.Health.Status)}</span>` : ''}
+        ${st.Status === 'running' ? `<span class="text-xs text-slate-500">up ${_dur(st.StartedAt, null)}</span>` : ''}
+      </div>
+      <div class="border-b border-slate-800 mb-3 flex flex-wrap gap-1 text-xs" id="ci-tabs">
+        ${TABS.map((t, i) => `<button data-tab="${t.id}" class="rounded-t px-3 py-2 transition ${i===0 ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}">${escapeHtml(t.label)}</button>`).join('')}
+      </div>
+      <div id="ci-pane" class="min-h-[200px]"></div>`;
+
+    function paint(tabId) {
+      const tab = TABS.find(t => t.id === tabId) || TABS[0];
+      const pane = wrap.querySelector('#ci-pane');
+      pane.replaceChildren();
+      if (tab.id === 'raw') pane.appendChild(jsonView(data));
+      else pane.innerHTML = tab.render();
+
+      pane.querySelectorAll('[data-reveal]').forEach((b) => {
+        b.onclick = () => {
+          const hidden = b.parentElement.nextElementSibling;
+          const slot = b.parentElement;
+          slot.replaceWith(Object.assign(document.createElement('span'), {
+            className: 'font-mono text-xs',
+            textContent: hidden.textContent,
+          }));
+        };
+      });
+      wrap.querySelectorAll('#ci-tabs button').forEach((b) => {
+        const active = b.dataset.tab === tab.id;
+        b.className = `rounded-t px-3 py-2 transition ${active ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`;
+      });
+    }
+    wrap.querySelector('#ci-tabs').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-tab]'); if (b) paint(b.dataset.tab);
+    });
+    paint(TABS[0].id);
+
+    await modal({
+      title: `Inspect: ${titleName}`,
+      body: wrap,
+      size: 'xl',
+      actions: [{ label: 'Close', value: null, kind: 'secondary' }],
+    });
   }
 
   async function showContainerLogs(id) {
@@ -1572,61 +1892,176 @@
     try { stack = await api(`/api/stacks/${encodeURIComponent(name)}`); }
     catch (e) { toast(e.message, 'error'); return false; }
 
-    const wrap = document.createElement('div');
     const composeAvail = state.config.compose_available;
+    const services = (stack.services && stack.services.length) ? stack.services :
+      Array.from(new Set((stack.containers_detail || []).map(c => c.service).filter(Boolean)));
+    const byService = {};
+    for (const s of services) byService[s] = [];
+    for (const c of (stack.containers_detail || [])) {
+      if (c.service) (byService[c.service] = byService[c.service] || []).push(c);
+    }
+
+    function serviceRow(svc) {
+      const cs = byService[svc] || [];
+      const running = cs.filter(c => c.status === 'running').length;
+      const tone = !cs.length ? 'bg-slate-700/40 text-slate-300 border border-slate-600/40'
+        : (running === cs.length ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+        : (running === 0 ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+        : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'));
+      const containers = cs.map(c => `
+        <div class="flex items-center justify-between gap-2 border-t border-slate-800/50 px-3 py-1.5 text-xs">
+          <div class="min-w-0">
+            <div class="font-medium text-slate-200 truncate">${escapeHtml(c.name)}</div>
+            <div class="text-[10px] text-slate-500 font-mono truncate">${escapeHtml(c.image || '')} · ${shortId(c.id)}</div>
+          </div>
+          <div class="flex items-center gap-1 shrink-0">
+            ${statusBadge(c.status)}
+            <button data-svc-cact="inspect" data-cid="${c.id}" title="Inspect" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px]">⌕</button>
+            ${c.status === 'running' ? `<button data-svc-cact="exec" data-cid="${c.id}" data-cname="${escapeHtml(c.name)}" title="Terminal" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px]">⌨</button>` : ''}
+            <button data-svc-cact="logs" data-cid="${c.id}" title="Logs" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px]">📜</button>
+          </div>
+        </div>`).join('');
+      return `
+        <div class="rounded-lg border border-slate-800 bg-slate-900/40 overflow-hidden">
+          <div class="flex items-center justify-between gap-2 px-3 py-2 bg-slate-900/70">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="font-medium text-slate-100 truncate">${escapeHtml(svc)}</span>
+              <span class="badge ${tone}">${running}/${cs.length}</span>
+            </div>
+            ${stack.managed && composeAvail ? `
+              <div class="flex gap-1 shrink-0">
+                <button data-svc-act="up" data-svc="${escapeHtml(svc)}" title="docker compose up -d ${escapeHtml(svc)}" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-0.5 text-[11px]">▲</button>
+                <button data-svc-act="restart" data-svc="${escapeHtml(svc)}" title="restart" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px]">↻</button>
+                <button data-svc-act="stop" data-svc="${escapeHtml(svc)}" title="stop" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px]">■</button>
+                <button data-svc-act="logs" data-svc="${escapeHtml(svc)}" title="logs" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px]">📜</button>
+                <button data-svc-act="rm" data-svc="${escapeHtml(svc)}" title="rm -sf" class="rounded bg-rose-500/70 hover:bg-rose-500 text-white px-2 py-0.5 text-[11px]">✕</button>
+              </div>` : ''}
+          </div>
+          ${containers || '<div class="px-3 py-2 text-xs text-slate-500">No containers</div>'}
+        </div>`;
+    }
+
+    const wrap = document.createElement('div');
+    const stackTone = stack.containers === 0 ? 'bg-slate-700/40 text-slate-300 border border-slate-600/40'
+      : (stack.running === stack.containers ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+      : (stack.running === 0 ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+      : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'));
+
     wrap.innerHTML = `
       <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
         <span class="badge ${stack.managed ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30' : 'bg-slate-700/40 text-slate-300 border border-slate-600/40'}">${stack.managed ? 'Managed' : 'External'}</span>
-        <span class="text-slate-400">${stack.running}/${stack.containers} running · ${stack.services.length} service${stack.services.length === 1 ? '' : 's'}</span>
+        <span class="badge ${stackTone}">${stack.running}/${stack.containers} running</span>
+        <span class="text-slate-400">${services.length} service${services.length === 1 ? '' : 's'}</span>
+        ${stack.managed && composeAvail ? `<button id="s-validate" class="ml-auto rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-[11px]">Validate compose</button>` : ''}
       </div>
-      <div class="grid gap-4 ${stack.managed ? 'md:grid-cols-2' : ''}">
+
+      <div class="grid gap-4 ${stack.managed ? 'lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]' : ''}">
         ${stack.managed ? `
-          <div>
-            <h4 class="mb-1 text-xs uppercase tracking-wider text-slate-400">docker-compose.yml</h4>
-            <textarea id="s-compose" rows="20" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.compose || '')}</textarea>
-            <h4 class="mt-3 mb-1 text-xs uppercase tracking-wider text-slate-400">.env</h4>
-            <textarea id="s-env" rows="6" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.env || '')}</textarea>
+          <div class="space-y-3">
+            <div>
+              <div class="mb-1 flex items-center justify-between">
+                <h4 class="text-xs uppercase tracking-wider text-slate-400">docker-compose.yml</h4>
+                <span id="s-validate-status" class="text-[11px] text-slate-500"></span>
+              </div>
+              <textarea id="s-compose" spellcheck="false" rows="20" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono leading-relaxed" style="tab-size:2">${escapeHtml(stack.compose || '')}</textarea>
+            </div>
+            <div>
+              <h4 class="mb-1 text-xs uppercase tracking-wider text-slate-400">.env</h4>
+              <textarea id="s-env" spellcheck="false" rows="5" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.env || '')}</textarea>
+            </div>
           </div>` : ''}
         <div>
-          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Containers</h4>
+          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Services</h4>
           <div class="space-y-2">
-            ${(stack.containers_detail || []).map(c => `
-              <div class="rounded border border-slate-800 bg-slate-900/50 p-2 text-xs flex items-center justify-between">
-                <div>
-                  <div class="font-medium text-slate-200">${escapeHtml(c.service || '')} <span class="text-slate-500">·</span> ${escapeHtml(c.name)}</div>
-                  <div class="text-[10px] text-slate-500 font-mono">${escapeHtml(c.image || '')}</div>
-                </div>
-                <span>${statusBadge(c.status)}</span>
-              </div>`).join('') || '<div class="text-xs text-slate-500">No running containers</div>'}
+            ${services.length ? services.map(serviceRow).join('') : '<div class="text-xs text-slate-500">No services</div>'}
           </div>
           ${stack.managed && composeAvail ? `
             <div class="mt-4 grid grid-cols-2 gap-2">
-              <button data-act="up" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1.5 text-xs">▲ Up -d</button>
-              <button data-act="down" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">▼ Down</button>
-              <button data-act="restart" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">↻ Restart</button>
-              <button data-act="pull" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">⤓ Pull</button>
-              <button data-act="logs" class="col-span-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">📜 Tail logs</button>
+              <button data-stack-act="up" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1.5 text-xs">▲ Up -d (all)</button>
+              <button data-stack-act="down" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">▼ Down</button>
+              <button data-stack-act="restart" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">↻ Restart all</button>
+              <button data-stack-act="pull" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">⤓ Pull all</button>
+              <button data-stack-act="logs" class="col-span-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">📜 Tail logs (all)</button>
             </div>` : ''}
         </div>
       </div>`;
 
-    wrap.addEventListener('click', async (e) => {
-      const t = e.target.closest('[data-act]'); if (!t) return;
-      const act = t.dataset.act;
-      try {
-        if (act === 'logs') {
-          await streamComposeModal(`${name}: logs`, `/api/stacks/${encodeURIComponent(name)}/logs?tail=300`, { method: 'GET' });
-        } else {
-          await streamComposeModal(`${name}: ${act}`, `/api/stacks/${encodeURIComponent(name)}/${act}`);
+    // Tab inserts a real tab character in the YAML editor. Compose forbids tabs, but
+    // some users prefer them to indent — we just keep the editor predictable.
+    const ta = wrap.querySelector('#s-compose');
+    if (ta) {
+      ta.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          const s = ta.selectionStart, eend = ta.selectionEnd;
+          ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(eend);
+          ta.selectionStart = ta.selectionEnd = s + 2;
         }
-      } catch (ex) { toast(ex.message, 'error'); }
+      });
+    }
+
+    wrap.addEventListener('click', async (e) => {
+      const stackBtn = e.target.closest('[data-stack-act]');
+      if (stackBtn) {
+        const act = stackBtn.dataset.stackAct;
+        if (act === 'logs') {
+          return streamComposeModal(`${name}: logs`, `/api/stacks/${encodeURIComponent(name)}/logs?tail=300`, { method: 'GET' });
+        }
+        return streamComposeModal(`${name}: ${act}`, `/api/stacks/${encodeURIComponent(name)}/${act}`);
+      }
+      const svcBtn = e.target.closest('[data-svc-act]');
+      if (svcBtn) {
+        const act = svcBtn.dataset.svcAct;
+        const svc = svcBtn.dataset.svc;
+        if (act === 'rm') {
+          const ok = await confirmModal(`Remove containers for service "${svc}"?`, { danger: true, confirmLabel: 'Remove' });
+          if (!ok) return;
+        }
+        if (act === 'logs') {
+          return streamComposeModal(`${name}/${svc}: logs`, `/api/stacks/${encodeURIComponent(name)}/services/${encodeURIComponent(svc)}/logs?tail=300`, { method: 'GET' });
+        }
+        return streamComposeModal(`${name}/${svc}: ${act}`, `/api/stacks/${encodeURIComponent(name)}/services/${encodeURIComponent(svc)}/${act}`);
+      }
+      const cBtn = e.target.closest('[data-svc-cact]');
+      if (cBtn) {
+        const act = cBtn.dataset.svcCact;
+        const cid = cBtn.dataset.cid;
+        if (act === 'inspect') return showContainerInspect(cid);
+        if (act === 'exec') return openTerminal(cid, cBtn.dataset.cname);
+        if (act === 'logs') return showContainerLogs(cid);
+      }
     });
+
+    if (stack.managed && composeAvail) {
+      const vbtn = wrap.querySelector('#s-validate');
+      const vstatus = wrap.querySelector('#s-validate-status');
+      vbtn.onclick = async () => {
+        vstatus.textContent = 'Validating…'; vstatus.className = 'text-[11px] text-slate-400';
+        try {
+          // First save the current text to disk so the validator sees it.
+          await api(`/api/stacks/${encodeURIComponent(name)}`, {
+            method: 'PUT',
+            body: JSON.stringify({ compose: ta.value, env: wrap.querySelector('#s-env').value }),
+          });
+          const r = await api(`/api/stacks/${encodeURIComponent(name)}/validate`, { method: 'POST' });
+          if (r.ok) {
+            vstatus.textContent = '✓ valid'; vstatus.className = 'text-[11px] text-emerald-400';
+          } else {
+            vstatus.textContent = '✗ invalid (see toast)'; vstatus.className = 'text-[11px] text-rose-400';
+            toast(r.stderr.trim().split('\n').slice(-3).join('\n') || 'compose config failed', 'error');
+          }
+        } catch (ex) {
+          vstatus.textContent = '✗ error'; vstatus.className = 'text-[11px] text-rose-400';
+          toast(ex.message, 'error');
+        }
+      };
+    }
 
     const actions = [{ label: 'Close', value: false, kind: 'secondary' }];
     if (stack.managed) {
       actions.push({ label: 'Save changes', kind: 'primary', value: true, onClick: async () => {
         const payload = {
-          compose: wrap.querySelector('#s-compose').value,
+          compose: ta.value,
           env: wrap.querySelector('#s-env').value,
         };
         try {
