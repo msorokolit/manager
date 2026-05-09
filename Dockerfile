@@ -5,6 +5,23 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+ARG COMPOSE_VERSION=v2.29.7
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && ARCH="$(dpkg --print-architecture)" \
+ && case "$ARCH" in \
+      amd64)  COMPOSE_ARCH=x86_64  ;; \
+      arm64)  COMPOSE_ARCH=aarch64 ;; \
+      armhf)  COMPOSE_ARCH=armv7   ;; \
+      *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+      -o /usr/local/bin/docker-compose \
+ && chmod +x /usr/local/bin/docker-compose \
+ && apt-get purge -y --auto-remove curl \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY backend/requirements.txt /app/backend/requirements.txt
@@ -13,7 +30,12 @@ RUN pip install -r /app/backend/requirements.txt
 COPY backend /app/backend
 COPY frontend /app/frontend
 
+RUN mkdir -p /data/stacks
+
 ENV STATIC_DIR=/app/frontend \
+    STACKS_DIR=/data/stacks \
+    COMPOSE_BIN=docker-compose \
+    EXEC_DEFAULT_SHELL=/bin/sh \
     ADMIN_USER=admin \
     ADMIN_PASSWORD=admin \
     ALLOW_DESTRUCTIVE=true

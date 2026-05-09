@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .config import settings
-from .routers import containers, images, networks, system, volumes
+from .routers import containers, exec as exec_router, images, networks, stacks, system, volumes
 
 app = FastAPI(
     title="Docker Manager",
@@ -32,6 +32,8 @@ app.include_router(containers.router)
 app.include_router(images.router)
 app.include_router(networks.router)
 app.include_router(volumes.router)
+app.include_router(stacks.router)
+app.include_router(exec_router.router)
 
 
 @app.get("/api/health", tags=["meta"])
@@ -41,9 +43,14 @@ def health() -> dict:
 
 @app.get("/api/config", tags=["meta"])
 def public_config() -> dict:
+    import shutil as _shutil
+
     return {
         "version": __version__,
         "allow_destructive": settings.allow_destructive,
+        "compose_available": _shutil.which(settings.compose_bin) is not None,
+        "stacks_dir": settings.stacks_dir,
+        "exec_default_shell": settings.exec_default_shell,
     }
 
 

@@ -14,19 +14,31 @@ The stack is intentionally small and easy to audit:
 
 ## Features
 
-- Dashboard with engine/host stats and recent containers
-- Containers — list, inspect, start/stop/restart/pause/kill, remove, prune
+- **Dashboard** with engine/host stats and recent containers
+- **Containers** — list, inspect, start/stop/restart/pause/kill, remove, prune
   - One-click follow-mode log streaming
   - "Run container" form with image, name, command, env, ports, volumes,
     restart policy, network, and pre-pull
-- Images — list, inspect, pull (with streaming progress), remove, prune dangling
-- Networks — list, inspect, create (bridge/overlay/macvlan/ipvlan/host), remove, prune
-- Volumes — list, inspect, create, remove, prune
-- System — engine info, version, disk usage breakdown
+  - **In-browser interactive terminal** (xterm.js + WebSocket; full TTY,
+    auto-resize, choose any command e.g. `/bin/bash`)
+- **Stacks (docker-compose)** — store compose files on the manager and
+  drive their lifecycle from the UI, plus discover compose projects already
+  running on the host:
+  - Create a stack from a compose YAML (and optional `.env`) and deploy with
+    one click; output of `docker compose up -d` streamed live
+  - `up`, `down`, `restart`, `pull`, tail logs — all stream stdout/stderr to
+    the browser
+  - Edit the compose / env content from the browser
+  - "External" stacks (those not stored on the manager but identified by
+    `com.docker.compose.project` labels) are listed read-only
+- **Images** — list, inspect, pull (with streaming progress), remove, prune dangling
+- **Networks** — list, inspect, create (bridge/overlay/macvlan/ipvlan/host), remove, prune
+- **Volumes** — list, inspect, create, remove, prune
+- **System** — engine info, version, disk usage breakdown
 - Live daemon-status indicator (green/red) with periodic ping
 - Two roles:
-  - `admin` — can call any endpoint
-  - `viewer` (optional) — can read everything but cannot mutate
+  - `admin` — can call any endpoint, including stacks and exec
+  - `viewer` (optional) — can read everything but cannot mutate or open shells
 
 ## Quick start (Docker Compose)
 
@@ -71,6 +83,9 @@ All configuration is via environment variables.
 | `CORS_ORIGINS`       | _(empty)_        | Comma-separated origins to allow if the UI is hosted elsewhere        |
 | `STATIC_DIR`         | `./frontend`     | Path to the SPA assets                                                |
 | `LOG_TAIL_DEFAULT`   | `200`            | Default tail size for log endpoints                                   |
+| `STACKS_DIR`         | `/data/stacks`   | Where managed compose stacks are persisted (one subdir per stack)     |
+| `COMPOSE_BIN`        | `docker-compose` | Path to a compose v2 binary; resolved from `$PATH` if relative        |
+| `EXEC_DEFAULT_SHELL` | `/bin/sh`        | Pre-filled command in the in-browser terminal                         |
 
 ## Security notes
 
@@ -81,9 +96,14 @@ All configuration is via environment variables.
 - Set a strong `ADMIN_PASSWORD`. The default of `admin/admin` exists only to
   make first-run testing trivial.
 - For an audit-friendly read-only deployment, set `ALLOW_DESTRUCTIVE=false` and
-  use the `viewer` account.
+  use the `viewer` account. Note that the in-browser terminal and all stack
+  mutations require the `admin` role and so are disabled in this mode too.
 - HTTP Basic credentials are sent on every request; always front this with TLS
   in production (Caddy, Traefik, nginx, an ingress controller, etc.).
+- The terminal endpoint is a WebSocket. Browsers cannot attach an HTTP Basic
+  header to `new WebSocket(...)`, so authentication uses a one-shot ticket
+  (`POST /api/exec/ticket`) that is consumed on connect and expires in 60s.
+  Tickets are bound to the issuing role and only admins can mint them.
 
 ## Project layout
 
@@ -100,6 +120,8 @@ backend/
       images.py        list/inspect/pull (streaming)/remove/prune
       networks.py      list/inspect/create/remove/prune
       volumes.py       list/inspect/create/remove/prune
+      stacks.py        list/get/create/update/up/down/restart/pull/logs/delete
+      exec.py          POST /api/exec/ticket + WS /api/containers/{id}/exec
   requirements.txt
 frontend/
   index.html

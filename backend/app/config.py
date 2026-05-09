@@ -23,6 +23,9 @@ class Settings:
     cors_origins: list[str]
     static_dir: str
     log_tail_default: int
+    stacks_dir: str
+    compose_bin: str
+    exec_default_shell: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -40,6 +43,9 @@ class Settings:
                 os.path.join(os.path.dirname(__file__), "..", "..", "frontend")
             )),
             log_tail_default=int(os.getenv("LOG_TAIL_DEFAULT", "200")),
+            stacks_dir=os.getenv("STACKS_DIR", "/data/stacks"),
+            compose_bin=os.getenv("COMPOSE_BIN", "docker-compose"),
+            exec_default_shell=os.getenv("EXEC_DEFAULT_SHELL", "/bin/sh"),
         )
 
 

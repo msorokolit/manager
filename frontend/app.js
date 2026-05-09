@@ -13,6 +13,7 @@
   const NAV = [
     { id: 'dashboard', label: 'Dashboard', icon: '🏠' },
     { id: 'containers', label: 'Containers', icon: '📦' },
+    { id: 'stacks', label: 'Stacks', icon: '🧱' },
     { id: 'images', label: 'Images', icon: '🗂️' },
     { id: 'networks', label: 'Networks', icon: '🌐' },
     { id: 'volumes', label: 'Volumes', icon: '💾' },
@@ -452,6 +453,7 @@
               ${actionButton(c, 'restart', '↻ Restart', 'secondary', false)}
               ${actionButton(c, 'stop', '■ Stop', 'secondary', c.state !== 'running')}
               <button data-act="logs" data-id="${c.id}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Logs</button>
+              <button data-act="exec" data-id="${c.id}" data-name="${escapeHtml(c.name)}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" ${c.state !== 'running' ? 'disabled' : ''} ${c.state !== 'running' ? 'title="Container must be running"' : ''}>⌨ Terminal</button>
               <button data-act="remove" data-id="${c.id}" class="rounded-md bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
             </div>
           </td>
@@ -488,12 +490,13 @@
 
     list.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]');
-      if (!t) return;
+      if (!t || t.disabled) return;
       const id = t.dataset.id;
       const act = t.dataset.act;
       try {
         if (act === 'inspect') return showContainerInspect(id);
         if (act === 'logs') return showContainerLogs(id);
+        if (act === 'exec') return openTerminal(id, t.dataset.name);
         if (act === 'remove') {
           const ok = await confirmModal('Remove this container? This cannot be undone.', { danger: true, confirmLabel: 'Remove' });
           if (!ok) return;
@@ -995,6 +998,355 @@
 
     await load();
   };
+
+  // ---------- Terminal (container exec) ----------
+  function openTerminal(containerId, containerName) {
+    if (typeof Terminal === 'undefined') {
+      toast('Terminal library failed to load', 'error');
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="mb-3 flex flex-wrap items-center gap-2">
+        <label class="text-xs text-slate-400">Command
+          <input id="term-cmd" value="${escapeHtml(state.config.exec_default_shell || '/bin/sh')}" class="ml-1 w-56 rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+        </label>
+        <button id="term-reconnect" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">Reconnect</button>
+        <span id="term-status" class="ml-2 text-xs text-slate-400">Idle</span>
+      </div>
+      <div id="term-host" class="rounded border border-slate-800 bg-black" style="height: 60vh; padding: 6px;"></div>`;
+
+    let term, fit, ws, resizeObs;
+
+    function setStatus(text, kind = 'info') {
+      const el = wrap.querySelector('#term-status');
+      if (!el) return;
+      const tones = { info: 'text-slate-400', ok: 'text-emerald-400', err: 'text-rose-400' };
+      el.className = `ml-2 text-xs ${tones[kind] || tones.info}`;
+      el.textContent = text;
+    }
+
+    async function connect() {
+      if (ws && ws.readyState !== WebSocket.CLOSED) { try { ws.close(); } catch {} }
+      let ticket;
+      try {
+        const r = await api('/api/exec/ticket', { method: 'POST' });
+        ticket = r.ticket;
+      } catch (e) { setStatus(e.message, 'err'); return; }
+      const cmd = wrap.querySelector('#term-cmd').value || '/bin/sh';
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const cols = term.cols, rows = term.rows;
+      const url = `${proto}://${location.host}/api/containers/${encodeURIComponent(containerId)}/exec`
+        + `?ticket=${encodeURIComponent(ticket)}&cmd=${encodeURIComponent(cmd)}&cols=${cols}&rows=${rows}`;
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      setStatus('Connecting…');
+      ws.onopen = () => { setStatus('Connected', 'ok'); term.focus(); };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') term.write(ev.data);
+        else term.write(new Uint8Array(ev.data));
+      };
+      ws.onclose = (ev) => setStatus(`Disconnected (${ev.code}${ev.reason ? ': ' + ev.reason : ''})`, ev.code === 1000 ? 'info' : 'err');
+      ws.onerror = () => setStatus('Connection error', 'err');
+    }
+
+    // Open the modal first (without awaiting) so the host element is in the DOM,
+    // then bootstrap xterm.js into it.
+    const promise = modal({
+      title: `Terminal: ${containerName || containerId.slice(0,12)}`,
+      body: wrap, size: 'xl',
+      actions: [{ label: 'Close', value: null, kind: 'secondary' }],
+    });
+
+    // Defer to next tick so DOM is mounted.
+    setTimeout(() => {
+      try {
+        term = new Terminal({
+          fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+          fontSize: 13,
+          cursorBlink: true,
+          theme: { background: '#000000', foreground: '#e2e8f0' },
+          convertEol: true,
+        });
+        fit = new FitAddon.FitAddon();
+        term.loadAddon(fit);
+        term.open(wrap.querySelector('#term-host'));
+        try { fit.fit(); } catch {}
+        term.onData((data) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
+        term.onResize(({ cols, rows }) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+          }
+        });
+        resizeObs = new ResizeObserver(() => { try { fit.fit(); } catch {} });
+        resizeObs.observe(wrap.querySelector('#term-host'));
+        wrap.querySelector('#term-reconnect').onclick = connect;
+        wrap.querySelector('#term-cmd').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); connect(); }
+        });
+        connect();
+      } catch (e) {
+        setStatus('Init failed: ' + e.message, 'err');
+      }
+    }, 0);
+
+    promise.then(() => {
+      try { ws && ws.close(); } catch {}
+      try { resizeObs && resizeObs.disconnect(); } catch {}
+      try { term && term.dispose(); } catch {}
+    });
+  };
+
+  // ---------- Stacks ----------
+  views.stacks = async (root) => {
+    const composeAvail = state.config.compose_available;
+    const warning = composeAvail ? '' : `
+      <div class="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+        <strong>docker-compose binary not found</strong> on the manager host. You can still browse stacks discovered from running containers, but creating or deploying stacks is disabled. Install the compose plugin or set <code>COMPOSE_BIN</code>.
+      </div>`;
+    root.innerHTML = pageHeader(
+      'Stacks',
+      'Manage docker-compose projects',
+      `${composeAvail ? btn('+ New stack', { kind: 'primary', id: 'new-stack' }) : ''}
+       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
+    ) + warning;
+    const list = document.createElement('div'); root.appendChild(list);
+
+    async function load() {
+      list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        const items = await api('/api/stacks');
+        const rows = items.map((s) => `
+          <tr class="hover:bg-slate-900/60">
+            <td class="px-4 py-2">
+              <button data-act="open" data-name="${escapeHtml(s.name)}" class="text-left">
+                <div class="font-medium text-sky-300 hover:underline">${escapeHtml(s.name)}</div>
+                <div class="text-[11px] text-slate-500">${s.managed ? 'Managed' : 'External (no stored compose file)'}</div>
+              </button>
+            </td>
+            <td class="px-4 py-2 text-slate-300">${s.services.map(escapeHtml).join(', ') || '<span class="text-slate-500">—</span>'}</td>
+            <td class="px-4 py-2 text-slate-400">${s.running}/${s.containers}</td>
+            <td class="px-4 py-2 text-right">
+              <div class="flex justify-end gap-1">
+                ${s.managed && composeAvail ? `<button data-act="up" data-name="${escapeHtml(s.name)}" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1 text-xs">▲ Up</button>` : ''}
+                ${s.managed && composeAvail ? `<button data-act="down" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">▼ Down</button>` : ''}
+                ${s.managed && composeAvail ? `<button data-act="restart" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">↻ Restart</button>` : ''}
+                ${s.managed && composeAvail ? `<button data-act="pull" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⤓ Pull</button>` : ''}
+                ${s.managed ? `<button data-act="delete" data-name="${escapeHtml(s.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Delete</button>` : ''}
+              </div>
+            </td>
+          </tr>`);
+        list.innerHTML = table(['Name', 'Services', 'Running', ''], rows);
+      } catch (e) {
+        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    list.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-act]'); if (!t) return;
+      const name = t.dataset.name; const act = t.dataset.act;
+      try {
+        if (act === 'open') return openStackDialog(name).then((changed) => { if (changed) load(); });
+        if (act === 'delete') {
+          const ok = await confirmModal(`Tear down and delete stack "${name}"?`, { danger: true, confirmLabel: 'Delete' });
+          if (!ok) return;
+          await api(`/api/stacks/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          toast('Stack deleted', 'success'); load(); return;
+        }
+        // up/down/restart/pull stream output
+        const path = `/api/stacks/${encodeURIComponent(name)}/${act}`;
+        await streamComposeModal(`${name}: ${act}`, path);
+        load();
+      } catch (ex) { toast(ex.message, 'error'); }
+    });
+
+    document.getElementById('refresh').onclick = load;
+    if (composeAvail) {
+      const btnNew = document.getElementById('new-stack');
+      if (btnNew) btnNew.onclick = () => newStackDialog().then((created) => { if (created) load(); });
+    }
+    await load();
+  };
+
+  async function streamComposeModal(title, path, opts = {}) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<pre id="out" class="log-pane h-[55vh] overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-300"></pre>`;
+    const pane = wrap.querySelector('#out');
+    let abort = new AbortController();
+    const promise = modal({
+      title, body: wrap, size: 'xl',
+      actions: [{ label: 'Close', value: null, kind: 'secondary' }],
+    });
+    try {
+      const res = await fetch(path, {
+        method: opts.method || 'POST',
+        headers: {
+          Authorization: `Basic ${state.auth.basic}`,
+          ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: opts.body || null,
+        signal: abort.signal,
+      });
+      if (!res.ok && !res.body) {
+        let det = res.statusText; try { const j = await res.json(); det = j.detail || det; } catch {}
+        pane.textContent += `ERROR ${res.status}: ${det}\n`;
+      } else {
+        const reader = res.body.getReader(); const dec = new TextDecoder();
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          pane.textContent += dec.decode(value, { stream: true });
+          pane.scrollTop = pane.scrollHeight;
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') pane.textContent += `\n[stream error: ${e.message}]\n`;
+    }
+    promise.then(() => abort.abort());
+    await promise;
+  }
+
+  async function newStackDialog() {
+    const sample = `services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="grid gap-3">
+        <label class="block"><span class="text-xs text-slate-400">Stack name *</span>
+          <input id="s-name" required placeholder="my-app" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <label class="block"><span class="text-xs text-slate-400">docker-compose.yml *</span>
+          <textarea id="s-compose" rows="14" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(sample)}</textarea></label>
+        <details>
+          <summary class="text-xs text-slate-400 cursor-pointer">Optional .env file</summary>
+          <textarea id="s-env" rows="4" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono" placeholder="KEY=value"></textarea>
+        </details>
+        <label class="flex items-center gap-2 text-xs text-slate-300">
+          <input id="s-deploy" type="checkbox" checked class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Deploy immediately (docker-compose up -d)
+        </label>
+      </div>`;
+    let success = false;
+    await modal({
+      title: 'New stack',
+      body: wrap, size: 'xl',
+      actions: [
+        { label: 'Cancel', value: false, kind: 'secondary' },
+        { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+          const payload = {
+            name: wrap.querySelector('#s-name').value.trim(),
+            compose: wrap.querySelector('#s-compose').value,
+            env: wrap.querySelector('#s-env').value || null,
+            deploy: wrap.querySelector('#s-deploy').checked,
+          };
+          if (!payload.name) return false;
+          try {
+            const res = await fetch('/api/stacks', {
+              method: 'POST',
+              headers: {
+                Authorization: `Basic ${state.auth.basic}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+              let det = res.statusText; try { const j = await res.json(); det = j.detail || det; } catch {}
+              throw new Error(det);
+            }
+            success = true;
+            if (payload.deploy) {
+              const reader = res.body.getReader(); const dec = new TextDecoder();
+              const pane = document.createElement('pre');
+              pane.className = 'log-pane mt-3 h-48 overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-300';
+              wrap.appendChild(pane);
+              while (true) {
+                const { value, done } = await reader.read(); if (done) break;
+                pane.textContent += dec.decode(value, { stream: true });
+                pane.scrollTop = pane.scrollHeight;
+              }
+            }
+            toast('Stack created', 'success');
+          } catch (e) {
+            toast(e.message, 'error'); return false;
+          }
+        }},
+      ],
+    });
+    return success;
+  }
+
+  async function openStackDialog(name) {
+    let stack;
+    try { stack = await api(`/api/stacks/${encodeURIComponent(name)}`); }
+    catch (e) { toast(e.message, 'error'); return false; }
+
+    const wrap = document.createElement('div');
+    const composeAvail = state.config.compose_available;
+    wrap.innerHTML = `
+      <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+        <span class="badge ${stack.managed ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30' : 'bg-slate-700/40 text-slate-300 border border-slate-600/40'}">${stack.managed ? 'Managed' : 'External'}</span>
+        <span class="text-slate-400">${stack.running}/${stack.containers} running · ${stack.services.length} service${stack.services.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="grid gap-4 ${stack.managed ? 'md:grid-cols-2' : ''}">
+        ${stack.managed ? `
+          <div>
+            <h4 class="mb-1 text-xs uppercase tracking-wider text-slate-400">docker-compose.yml</h4>
+            <textarea id="s-compose" rows="20" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.compose || '')}</textarea>
+            <h4 class="mt-3 mb-1 text-xs uppercase tracking-wider text-slate-400">.env</h4>
+            <textarea id="s-env" rows="6" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.env || '')}</textarea>
+          </div>` : ''}
+        <div>
+          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Containers</h4>
+          <div class="space-y-2">
+            ${(stack.containers_detail || []).map(c => `
+              <div class="rounded border border-slate-800 bg-slate-900/50 p-2 text-xs flex items-center justify-between">
+                <div>
+                  <div class="font-medium text-slate-200">${escapeHtml(c.service || '')} <span class="text-slate-500">·</span> ${escapeHtml(c.name)}</div>
+                  <div class="text-[10px] text-slate-500 font-mono">${escapeHtml(c.image || '')}</div>
+                </div>
+                <span>${statusBadge(c.status)}</span>
+              </div>`).join('') || '<div class="text-xs text-slate-500">No running containers</div>'}
+          </div>
+          ${stack.managed && composeAvail ? `
+            <div class="mt-4 grid grid-cols-2 gap-2">
+              <button data-act="up" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1.5 text-xs">▲ Up -d</button>
+              <button data-act="down" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">▼ Down</button>
+              <button data-act="restart" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">↻ Restart</button>
+              <button data-act="pull" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">⤓ Pull</button>
+              <button data-act="logs" class="col-span-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1.5 text-xs">📜 Tail logs</button>
+            </div>` : ''}
+        </div>
+      </div>`;
+
+    wrap.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-act]'); if (!t) return;
+      const act = t.dataset.act;
+      try {
+        if (act === 'logs') {
+          await streamComposeModal(`${name}: logs`, `/api/stacks/${encodeURIComponent(name)}/logs?tail=300`, { method: 'GET' });
+        } else {
+          await streamComposeModal(`${name}: ${act}`, `/api/stacks/${encodeURIComponent(name)}/${act}`);
+        }
+      } catch (ex) { toast(ex.message, 'error'); }
+    });
+
+    const actions = [{ label: 'Close', value: false, kind: 'secondary' }];
+    if (stack.managed) {
+      actions.push({ label: 'Save changes', kind: 'primary', value: true, onClick: async () => {
+        const payload = {
+          compose: wrap.querySelector('#s-compose').value,
+          env: wrap.querySelector('#s-env').value,
+        };
+        try {
+          await api(`/api/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify(payload) });
+          toast('Saved (run "Up" to apply)', 'success');
+        } catch (e) { toast(e.message, 'error'); return false; }
+      }});
+    }
+    return await modal({ title: `Stack: ${name}`, body: wrap, size: 'xl', actions }) === true;
+  }
 
   // ---------- System ----------
   views.system = async (root) => {
