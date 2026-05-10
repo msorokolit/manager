@@ -1,6 +1,5 @@
 // Container management endpoints.
-import { Router } from 'express';
-import { authenticate, requireAdmin } from '../auth.js';
+import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
 import {
   asyncHandler,
@@ -9,24 +8,22 @@ import {
   pipeNdjson,
   pipeRaw,
 } from '../util.js';
-import { validateBody } from '../validate.js';
-import { CreateContainerRequest } from '../schemas/index.js';
+import { createApiRouter, streamResponse, customResponse } from '../route-builder.js';
+import {
+  ContainerSummary,
+  CreateContainerRequest,
+  PassThroughObject,
+} from '../schemas/index.js';
 
-const router = Router();
-router.use(authenticate);
+const r = createApiRouter('/api/containers', { tag: 'containers' });
 
 function portsObj(arr) {
-  // dockerode list returns Ports: [{IP, PrivatePort, PublicPort, Type}]
-  // Frontend expects { "80/tcp": [{HostIp, HostPort}] }
   const out = {};
   for (const p of arr || []) {
     const key = `${p.PrivatePort}/${p.Type || 'tcp'}`;
     if (!out[key]) out[key] = [];
     if (p.PublicPort) {
-      out[key].push({
-        HostIp: p.IP || '0.0.0.0',
-        HostPort: String(p.PublicPort),
-      });
+      out[key].push({ HostIp: p.IP || '0.0.0.0', HostPort: String(p.PublicPort) });
     }
   }
   return out;
@@ -38,7 +35,7 @@ function summary(c) {
     short_id: c.Id.slice(0, 12),
     name: ((c.Names && c.Names[0]) || '').replace(/^\//, ''),
     image: c.Image,
-    status: c.State, // "running" / "exited" / etc. - frontend expects this token
+    status: c.State,
     state: c.State,
     health: null,
     started_at: null,
@@ -74,8 +71,19 @@ function summaryFromInspect(attrs) {
   };
 }
 
-router.get(
+const ListQuery = Type.Object(
+  { all: Type.Optional(Type.Boolean({ default: true })) },
+  { additionalProperties: false },
+);
+const IdParam = Type.Object({ id: Type.String() }, { additionalProperties: false });
+
+r.get(
   '/',
+  {
+    summary: 'List containers',
+    query: ListQuery,
+    responses: { 200: Type.Array(ContainerSummary) },
+  },
   asyncHandler(async (req, res) => {
     const all = boolQuery(req.query.all, true);
     const list = await getClient().listContainers({ all });
@@ -83,72 +91,126 @@ router.get(
   }),
 );
 
-router.get(
+r.get(
   '/prune',
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().pruneContainers());
-  }),
+  {
+    summary: 'Prune stopped containers (alias of POST /prune)',
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (_req, res) => res.json(await getClient().pruneContainers())),
 );
 
-router.post(
+r.post(
   '/prune',
-  requireAdmin,
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().pruneContainers());
-  }),
+  {
+    summary: 'Prune stopped containers',
+    admin: true,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (_req, res) => res.json(await getClient().pruneContainers())),
 );
 
-router.get(
-  '/:id',
+r.post(
+  '/',
+  {
+    summary: 'Create and start a container',
+    admin: true,
+    body: CreateContainerRequest,
+    responses: { 200: ContainerSummary },
+  },
   asyncHandler(async (req, res) => {
-    const c = getClient().getContainer(req.params.id);
-    res.json(await c.inspect());
+    const body = req.body;
+    const docker = getClient();
+    if (body.pull) {
+      await new Promise((resolve, reject) => {
+        docker.pull(body.image, (err, stream) => {
+          if (err) return reject(err);
+          docker.modem.followProgress(stream, (e) => (e ? reject(e) : resolve()));
+        });
+      });
+    }
+    const opts = buildCreateOptions(body);
+    const c = await docker.createContainer(opts);
+    await c.start();
+    res.json(summaryFromInspect(await c.inspect()));
   }),
 );
 
-router.get(
+r.get(
+  '/:id',
+  {
+    summary: 'Inspect a container',
+    params: IdParam,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (req, res) =>
+    res.json(await getClient().getContainer(req.params.id).inspect()),
+  ),
+);
+
+const LogsQuery = Type.Object(
+  {
+    tail: Type.Optional(Type.Integer({ minimum: 1, maximum: 50000, default: 200 })),
+    timestamps: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { additionalProperties: false },
+);
+
+r.get(
   '/:id/logs',
+  {
+    summary: 'Tail logs (one-shot)',
+    params: IdParam,
+    query: LogsQuery,
+    responses: { 200: Type.Object({ logs: Type.String() }) },
+  },
   asyncHandler(async (req, res) => {
     const tail = intQuery(req.query.tail, 200, { min: 1, max: 50000 });
     const timestamps = boolQuery(req.query.timestamps, false);
     const c = getClient().getContainer(req.params.id);
-    const buf = await c.logs({
-      stdout: true,
-      stderr: true,
-      tail,
-      timestamps,
-      follow: false,
-    });
-    // dockerode returns a Buffer when follow:false
+    const buf = await c.logs({ stdout: true, stderr: true, tail, timestamps, follow: false });
     res.json({ logs: Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf) });
   }),
 );
 
-router.get(
+r.get(
   '/:id/logs/stream',
+  {
+    summary: 'Follow logs (text stream)',
+    params: IdParam,
+    query: Type.Object(
+      { tail: Type.Optional(Type.Integer({ minimum: 1, maximum: 50000, default: 100 })) },
+      { additionalProperties: false },
+    ),
+    responses: { 200: streamResponse('Raw container log bytes', 'text/plain') },
+  },
   asyncHandler(async (req, res) => {
     const tail = intQuery(req.query.tail, 100, { min: 1, max: 50000 });
     const c = getClient().getContainer(req.params.id);
-    const stream = await c.logs({
-      stdout: true,
-      stderr: true,
-      tail,
-      follow: true,
-    });
+    const stream = await c.logs({ stdout: true, stderr: true, tail, follow: true });
     pipeRaw(stream, res);
   }),
 );
 
-router.get(
+r.get(
   '/:id/stats',
-  asyncHandler(async (req, res) => {
-    const c = getClient().getContainer(req.params.id);
-    res.json(await c.stats({ stream: false }));
-  }),
+  {
+    summary: 'One-shot stats sample',
+    params: IdParam,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (req, res) =>
+    res.json(await getClient().getContainer(req.params.id).stats({ stream: false })),
+  ),
 );
 
-router.get(
+r.get(
   '/:id/stats/stream',
+  {
+    summary: 'Live stats (NDJSON)',
+    params: IdParam,
+    responses: { 200: streamResponse('NDJSON stream of stats samples') },
+  },
   asyncHandler(async (req, res) => {
     const c = getClient().getContainer(req.params.id);
     const stream = await c.stats({ stream: true });
@@ -162,44 +224,36 @@ async function action(id, name) {
   return summaryFromInspect(await c.inspect());
 }
 
-router.post(
-  '/:id/start',
-  requireAdmin,
-  asyncHandler(async (req, res) => res.json(await action(req.params.id, 'start'))),
-);
-router.post(
-  '/:id/stop',
-  requireAdmin,
-  asyncHandler(async (req, res) => res.json(await action(req.params.id, 'stop'))),
-);
-router.post(
-  '/:id/restart',
-  requireAdmin,
-  asyncHandler(async (req, res) =>
-    res.json(await action(req.params.id, 'restart')),
-  ),
-);
-router.post(
-  '/:id/pause',
-  requireAdmin,
-  asyncHandler(async (req, res) => res.json(await action(req.params.id, 'pause'))),
-);
-router.post(
-  '/:id/unpause',
-  requireAdmin,
-  asyncHandler(async (req, res) =>
-    res.json(await action(req.params.id, 'unpause')),
-  ),
-);
-router.post(
-  '/:id/kill',
-  requireAdmin,
-  asyncHandler(async (req, res) => res.json(await action(req.params.id, 'kill'))),
+for (const verb of ['start', 'stop', 'restart', 'pause', 'unpause', 'kill']) {
+  r.post(
+    `/:id/${verb}`,
+    {
+      summary: `${verb[0].toUpperCase()}${verb.slice(1)}`,
+      admin: true,
+      params: IdParam,
+      responses: { 200: ContainerSummary },
+    },
+    asyncHandler(async (req, res) => res.json(await action(req.params.id, verb))),
+  );
+}
+
+const RemoveQuery = Type.Object(
+  {
+    force: Type.Optional(Type.Boolean({ default: false })),
+    volumes: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { additionalProperties: false },
 );
 
-router.delete(
+r.delete(
   '/:id',
-  requireAdmin,
+  {
+    summary: 'Remove a container',
+    admin: true,
+    params: IdParam,
+    query: RemoveQuery,
+    responses: { 200: Type.Object({ removed: Type.String() }) },
+  },
   asyncHandler(async (req, res) => {
     const force = boolQuery(req.query.force, false);
     const v = boolQuery(req.query.volumes, false);
@@ -210,38 +264,18 @@ router.delete(
 );
 
 // Build the dockerode createContainer payload from our rich JSON schema.
-// The body is already validated upstream by validateBody(CreateContainerBody),
-// so this function trusts the shape + types it receives.
 function buildCreateOptions(o) {
-  const env = o.env
-    ? Object.entries(o.env).map(([k, v]) => `${k}=${v}`)
-    : undefined;
+  const env = o.env ? Object.entries(o.env).map(([k, v]) => `${k}=${v}`) : undefined;
+  const cmd = Array.isArray(o.command) ? o.command : typeof o.command === 'string' && o.command.length ? o.command.split(/\s+/) : undefined;
+  const entrypoint = Array.isArray(o.entrypoint) ? o.entrypoint : typeof o.entrypoint === 'string' && o.entrypoint.length ? o.entrypoint.split(/\s+/) : undefined;
 
-  const cmd = Array.isArray(o.command)
-    ? o.command
-    : typeof o.command === 'string' && o.command.length
-      ? o.command.split(/\s+/)
-      : undefined;
-  const entrypoint = Array.isArray(o.entrypoint)
-    ? o.entrypoint
-    : typeof o.entrypoint === 'string' && o.entrypoint.length
-      ? o.entrypoint.split(/\s+/)
-      : undefined;
-
-  // Ports: { "80/tcp": 8080 } -> ExposedPorts + PortBindings
   const exposedPorts = {};
   const portBindings = {};
   for (const [containerPort, host] of Object.entries(o.ports || {})) {
     exposedPorts[containerPort] = {};
-    portBindings[containerPort] = [
-      {
-        HostIp: '',
-        HostPort: host == null ? '' : String(host),
-      },
-    ];
+    portBindings[containerPort] = [{ HostIp: '', HostPort: host == null ? '' : String(host) }];
   }
 
-  // Volumes: { "/host": {bind: "/container", mode: "rw"} } -> Binds
   const binds = [];
   for (const [src, spec] of Object.entries(o.volumes || {})) {
     if (spec && typeof spec === 'object' && spec.bind) {
@@ -249,20 +283,12 @@ function buildCreateOptions(o) {
     }
   }
 
-  // tmpfs: { "/run": "size=64m" }
   const tmpfs = o.tmpfs || undefined;
-
-  // Devices: ["/host:/container[:rwm]"]
   const devices = (o.devices || []).map((s) => {
     const parts = s.split(':');
-    return {
-      PathOnHost: parts[0],
-      PathInContainer: parts[1] || parts[0],
-      CgroupPermissions: parts[2] || 'rwm',
-    };
+    return { PathOnHost: parts[0], PathInContainer: parts[1] || parts[0], CgroupPermissions: parts[2] || 'rwm' };
   });
 
-  // Healthcheck
   let healthcheck;
   if (o.healthcheck) {
     const hc = o.healthcheck;
@@ -276,48 +302,19 @@ function buildCreateOptions(o) {
       StartPeriod: hc.start_period || undefined,
     };
   }
-
-  // Log config
   let logConfig;
-  if (o.log_driver) {
-    logConfig = {
-      Type: o.log_driver,
-      Config: o.log_opts || {},
-    };
-  }
-
-  // Restart policy
-  const restartPolicy = o.restart_policy
-    ? { Name: o.restart_policy }
-    : undefined;
-
-  // ExtraHosts: { "db": "10.0.0.5" } -> ["db:10.0.0.5"]
-  const extraHosts = o.extra_hosts
-    ? Object.entries(o.extra_hosts).map(([h, ip]) => `${h}:${ip}`)
-    : undefined;
-
-  // Ulimits
-  const ulimits = (o.ulimits || []).map((u) => ({
-    Name: u.name,
-    Soft: u.soft,
-    Hard: u.hard,
-  }));
-
-  // GPUs
+  if (o.log_driver) logConfig = { Type: o.log_driver, Config: o.log_opts || {} };
+  const restartPolicy = o.restart_policy ? { Name: o.restart_policy } : undefined;
+  const extraHosts = o.extra_hosts ? Object.entries(o.extra_hosts).map(([h, ip]) => `${h}:${ip}`) : undefined;
+  const ulimits = (o.ulimits || []).map((u) => ({ Name: u.name, Soft: u.soft, Hard: u.hard }));
   const deviceRequests = [];
   if (o.gpus !== undefined && o.gpus !== null && o.gpus !== '' && o.gpus !== 0) {
-    const count =
-      String(o.gpus).toLowerCase() === 'all' || Number(o.gpus) === -1
-        ? -1
-        : Number(o.gpus);
+    const count = String(o.gpus).toLowerCase() === 'all' || Number(o.gpus) === -1 ? -1 : Number(o.gpus);
     deviceRequests.push({ Count: count, Capabilities: [['gpu']] });
   }
-
-  // Networking
   const endpointsConfig = {};
   if (o.network) endpointsConfig[o.network] = {};
 
-  // Memory parsing helper
   function memBytes(v) {
     if (v == null || v === '') return undefined;
     if (typeof v === 'number') return v;
@@ -339,8 +336,7 @@ function buildCreateOptions(o) {
     Hostname: o.hostname || undefined,
     Domainname: o.domainname || undefined,
     StopSignal: o.stop_signal || undefined,
-    StopTimeout:
-      o.stop_grace_period != null ? Number(o.stop_grace_period) : undefined,
+    StopTimeout: o.stop_grace_period != null ? Number(o.stop_grace_period) : undefined,
     Tty: o.tty,
     OpenStdin: o.stdin_open,
     Labels: o.labels || undefined,
@@ -369,10 +365,7 @@ function buildCreateOptions(o) {
       Ulimits: ulimits.length ? ulimits : undefined,
       LogConfig: logConfig,
       DeviceRequests: deviceRequests.length ? deviceRequests : undefined,
-      NanoCpus:
-        o.cpus != null && o.cpus !== ''
-          ? Math.floor(Number(o.cpus) * 1_000_000_000)
-          : undefined,
+      NanoCpus: o.cpus != null && o.cpus !== '' ? Math.floor(Number(o.cpus) * 1_000_000_000) : undefined,
       CpuShares: o.cpu_shares != null ? Number(o.cpu_shares) : undefined,
       CpusetCpus: o.cpuset_cpus || undefined,
       Memory: memBytes(o.mem_limit),
@@ -381,12 +374,8 @@ function buildCreateOptions(o) {
       PidsLimit: o.pids_limit != null ? Number(o.pids_limit) : undefined,
       ShmSize: memBytes(o.shm_size),
     },
-    NetworkingConfig: Object.keys(endpointsConfig).length
-      ? { EndpointsConfig: endpointsConfig }
-      : undefined,
+    NetworkingConfig: Object.keys(endpointsConfig).length ? { EndpointsConfig: endpointsConfig } : undefined,
   };
-
-  // Strip undefined to keep payload clean.
   function clean(obj) {
     if (Array.isArray(obj)) return obj;
     if (!obj || typeof obj !== 'object') return obj;
@@ -399,34 +388,4 @@ function buildCreateOptions(o) {
   return clean(create);
 }
 
-router.post(
-  '/',
-  requireAdmin,
-  validateBody(CreateContainerRequest),
-  asyncHandler(async (req, res) => {
-    const body = req.body;
-    const docker = getClient();
-    if (body.pull) {
-      // Pull synchronously before create.
-      await new Promise((resolve, reject) => {
-        docker.pull(body.image, (err, stream) => {
-          if (err) return reject(err);
-          docker.modem.followProgress(stream, (e) => (e ? reject(e) : resolve()));
-        });
-      });
-    }
-    const opts = buildCreateOptions(body);
-    const c = await docker.createContainer(opts);
-    if (body.detach !== false) {
-      await c.start();
-      res.json(summaryFromInspect(await c.inspect()));
-    } else {
-      // Synchronous run: not really supported via dockerode the same way; start
-      // and return what we have.
-      await c.start();
-      res.json(summaryFromInspect(await c.inspect()));
-    }
-  }),
-);
-
-export default router;
+export default r;

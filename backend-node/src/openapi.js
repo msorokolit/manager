@@ -1,13 +1,15 @@
-// Auto-generates the OpenAPI 3.1 document from the same TypeBox / JSON
-// Schema fragments the routes use for validation. There's only one place to
-// keep in sync: when you add a route, also add a path entry below.
+// Auto-generates the OpenAPI 3.1 document from the operation registry that
+// each route file populates via createApiRouter().
 //
-// Each top-level schema imported here lives under components.schemas; routes
-// reference them via `$ref: '#/components/schemas/<$id>'` so the spec stays
-// readable and Swagger UI can group them in its "Schemas" pane.
+// Adding a route doesn't require touching this file: just declare the route
+// in its routes/<resource>.js with a `summary`, `body`, `params`, `query`
+// and `responses` and it shows up in /api/openapi.json + Swagger UI.
 import * as S from './schemas/index.js';
 import { VERSION } from './config.js';
 
+// All schemas with $id are emitted under components.schemas; refs are used
+// in path operations so the spec stays compact and Swagger UI can group them
+// in its "Schemas" pane.
 const COMPONENT_SCHEMAS = [
   S.ErrorResponse,
   S.ValidationError,
@@ -44,49 +46,155 @@ function ref(schema) {
   if (schema && schema.$id) return { $ref: `#/components/schemas/${schema.$id}` };
   return schema;
 }
-
+function inlineSchema(schema) {
+  if (!schema) return undefined;
+  // Strip $id when inlining inside a path operation so it doesn't conflict
+  // with the components/schemas entry.
+  if (schema.$id) return ref(schema);
+  return schema;
+}
 function jsonResp(schema, description = 'OK') {
-  return { description, content: { 'application/json': { schema: ref(schema) } } };
+  return { description, content: { 'application/json': { schema: inlineSchema(schema) } } };
 }
-function jsonBody(schema, required = true, description = '') {
-  return { required, description, content: { 'application/json': { schema: ref(schema) } } };
+function jsonBody(schema, description = '') {
+  return { required: true, description, content: { 'application/json': { schema: inlineSchema(schema) } } };
 }
-function streamResp(description, mediaType = 'application/x-ndjson') {
-  return { description, content: { [mediaType]: { schema: { type: 'string' } } } };
+function streamResp(description, contentType = 'application/x-ndjson') {
+  return { description, content: { [contentType]: { schema: { type: 'string' } } } };
 }
 
-const COMMON_RESPONSES = {
-  400: jsonResp(S.ValidationError, 'Validation failed'),
-  401: jsonResp(S.ErrorResponse, 'Missing or invalid bearer token'),
-  403: jsonResp(S.ErrorResponse, 'Forbidden (admin role / destructive disabled)'),
-  404: jsonResp(S.ErrorResponse, 'Resource not found'),
-  502: jsonResp(S.ErrorResponse, 'Docker daemon error'),
-  503: jsonResp(S.ErrorResponse, 'Docker daemon unreachable'),
-};
+const ERR_400 = jsonResp(S.ValidationError, 'Validation failed');
+const ERR_401 = jsonResp(S.ErrorResponse, 'Missing or invalid bearer token');
+const ERR_403 = jsonResp(S.ErrorResponse, 'Forbidden (admin role / destructive disabled)');
+const ERR_404 = jsonResp(S.ErrorResponse, 'Resource not found');
+const ERR_502 = jsonResp(S.ErrorResponse, 'Docker daemon error');
+const ERR_503 = jsonResp(S.ErrorResponse, 'Docker daemon unreachable');
 
-const BEARER = [{ bearerAuth: [] }];
+function expressPathToOpenApi(p) {
+  return p.replace(/:(\w+)/g, '{$1}');
+}
 
-const parameter = (name, where, schema, opts = {}) => ({
-  name,
-  in: where,
-  required: where === 'path' ? true : !!opts.required,
-  schema,
-  description: opts.description,
-});
+function buildResponses(op) {
+  const out = {};
+  if (op.responses) {
+    for (const [code, val] of Object.entries(op.responses)) {
+      if (val == null) continue;
+      if (val.kind === 'stream') {
+        out[code] = streamResp(val.description || 'Stream', val.contentType || 'application/x-ndjson');
+      } else if (val.kind === 'custom') {
+        out[code] = val.definition;
+      } else if (val.content) {
+        out[code] = val;
+      } else {
+        out[code] = jsonResp(val);
+      }
+    }
+  }
+  if (!Object.keys(out).length) out['200'] = { description: 'OK' };
+  if ((op.body || op.params || op.query) && !out['400']) out['400'] = ERR_400;
+  if (op.auth !== false && !out['401']) out['401'] = ERR_401;
+  if (op.admin && !out['403']) out['403'] = ERR_403;
+  // Most routes touch the daemon, so always include 502/503 unless the route
+  // explicitly opted out (404 isn't always raised).
+  if (!out['502']) out['502'] = ERR_502;
+  if (!out['503']) out['503'] = ERR_503;
+  return out;
+}
 
-const PATH_NAME = parameter('name', 'path', { type: 'string' });
-const PATH_ID = parameter('id', 'path', { type: 'string' });
-const PATH_SERVICE = parameter('service', 'path', { type: 'string' });
-const PATH_ACTION = parameter('action', 'path', { type: 'string', enum: S.SERVICE_ACTIONS });
+function buildParameters(op) {
+  // Allow explicit override via op.extra.openapiParams (used when the route
+  // uses an Express regex path like /^\/((?!prune$).+)$/ where the path-name
+  // can't be derived from the route definition).
+  if (op.extra && Array.isArray(op.extra.openapiParams)) {
+    return op.extra.openapiParams;
+  }
+  const params = [];
+  if (op.params && op.params.properties) {
+    for (const [name, schema] of Object.entries(op.params.properties)) {
+      params.push({ name, in: 'path', required: true, schema });
+    }
+  }
+  if (op.query && op.query.properties) {
+    const required = op.query.required || [];
+    for (const [name, schema] of Object.entries(op.query.properties)) {
+      params.push({
+        name,
+        in: 'query',
+        required: required.includes(name),
+        schema,
+      });
+    }
+  }
+  return params;
+}
 
-const QUERY_TAIL = parameter('tail', 'query', { type: 'integer', default: 200, minimum: 1, maximum: 5000 });
-const QUERY_FORCE = parameter('force', 'query', { type: 'boolean', default: false });
-const QUERY_PATH = parameter('path', 'query', { type: 'string' });
+function pathFor(op) {
+  if (op.extra && op.extra.openapiPath) return op.extra.openapiPath;
+  const raw = op.fullPath;
+  // Skip routes whose Express path is a regex (no sensible OpenAPI mapping
+  // unless the route declares extra.openapiPath).
+  if (raw instanceof RegExp) return null;
+  if (typeof raw !== 'string') return null;
+  return expressPathToOpenApi(raw);
+}
 
-function ok(schema) { return { 200: jsonResp(schema) }; }
-function okWith(schema, extras = {}) { return { 200: jsonResp(schema), ...extras }; }
+export function buildOpenApiSpec(operations, opts = {}) {
+  const paths = {};
+  const tagSet = new Set();
+  for (const op of operations) {
+    const p = pathFor(op);
+    if (!p) continue;
+    paths[p] = paths[p] || {};
+    const operation = {
+      tags: op.tags && op.tags.length ? op.tags : undefined,
+      summary: op.summary,
+      description: op.description,
+      security: op.auth === false ? [] : [{ bearerAuth: [] }],
+      parameters: buildParameters(op),
+      requestBody: op.extra && op.extra.requestBody
+        ? op.extra.requestBody
+        : op.body
+          ? jsonBody(op.body)
+          : undefined,
+      responses: buildResponses(op),
+    };
+    // Strip empty-array parameters / undefined fields so the spec stays clean.
+    if (operation.parameters && operation.parameters.length === 0) {
+      delete operation.parameters;
+    }
+    for (const k of Object.keys(operation)) {
+      if (operation[k] === undefined) delete operation[k];
+    }
+    paths[p][op.method] = operation;
+    for (const t of op.tags || []) tagSet.add(t);
+  }
 
-export function buildOpenApiSpec() {
+  // Always include the public meta endpoints — they aren't part of any
+  // resource router but are always there.
+  if (!paths['/api/health']) {
+    paths['/api/health'] = {
+      get: {
+        tags: ['meta'], summary: 'Liveness probe', security: [],
+        responses: { 200: jsonResp(S.HealthResponse) },
+      },
+    };
+    tagSet.add('meta');
+  }
+  if (!paths['/api/config']) {
+    paths['/api/config'] = {
+      get: {
+        tags: ['meta'], summary: 'Public configuration / feature flags', security: [],
+        responses: { 200: jsonResp(S.ConfigResponse) },
+      },
+    };
+    tagSet.add('meta');
+  }
+
+  // Stable tag order for the UI: meta first, then alphabetical.
+  const tags = ['meta', ...[...tagSet].filter((t) => t !== 'meta').sort()].map(
+    (name) => ({ name }),
+  );
+
   return {
     openapi: '3.1.0',
     info: {
@@ -100,7 +208,10 @@ export function buildOpenApiSpec() {
         'Authentication: `POST /api/auth/login` exchanges a username + password ' +
         'for an HS256 JWT, sent as `Authorization: Bearer <token>` on every ' +
         'subsequent request. The WebSocket exec endpoint uses a one-shot ticket ' +
-        '(see `POST /api/exec/ticket`).',
+        '(see `POST /api/exec/ticket`).\n\n' +
+        'This document is **auto-generated** from the same TypeBox / JSON Schema ' +
+        'fragments the runtime uses for validation — there is no hand-maintained ' +
+        'OpenAPI definition.',
     },
     servers: [{ url: '/' }],
     components: {
@@ -114,261 +225,20 @@ export function buildOpenApiSpec() {
         }),
       ),
     },
-    tags: [
-      { name: 'meta' },
-      { name: 'auth' },
-      { name: 'system' },
-      { name: 'containers' },
-      { name: 'images' },
-      { name: 'networks' },
-      { name: 'volumes' },
-      { name: 'volume-browser' },
-      { name: 'stacks' },
-      { name: 'registries' },
-      { name: 'exec' },
-    ],
-    paths: {
-      // ---------- meta ----------
-      '/api/health': {
-        get: {
-          tags: ['meta'],
-          summary: 'Liveness probe',
-          security: [],
-          responses: ok(S.HealthResponse),
-        },
-      },
-      '/api/config': {
-        get: {
-          tags: ['meta'],
-          summary: 'Public configuration / feature flags',
-          security: [],
-          responses: ok(S.ConfigResponse),
-        },
-      },
-
-      // ---------- auth ----------
-      '/api/auth/login': {
-        post: {
-          tags: ['auth'],
-          summary: 'Exchange credentials for a JWT',
-          security: [],
-          requestBody: jsonBody(S.LoginRequest),
-          responses: { 200: jsonResp(S.LoginResponse), 400: COMMON_RESPONSES[400], 401: COMMON_RESPONSES[401] },
-        },
-      },
-      '/api/auth/me': {
-        get: {
-          tags: ['auth'],
-          summary: 'Current user (validates the bearer token)',
-          security: BEARER,
-          responses: { 200: jsonResp(S.MeResponse), 401: COMMON_RESPONSES[401] },
-        },
-      },
-
-      // ---------- system ----------
-      '/api/system/ping': {
-        get: { tags: ['system'], summary: 'Ping the Docker daemon', security: BEARER, responses: { 200: jsonResp(S.PingResponse), ...COMMON_RESPONSES } },
-      },
-      '/api/system/info': {
-        get: { tags: ['system'], summary: 'docker info (raw)', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/system/version': {
-        get: { tags: ['system'], summary: 'docker version (raw)', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/system/df': {
-        get: { tags: ['system'], summary: 'Docker disk usage', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/system/events': {
-        get: {
-          tags: ['system'], summary: 'Recent docker events (bounded)', security: BEARER,
-          parameters: [parameter('limit', 'query', { type: 'integer', default: 25, minimum: 1, maximum: 1000 })],
-          responses: { 200: jsonResp({ type: 'array', items: { type: 'object', additionalProperties: true } }), ...COMMON_RESPONSES },
-        },
-      },
-      '/api/system/events/stream': {
-        get: {
-          tags: ['system'], summary: 'Live docker events (NDJSON)', security: BEARER,
-          responses: { 200: streamResp('NDJSON stream of docker event objects'), ...COMMON_RESPONSES },
-        },
-      },
-
-      // ---------- containers ----------
-      '/api/containers': {
-        get: {
-          tags: ['containers'], summary: 'List containers', security: BEARER,
-          parameters: [parameter('all', 'query', { type: 'boolean', default: true })],
-          responses: { 200: jsonResp({ type: 'array', items: ref(S.ContainerSummary) }), ...COMMON_RESPONSES },
-        },
-        post: {
-          tags: ['containers'], summary: 'Create and start a container (admin)', security: BEARER,
-          requestBody: jsonBody(S.CreateContainerRequest),
-          responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES },
-        },
-      },
-      '/api/containers/prune': {
-        post: { tags: ['containers'], summary: 'Prune stopped containers (admin)', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/containers/{id}': {
-        get: { tags: ['containers'], summary: 'Inspect a container', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['containers'], summary: 'Remove a container (admin)', security: BEARER, parameters: [PATH_ID, QUERY_FORCE, parameter('volumes', 'query', { type: 'boolean', default: false })], responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-      '/api/containers/{id}/start': { post: { tags: ['containers'], summary: 'Start (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/stop': { post: { tags: ['containers'], summary: 'Stop (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/restart': { post: { tags: ['containers'], summary: 'Restart (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/pause': { post: { tags: ['containers'], summary: 'Pause (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/unpause': { post: { tags: ['containers'], summary: 'Unpause (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/kill': { post: { tags: ['containers'], summary: 'Kill (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.ContainerSummary), ...COMMON_RESPONSES } } },
-      '/api/containers/{id}/logs': {
-        get: {
-          tags: ['containers'], summary: 'Tail logs (one-shot)', security: BEARER,
-          parameters: [PATH_ID, QUERY_TAIL, parameter('timestamps', 'query', { type: 'boolean', default: false })],
-          responses: { 200: jsonResp({ type: 'object', properties: { logs: { type: 'string' } }, required: ['logs'] }), ...COMMON_RESPONSES },
-        },
-      },
-      '/api/containers/{id}/logs/stream': {
-        get: { tags: ['containers'], summary: 'Follow logs (text stream)', security: BEARER, parameters: [PATH_ID, parameter('tail', 'query', { type: 'integer', default: 100 })], responses: { 200: streamResp('Raw container log bytes', 'text/plain'), ...COMMON_RESPONSES } },
-      },
-      '/api/containers/{id}/stats': {
-        get: { tags: ['containers'], summary: 'One-shot stats sample', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/containers/{id}/stats/stream': {
-        get: { tags: ['containers'], summary: 'Live stats (NDJSON)', security: BEARER, parameters: [PATH_ID], responses: { 200: streamResp('NDJSON stream of stats samples'), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- images ----------
-      '/api/images': {
-        get: { tags: ['images'], summary: 'List images', security: BEARER, responses: { 200: jsonResp({ type: 'array', items: ref(S.ImageSummary) }), ...COMMON_RESPONSES } },
-      },
-      '/api/images/pull': {
-        post: { tags: ['images'], summary: 'Pull an image (admin, NDJSON progress stream)', security: BEARER, requestBody: jsonBody(S.PullRequest), responses: { 200: streamResp('NDJSON pull progress'), ...COMMON_RESPONSES } },
-      },
-      '/api/images/prune': {
-        post: { tags: ['images'], summary: 'Prune images (admin)', security: BEARER, parameters: [parameter('dangling_only', 'query', { type: 'boolean', default: true })], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/images/{id}': {
-        get: { tags: ['images'], summary: 'Inspect an image', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['images'], summary: 'Remove an image (admin)', security: BEARER, parameters: [PATH_ID, QUERY_FORCE], responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- networks ----------
-      '/api/networks': {
-        get: { tags: ['networks'], summary: 'List networks', security: BEARER, responses: { 200: jsonResp({ type: 'array', items: ref(S.NetworkSummary) }), ...COMMON_RESPONSES } },
-        post: { tags: ['networks'], summary: 'Create network (admin)', security: BEARER, requestBody: jsonBody(S.CreateNetworkRequest), responses: { 200: jsonResp(S.NetworkSummary), ...COMMON_RESPONSES } },
-      },
-      '/api/networks/prune': { post: { tags: ['networks'], summary: 'Prune unused networks (admin)', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } } },
-      '/api/networks/{id}': {
-        get: { tags: ['networks'], summary: 'Inspect a network', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['networks'], summary: 'Remove a network (admin)', security: BEARER, parameters: [PATH_ID], responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-      '/api/networks/{id}/connect': {
-        post: { tags: ['networks'], summary: 'Connect a container (admin)', security: BEARER, parameters: [PATH_ID], requestBody: jsonBody(S.ConnectRequest), responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-      '/api/networks/{id}/disconnect': {
-        post: { tags: ['networks'], summary: 'Disconnect a container (admin)', security: BEARER, parameters: [PATH_ID], requestBody: jsonBody(S.DisconnectRequest), responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- volumes ----------
-      '/api/volumes': {
-        get: { tags: ['volumes'], summary: 'List volumes', security: BEARER, responses: { 200: jsonResp({ type: 'array', items: ref(S.VolumeSummary) }), ...COMMON_RESPONSES } },
-        post: { tags: ['volumes'], summary: 'Create volume (admin)', security: BEARER, requestBody: jsonBody(S.CreateVolumeRequest), responses: { 200: jsonResp(S.VolumeSummary), ...COMMON_RESPONSES } },
-      },
-      '/api/volumes/prune': { post: { tags: ['volumes'], summary: 'Prune unused volumes (admin)', security: BEARER, responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } } },
-      '/api/volumes/{name}': {
-        get: { tags: ['volumes'], summary: 'Inspect a volume', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['volumes'], summary: 'Remove a volume (admin)', security: BEARER, parameters: [PATH_NAME, QUERY_FORCE], responses: { 200: jsonResp({ type: 'object' }), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- volume-browser ----------
-      '/api/volumes/{name}/browse/list': {
-        get: { tags: ['volume-browser'], summary: 'List a directory inside a volume', security: BEARER, parameters: [PATH_NAME, QUERY_PATH], responses: { 200: jsonResp(S.VolumeBrowseListResponse), ...COMMON_RESPONSES } },
-      },
-      '/api/volumes/{name}/browse/file': {
-        get: {
-          tags: ['volume-browser'], summary: 'Download a file', security: BEARER,
-          parameters: [PATH_NAME, { ...QUERY_PATH, required: true }],
-          responses: { 200: { description: 'File bytes', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } }, ...COMMON_RESPONSES },
-        },
-        post: {
-          tags: ['volume-browser'], summary: 'Upload a file (admin)', security: BEARER,
-          parameters: [PATH_NAME, QUERY_PATH],
-          requestBody: { required: true, content: { 'multipart/form-data': { schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } }, required: ['file'] } } } },
-          responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES },
-        },
-        delete: { tags: ['volume-browser'], summary: 'Delete a file or directory (admin)', security: BEARER, parameters: [PATH_NAME, { ...QUERY_PATH, required: true }], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/volumes/{name}/browse/mkdir': {
-        post: { tags: ['volume-browser'], summary: 'Make a directory (admin)', security: BEARER, parameters: [PATH_NAME, { ...QUERY_PATH, required: true }], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/volumes/{name}/browse/stop': {
-        post: { tags: ['volume-browser'], summary: 'Stop the volume-browser sidecar (admin)', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- stacks ----------
-      '/api/stacks': {
-        get: { tags: ['stacks'], summary: 'List stacks (managed + discovered)', security: BEARER, responses: { 200: jsonResp({ type: 'array', items: ref(S.StackSummary) }), ...COMMON_RESPONSES } },
-        post: { tags: ['stacks'], summary: 'Create a stack (admin); streams compose stdout if deploy=true', security: BEARER, requestBody: jsonBody(S.CreateStackRequest), responses: { 200: streamResp('compose up -d stdout (text/plain) or {name, deployed:false}', 'text/plain'), ...COMMON_RESPONSES } },
-      },
-      '/api/stacks/{name}': {
-        get: { tags: ['stacks'], summary: 'Get stack detail', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.StackDetail), ...COMMON_RESPONSES } },
-        put: { tags: ['stacks'], summary: 'Replace compose / env files (admin)', security: BEARER, parameters: [PATH_NAME], requestBody: jsonBody(S.UpdateStackRequest), responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['stacks'], summary: 'Tear down + remove a managed stack (admin)', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/stacks/{name}/up': { post: { tags: ['stacks'], summary: 'compose up -d (admin, streamed)', security: BEARER, parameters: [PATH_NAME], responses: { 200: streamResp('compose stdout', 'text/plain'), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/down': { post: { tags: ['stacks'], summary: 'compose down (admin, streamed)', security: BEARER, parameters: [PATH_NAME, parameter('volumes', 'query', { type: 'boolean', default: false })], responses: { 200: streamResp('compose stdout', 'text/plain'), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/restart': { post: { tags: ['stacks'], summary: 'compose restart (admin, streamed)', security: BEARER, parameters: [PATH_NAME], responses: { 200: streamResp('compose stdout', 'text/plain'), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/pull': { post: { tags: ['stacks'], summary: 'compose pull (admin, streamed)', security: BEARER, parameters: [PATH_NAME], responses: { 200: streamResp('compose stdout', 'text/plain'), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/logs': { get: { tags: ['stacks'], summary: 'compose logs (streamed)', security: BEARER, parameters: [PATH_NAME, QUERY_TAIL], responses: { 200: streamResp('compose logs', 'text/plain'), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/validate': { post: { tags: ['stacks'], summary: 'compose config -q', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.ValidateResponse), ...COMMON_RESPONSES } } },
-      '/api/stacks/{name}/services/{service}/{action}': {
-        post: {
-          tags: ['stacks'], summary: 'Per-service compose action (admin, streamed)', security: BEARER,
-          parameters: [PATH_NAME, PATH_SERVICE, PATH_ACTION],
-          responses: { 200: streamResp('compose stdout', 'text/plain'), ...COMMON_RESPONSES },
-        },
-      },
-      '/api/stacks/{name}/services/{service}/logs': {
-        get: { tags: ['stacks'], summary: 'Per-service compose logs (streamed)', security: BEARER, parameters: [PATH_NAME, PATH_SERVICE, QUERY_TAIL], responses: { 200: streamResp('compose logs', 'text/plain'), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- registries ----------
-      '/api/registries': {
-        get: { tags: ['registries'], summary: 'List stored registry credentials', security: BEARER, responses: { 200: jsonResp({ type: 'array', items: ref(S.RegistryPublic) }), ...COMMON_RESPONSES } },
-        post: { tags: ['registries'], summary: 'Add or replace a registry (admin)', security: BEARER, requestBody: jsonBody(S.RegistryRequest), responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/registries/{name}': {
-        put: { tags: ['registries'], summary: 'Add or replace by path (admin)', security: BEARER, parameters: [PATH_NAME], requestBody: jsonBody(S.RegistryUpdateRequest), responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-        delete: { tags: ['registries'], summary: 'Delete a registry (admin)', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-      '/api/registries/{name}/test': {
-        post: { tags: ['registries'], summary: 'Test login against the saved credentials (admin)', security: BEARER, parameters: [PATH_NAME], responses: { 200: jsonResp(S.PassThroughObject), ...COMMON_RESPONSES } },
-      },
-
-      // ---------- exec ----------
-      '/api/exec/ticket': {
-        post: {
-          tags: ['exec'],
-          summary: 'Mint a one-shot 60s WebSocket ticket (admin)',
-          description:
-            'Returns a token that authorises a single connection to the WebSocket exec ' +
-            'endpoint. Tickets cannot be replayed and expire after 60s.',
-          security: BEARER,
-          responses: { 200: jsonResp(S.TicketResponse), 401: COMMON_RESPONSES[401], 403: COMMON_RESPONSES[403] },
-        },
-      },
-    },
-    // The exec WebSocket isn't an HTTP path, but we document it under
-    // x-webhooks so consumers see it in the spec. Swagger UI v5 doesn't
-    // render this section, but it's useful for spec readers.
+    tags,
+    paths,
+    // The exec WebSocket isn't an HTTP path. Document it under x-websockets
+    // so spec consumers see it.
     'x-websockets': {
       '/api/containers/{id}/exec': {
         method: 'WS',
         summary: 'Bidirectional terminal stream (admin only, ticket-gated)',
         parameters: [
-          PATH_ID,
-          parameter('ticket', 'query', { type: 'string' }, { description: 'One-shot token from POST /api/exec/ticket' }),
-          parameter('cmd', 'query', { type: 'string', default: '/bin/sh' }),
-          parameter('cols', 'query', { type: 'integer', default: 80 }),
-          parameter('rows', 'query', { type: 'integer', default: 24 }),
+          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'ticket', in: 'query', required: true, schema: { type: 'string' }, description: 'One-shot token from POST /api/exec/ticket' },
+          { name: 'cmd', in: 'query', schema: { type: 'string', default: '/bin/sh' } },
+          { name: 'cols', in: 'query', schema: { type: 'integer', default: 80 } },
+          { name: 'rows', in: 'query', schema: { type: 'integer', default: 24 } },
         ],
       },
     },

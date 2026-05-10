@@ -1,31 +1,34 @@
 // Container exec ticket endpoint. The actual WebSocket handling lives in
-// `attachExecWebSocket` because it needs to hook the HTTP server's upgrade
+// `handleExecWebSocket` because it needs to hook the HTTP server's upgrade
 // event rather than be expressed as an Express route.
-import { Router } from 'express';
-import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
-import { authenticate } from '../auth.js';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError } from '../util.js';
+import { createApiRouter } from '../route-builder.js';
+import { TicketResponse } from '../schemas/index.js';
 
-const router = Router();
+const r = createApiRouter('/api/exec', { tag: 'exec' });
 
 const TICKET_TTL_MS = 60_000;
-const tickets = new Map(); // token -> { user, role, expires }
+const tickets = new Map();
 
 function gc() {
   const now = Date.now();
   for (const [k, v] of tickets) if (v.expires < now) tickets.delete(k);
 }
 
-router.post(
+r.post(
   '/ticket',
-  authenticate,
+  {
+    summary: 'Mint a one-shot 60s WebSocket exec ticket',
+    description:
+      'Returns a token that authorises a single connection to the WebSocket exec endpoint. ' +
+      'Tickets cannot be replayed and expire after 60s. Admin only.',
+    admin: true,
+    responses: { 200: TicketResponse },
+  },
   asyncHandler(async (req, res) => {
-    if (req.user.role !== 'admin') {
-      throw new HttpError(403, 'Exec requires admin role');
-    }
     gc();
     const token = randomBytes(24).toString('base64url');
     tickets.set(token, {
@@ -73,7 +76,6 @@ export async function handleExecWebSocket(ws, req, params) {
   }
 
   const argv = cmd.includes(' ') ? ['sh', '-c', cmd] : [cmd];
-
   let exec, stream;
   try {
     exec = await container.exec({
@@ -84,65 +86,41 @@ export async function handleExecWebSocket(ws, req, params) {
       Tty: true,
     });
     stream = await exec.start({ hijack: true, stdin: true });
-    try {
-      await exec.resize({ h: rows, w: cols });
-    } catch {}
+    try { await exec.resize({ h: rows, w: cols }); } catch {}
   } catch (err) {
     return ws.close(4500, (err.message || 'exec failed').slice(0, 120));
   }
 
   let closed = false;
   function shutdown() {
-    if (closed) return;
-    closed = true;
-    try {
-      stream.end();
-    } catch {}
-    try {
-      stream.destroy();
-    } catch {}
+    if (closed) return; closed = true;
+    try { stream.end(); } catch {}
+    try { stream.destroy(); } catch {}
     if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
-      try {
-        ws.close();
-      } catch {}
+      try { ws.close(); } catch {}
     }
   }
-
   stream.on('data', (chunk) => {
-    if (ws.readyState === ws.OPEN) {
-      try {
-        ws.send(chunk);
-      } catch {}
-    }
+    if (ws.readyState === ws.OPEN) { try { ws.send(chunk); } catch {} }
   });
   stream.on('end', shutdown);
   stream.on('error', shutdown);
-
   ws.on('message', (data, isBinary) => {
-    if (isBinary) {
-      try {
-        stream.write(data);
-      } catch {}
-      return;
-    }
+    if (isBinary) { try { stream.write(data); } catch {} return; }
     const text = data.toString('utf8');
     if (text.startsWith('{')) {
       try {
         const obj = JSON.parse(text);
         if (obj.type === 'resize') {
-          exec
-            .resize({ h: parseInt(obj.rows, 10) || 24, w: parseInt(obj.cols, 10) || 80 })
-            .catch(() => {});
+          exec.resize({ h: parseInt(obj.rows, 10) || 24, w: parseInt(obj.cols, 10) || 80 }).catch(() => {});
           return;
         }
       } catch {}
     }
-    try {
-      stream.write(text);
-    } catch {}
+    try { stream.write(text); } catch {}
   });
   ws.on('close', shutdown);
   ws.on('error', shutdown);
 }
 
-export default router;
+export default r;

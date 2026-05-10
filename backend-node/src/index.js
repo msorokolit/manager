@@ -14,16 +14,33 @@ import { settings, VERSION } from './config.js';
 import { sendError } from './util.js';
 import { buildOpenApiSpec } from './openapi.js';
 
-import authRouter from './routes/auth.js';
-import systemRouter from './routes/system.js';
-import containersRouter from './routes/containers.js';
-import imagesRouter from './routes/images.js';
-import networksRouter from './routes/networks.js';
-import volumesRouter from './routes/volumes.js';
-import volumeBrowserRouter from './routes/volume-browser.js';
-import stacksRouter from './routes/stacks.js';
-import registriesRouter from './routes/registries.js';
-import execRouter, { handleExecWebSocket } from './routes/exec.js';
+import authApi from './routes/auth.js';
+import systemApi from './routes/system.js';
+import containersApi from './routes/containers.js';
+import imagesApi from './routes/images.js';
+import networksApi from './routes/networks.js';
+import volumesApi from './routes/volumes.js';
+import volumeBrowserApi from './routes/volume-browser.js';
+import stacksApi from './routes/stacks.js';
+import registriesApi from './routes/registries.js';
+import execApi, { handleExecWebSocket } from './routes/exec.js';
+
+// Every routes/* file exposes { basePath, router, operations } via
+// createApiRouter. Listing them here is the only place index.js needs to know
+// about new resource modules — both Express mounting and the OpenAPI spec
+// flow from this list.
+const apis = [
+  authApi,
+  systemApi,
+  containersApi,
+  imagesApi,
+  networksApi,
+  volumesApi,
+  volumeBrowserApi,
+  stacksApi,
+  registriesApi,
+  execApi,
+];
 
 const app = express();
 
@@ -147,8 +164,13 @@ app.get('/api/config', (_req, res) => {
   });
 });
 
+// Aggregate route operations from every api module and build the OpenAPI
+// spec dynamically — adding a route only requires touching its routes/*.js
+// file; this section auto-discovers it.
+const allOperations = apis.flatMap((a) => a.operations);
+const openApiSpec = buildOpenApiSpec(allOperations);
+
 // OpenAPI spec + Swagger UI — public so the spec is browseable without a token.
-const openApiSpec = buildOpenApiSpec();
 app.get('/api/openapi.json', (_req, res) => res.json(openApiSpec));
 app.use(
   '/api/docs',
@@ -165,19 +187,12 @@ app.use(
   }),
 );
 
-// Auth (login / me) — public so the SPA can call /login without a token.
-app.use('/api/auth', authRouter);
-
-// All other resource routers require a valid Bearer JWT.
-app.use('/api/system', systemRouter);
-app.use('/api/containers', containersRouter);
-app.use('/api/images', imagesRouter);
-app.use('/api/networks', networksRouter);
-app.use('/api/volumes', volumesRouter);
-app.use('/api/volumes', volumeBrowserRouter); // mount on the same base; routes don't collide
-app.use('/api/stacks', stacksRouter);
-app.use('/api/registries', registriesRouter);
-app.use('/api/exec', execRouter);
+// Mount every api module on its declared base path. Authentication is now
+// per-route (via the route-builder middleware chain), so there's no longer a
+// global authenticate middleware up here.
+for (const a of apis) {
+  app.use(a.basePath, a.router);
+}
 
 // Static SPA serving (mirrors the FastAPI mount).
 const staticDir = settings.staticDir;

@@ -1,58 +1,68 @@
 // System-level endpoints: ping, info, version, df, events, events/stream.
-import { Router } from 'express';
-import { authenticate } from '../auth.js';
+import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, intQuery, pipeNdjson } from '../util.js';
+import { createApiRouter, streamResponse } from '../route-builder.js';
+import { PassThroughObject, PingResponse } from '../schemas/index.js';
 
-const router = Router();
-router.use(authenticate);
+const r = createApiRouter('/api/system', { tag: 'system' });
 
-router.get(
+r.get(
   '/ping',
+  {
+    summary: 'Ping the Docker daemon',
+    responses: { 200: PingResponse },
+  },
   asyncHandler(async (req, res) => {
-    const client = getClient();
-    await client.ping();
+    await getClient().ping();
     res.json({ ok: true, user: req.user.username, role: req.user.role });
   }),
 );
 
-router.get(
+r.get(
   '/info',
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().info());
-  }),
+  { summary: 'docker info (raw)', responses: { 200: PassThroughObject } },
+  asyncHandler(async (_req, res) => res.json(await getClient().info())),
 );
 
-router.get(
+r.get(
   '/version',
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().version());
-  }),
+  { summary: 'docker version (raw)', responses: { 200: PassThroughObject } },
+  asyncHandler(async (_req, res) => res.json(await getClient().version())),
 );
 
-router.get(
+r.get(
   '/df',
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().df());
-  }),
+  { summary: 'Docker disk usage', responses: { 200: PassThroughObject } },
+  asyncHandler(async (_req, res) => res.json(await getClient().df())),
 );
 
-router.get(
+const EventsQuery = Type.Object(
+  {
+    limit: Type.Optional(
+      Type.Integer({ minimum: 1, maximum: 1000, default: 25 }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+r.get(
   '/events',
+  {
+    summary: 'Recent docker events (bounded)',
+    query: EventsQuery,
+    responses: { 200: Type.Array(PassThroughObject) },
+  },
   asyncHandler(async (req, res) => {
     const limit = intQuery(req.query.limit, 25, { min: 1, max: 1000 });
     const end = Math.floor(Date.now() / 1000);
     const start = end - 60 * 60;
     const out = [];
-
     const stream = await getClient().getEvents({ since: start, until: end });
-
     let buf = '';
     await new Promise((resolve) => {
       const finish = () => {
-        try {
-          stream.destroy();
-        } catch {}
+        try { stream.destroy(); } catch {}
         resolve();
       };
       stream.on('data', (chunk) => {
@@ -62,28 +72,28 @@ router.get(
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
           if (!line.trim()) continue;
-          try {
-            out.push(JSON.parse(line));
-          } catch {}
+          try { out.push(JSON.parse(line)); } catch {}
           if (out.length >= limit) return finish();
         }
       });
       stream.on('end', resolve);
       stream.on('error', resolve);
-      // Hard-stop in case there are no events in the window.
       setTimeout(finish, 1500);
     });
-
     res.json(out);
   }),
 );
 
-router.get(
+r.get(
   '/events/stream',
+  {
+    summary: 'Live docker events (NDJSON)',
+    responses: { 200: streamResponse('NDJSON stream of docker event objects') },
+  },
   asyncHandler(async (_req, res) => {
     const stream = await getClient().getEvents();
     pipeNdjson(stream, res);
   }),
 );
 
-export default router;
+export default r;

@@ -1,13 +1,15 @@
-// Volume management endpoints (the file-browser sidecar lives in volume-browser.js).
-import { Router } from 'express';
-import { authenticate, requireAdmin } from '../auth.js';
+// Volume management endpoints (file browser is in volume-browser.js).
+import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, boolQuery, HttpError } from '../util.js';
-import { validateBody } from '../validate.js';
-import { CreateVolumeRequest } from '../schemas/index.js';
+import { asyncHandler, boolQuery } from '../util.js';
+import { createApiRouter } from '../route-builder.js';
+import {
+  CreateVolumeRequest,
+  PassThroughObject,
+  VolumeSummary,
+} from '../schemas/index.js';
 
-const router = Router();
-router.use(authenticate);
+const r = createApiRouter('/api/volumes', { tag: 'volumes' });
 
 function summary(v) {
   return {
@@ -21,50 +23,64 @@ function summary(v) {
   };
 }
 
-router.get(
+const NameParam = Type.Object({ name: Type.String() }, { additionalProperties: false });
+const RemoveQuery = Type.Object(
+  { force: Type.Optional(Type.Boolean({ default: false })) },
+  { additionalProperties: false },
+);
+
+r.get(
   '/',
+  { summary: 'List volumes', responses: { 200: Type.Array(VolumeSummary) } },
   asyncHandler(async (_req, res) => {
-    const r = await getClient().listVolumes();
-    res.json((r.Volumes || []).map(summary));
+    const list = await getClient().listVolumes();
+    res.json((list.Volumes || []).map(summary));
   }),
 );
 
-router.post(
+r.post(
   '/',
-  requireAdmin,
-  validateBody(CreateVolumeRequest),
+  {
+    summary: 'Create a volume',
+    admin: true,
+    body: CreateVolumeRequest,
+    responses: { 200: VolumeSummary },
+  },
   asyncHandler(async (req, res) => {
     const b = req.body;
-    const v = await getClient().createVolume({
+    await getClient().createVolume({
       Name: b.name,
       Driver: b.driver,
       Labels: b.labels || {},
       DriverOpts: b.driver_opts || {},
     });
-    // dockerode's createVolume returns an object that has .inspect()
-    const insp = await getClient().getVolume(b.name).inspect();
-    res.json(summary(insp));
+    res.json(summary(await getClient().getVolume(b.name).inspect()));
   }),
 );
 
-router.post(
+r.post(
   '/prune',
-  requireAdmin,
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().pruneVolumes());
-  }),
+  { summary: 'Prune unused volumes', admin: true, responses: { 200: PassThroughObject } },
+  asyncHandler(async (_req, res) => res.json(await getClient().pruneVolumes())),
 );
 
-router.get(
+r.get(
   '/:name',
-  asyncHandler(async (req, res) => {
-    res.json(await getClient().getVolume(req.params.name).inspect());
-  }),
+  { summary: 'Inspect a volume', params: NameParam, responses: { 200: PassThroughObject } },
+  asyncHandler(async (req, res) =>
+    res.json(await getClient().getVolume(req.params.name).inspect()),
+  ),
 );
 
-router.delete(
+r.delete(
   '/:name',
-  requireAdmin,
+  {
+    summary: 'Remove a volume',
+    admin: true,
+    params: NameParam,
+    query: RemoveQuery,
+    responses: { 200: Type.Object({ removed: Type.String() }) },
+  },
   asyncHandler(async (req, res) => {
     const force = boolQuery(req.query.force, false);
     await getClient().getVolume(req.params.name).remove({ force });
@@ -72,4 +88,4 @@ router.delete(
   }),
 );
 
-export default router;
+export default r;

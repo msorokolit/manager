@@ -122,9 +122,41 @@ All configuration is via environment variables.
 Every endpoint that accepts a body or interesting path/query parameters has
 a JSON Schema fragment authored with [TypeBox](https://github.com/sinclairzx81/typebox).
 The same schemas are used at runtime by [AJV](https://ajv.js.org) to validate
-requests **and** are mounted into the auto-generated OpenAPI 3.1 document.
+requests **and** are referenced from the auto-generated OpenAPI 3.1 document.
 There is one source of truth per type — schemas live under
 `backend-node/src/schemas/` and are re-exported from `schemas/index.js`.
+
+### Routes are declarative
+
+Routes are declared with a small builder (`createApiRouter`) so adding a
+route only ever touches its own `routes/<resource>.js` file — the OpenAPI
+spec rebuilds itself from the registry on boot:
+
+```js
+import { createApiRouter } from '../route-builder.js';
+import { LoginRequest, LoginResponse } from '../schemas/index.js';
+
+const r = createApiRouter('/api/auth', { tag: 'auth' });
+
+r.post(
+  '/login',
+  {
+    summary: 'Exchange credentials for a JWT',
+    auth: false,                          // public route
+    body: LoginRequest,                   // -> validateBody + requestBody schema
+    responses: { 200: LoginResponse },    // 400 / 502 / 503 auto-injected
+  },
+  asyncHandler(async (req, res) => { /* handler */ }),
+);
+
+export default r;
+```
+
+The builder wires up `authenticate` / `requireAdmin` / `validateBody` /
+`validateQuery` / `validateParams` middleware automatically based on the
+spec, and pushes a canonical operation descriptor into `r.operations`.
+`index.js` aggregates `operations` from every api module and hands them to
+`buildOpenApiSpec()` — there is no hand-maintained list of paths anywhere.
 
 On a validation failure you get HTTP 400 with field-level errors:
 
@@ -221,7 +253,8 @@ backend-node/
     docker-client.js            Lazy dockerode singleton
     jwt.js                      HS256 sign/verify (random secret if JWT_SECRET unset)
     validate.js                 AJV-based body / query / params validation middleware
-    openapi.js                  Assembles the OpenAPI 3.1 spec from schemas/
+    route-builder.js            createApiRouter() — wires middleware + records operations
+    openapi.js                  Builds OpenAPI 3.1 from the operation registry on boot
     schemas/                    TypeBox / JSON Schema fragments, one file per resource
       _common.js, auth.js, containers.js, images.js, networks.js,
       volumes.js, stacks.js, registries.js, system.js, index.js

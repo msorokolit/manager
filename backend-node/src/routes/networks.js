@@ -1,17 +1,17 @@
 // Network management endpoints.
-import { Router } from 'express';
-import { authenticate, requireAdmin } from '../auth.js';
+import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, HttpError } from '../util.js';
-import { validateBody } from '../validate.js';
+import { asyncHandler } from '../util.js';
+import { createApiRouter } from '../route-builder.js';
 import {
   ConnectRequest,
   CreateNetworkRequest,
   DisconnectRequest,
+  NetworkSummary,
+  PassThroughObject,
 } from '../schemas/index.js';
 
-const router = Router();
-router.use(authenticate);
+const r = createApiRouter('/api/networks', { tag: 'networks' });
 
 function summary(n) {
   return {
@@ -28,18 +28,24 @@ function summary(n) {
   };
 }
 
-router.get(
+const IdParam = Type.Object({ id: Type.String() }, { additionalProperties: false });
+
+r.get(
   '/',
-  asyncHandler(async (_req, res) => {
-    const list = await getClient().listNetworks();
-    res.json(list.map(summary));
-  }),
+  { summary: 'List networks', responses: { 200: Type.Array(NetworkSummary) } },
+  asyncHandler(async (_req, res) =>
+    res.json((await getClient().listNetworks()).map(summary)),
+  ),
 );
 
-router.post(
+r.post(
   '/',
-  requireAdmin,
-  validateBody(CreateNetworkRequest),
+  {
+    summary: 'Create a network',
+    admin: true,
+    body: CreateNetworkRequest,
+    responses: { 200: NetworkSummary },
+  },
   asyncHandler(async (req, res) => {
     const b = req.body;
     const n = await getClient().createNetwork({
@@ -49,39 +55,47 @@ router.post(
       Attachable: b.attachable,
       Labels: b.labels || {},
     });
-    const inspect = await n.inspect();
-    res.json(summary(inspect));
+    res.json(summary(await n.inspect()));
   }),
 );
 
-router.post(
+r.post(
   '/prune',
-  requireAdmin,
-  asyncHandler(async (_req, res) => {
-    res.json(await getClient().pruneNetworks());
-  }),
+  { summary: 'Prune unused networks', admin: true, responses: { 200: PassThroughObject } },
+  asyncHandler(async (_req, res) => res.json(await getClient().pruneNetworks())),
 );
 
-router.get(
+r.get(
   '/:id',
-  asyncHandler(async (req, res) => {
-    res.json(await getClient().getNetwork(req.params.id).inspect());
-  }),
+  { summary: 'Inspect a network', params: IdParam, responses: { 200: PassThroughObject } },
+  asyncHandler(async (req, res) =>
+    res.json(await getClient().getNetwork(req.params.id).inspect()),
+  ),
 );
 
-router.delete(
+r.delete(
   '/:id',
-  requireAdmin,
+  {
+    summary: 'Remove a network',
+    admin: true,
+    params: IdParam,
+    responses: { 200: Type.Object({ removed: Type.String() }) },
+  },
   asyncHandler(async (req, res) => {
     await getClient().getNetwork(req.params.id).remove();
     res.json({ removed: req.params.id });
   }),
 );
 
-router.post(
+r.post(
   '/:id/connect',
-  requireAdmin,
-  validateBody(ConnectRequest),
+  {
+    summary: 'Connect a container to a network',
+    admin: true,
+    params: IdParam,
+    body: ConnectRequest,
+    responses: { 200: PassThroughObject },
+  },
   asyncHandler(async (req, res) => {
     const b = req.body;
     await getClient().getNetwork(req.params.id).connect({
@@ -91,10 +105,7 @@ router.post(
         Links: b.links || undefined,
         IPAMConfig:
           b.ipv4_address || b.ipv6_address
-            ? {
-                IPv4Address: b.ipv4_address || undefined,
-                IPv6Address: b.ipv6_address || undefined,
-              }
+            ? { IPv4Address: b.ipv4_address || undefined, IPv6Address: b.ipv6_address || undefined }
             : undefined,
       },
     });
@@ -102,22 +113,23 @@ router.post(
   }),
 );
 
-router.post(
+r.post(
   '/:id/disconnect',
-  requireAdmin,
-  validateBody(DisconnectRequest),
+  {
+    summary: 'Disconnect a container from a network',
+    admin: true,
+    params: IdParam,
+    body: DisconnectRequest,
+    responses: { 200: PassThroughObject },
+  },
   asyncHandler(async (req, res) => {
     const b = req.body;
     await getClient().getNetwork(req.params.id).disconnect({
       Container: b.container,
       Force: b.force,
     });
-    res.json({
-      network: req.params.id,
-      container: b.container,
-      disconnected: true,
-    });
+    res.json({ network: req.params.id, container: b.container, disconnected: true });
   }),
 );
 
-export default router;
+export default r;
