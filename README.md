@@ -7,10 +7,14 @@ single Docker engine: containers, images, networks, volumes, and host info.
 The stack is intentionally small and easy to audit:
 
 - **Backend**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode)
-  + [`zod`](https://zod.dev) + [`helmet`](https://helmetjs.github.io) +
+  + [`@sinclair/typebox`](https://github.com/sinclairzx81/typebox) +
+  [`ajv`](https://ajv.js.org) + [`helmet`](https://helmetjs.github.io) +
   [`cors`](https://github.com/expressjs/cors) +
-  [`jsonwebtoken`](https://github.com/auth0/node-jsonwebtoken)) in
-  `backend-node/`. Pure ESM, no transpilation, ~13 source files.
+  [`jsonwebtoken`](https://github.com/auth0/node-jsonwebtoken) +
+  [`swagger-ui-express`](https://github.com/scottie1984/swagger-ui-express))
+  in `backend-node/`. Pure ESM, no transpilation. Schemas are JSON Schema
+  fragments that drive both runtime validation **and** the auto-generated
+  OpenAPI 3.1 spec — single source of truth.
 - **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
   (loaded via CDN) — no build step is required
 - **Auth**: JWT bearer (HS256), two roles (`admin`, optional read-only `viewer`)
@@ -113,20 +117,23 @@ All configuration is via environment variables.
 | `CSP_DISABLED`       | `false`          | Keep all other Helmet headers but drop the Content-Security-Policy header (useful if you proxy through a CDN that injects its own CSP). |
 | `CSP_EXTRA_SCRIPT_SRC` / `CSP_EXTRA_STYLE_SRC` / `CSP_EXTRA_CONNECT_SRC` | _(empty)_ | Comma-separated additional sources to allow if you fork the SPA to load assets from another CDN. |
 
-## Request validation
+## Request validation & OpenAPI
 
-Every endpoint that accepts a body validates it with [Zod](https://zod.dev)
-before the handler runs. Schemas use `.strict()` so unknown fields are
-rejected, type mismatches are caught (including in deeply-nested arrays /
-records), and field-level errors come back in a uniform shape:
+Every endpoint that accepts a body or interesting path/query parameters has
+a JSON Schema fragment authored with [TypeBox](https://github.com/sinclairzx81/typebox).
+The same schemas are used at runtime by [AJV](https://ajv.js.org) to validate
+requests **and** are mounted into the auto-generated OpenAPI 3.1 document.
+There is one source of truth per type — schemas live under
+`backend-node/src/schemas/` and are re-exported from `schemas/index.js`.
+
+On a validation failure you get HTTP 400 with field-level errors:
 
 ```json
 {
   "detail": "Validation failed",
   "errors": [
-    { "path": "ports.80/tcp", "message": "Expected number, received string", "code": "invalid_type" },
-    { "path": "ulimits.0.soft", "message": "Expected number, received string", "code": "invalid_type" },
-    { "path": "", "message": "Unrecognized key(s) in object: 'sneaky'", "code": "unrecognized_keys" }
+    { "path": "ulimits.0.soft", "message": "must be integer", "code": "type" },
+    { "path": "sneaky",         "message": "Unrecognized field 'sneaky'", "code": "additionalProperties" }
   ]
 }
 ```
@@ -134,6 +141,14 @@ records), and field-level errors come back in a uniform shape:
 Path parameters are validated where they affect filesystem or shell-out
 behaviour (stack name, service name, action enum) so e.g. `service: "../etc"`
 is rejected at the routing layer rather than relying on downstream sanitising.
+
+### Browse the API
+
+- **`GET /api/openapi.json`** — the raw OpenAPI 3.1 document
+- **`GET /api/docs/`** — [Swagger UI](https://swagger.io/tools/swagger-ui/),
+  with "Try it out" wired to the live server. Both URLs are public so the API
+  is discoverable without logging in; protected operations show a lock and
+  prompt for a Bearer token (paste the JWT from `POST /api/auth/login`).
 
 ## Security notes
 
@@ -205,7 +220,11 @@ backend-node/
     auth.js                     HTTP Basic + role gating
     docker-client.js            Lazy dockerode singleton
     jwt.js                      HS256 sign/verify (random secret if JWT_SECRET unset)
-    validate.js                 zod-based body / query / params validation middleware
+    validate.js                 AJV-based body / query / params validation middleware
+    openapi.js                  Assembles the OpenAPI 3.1 spec from schemas/
+    schemas/                    TypeBox / JSON Schema fragments, one file per resource
+      _common.js, auth.js, containers.js, images.js, networks.js,
+      volumes.js, stacks.js, registries.js, system.js, index.js
     util.js                     asyncHandler, NDJSON/raw stream helpers, errors
     routes/
       system.js                 ping, info, version, df, events, events/stream

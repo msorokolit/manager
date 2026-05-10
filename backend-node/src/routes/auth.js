@@ -12,20 +12,14 @@ import { authenticate, verifyCredentials } from '../auth.js';
 import { signToken } from '../jwt.js';
 import { settings } from '../config.js';
 import { asyncHandler } from '../util.js';
-import { validateBody, z } from '../validate.js';
+import { validateBody } from '../validate.js';
+import { LoginRequest } from '../schemas/index.js';
 
 const router = Router();
 
-const LoginBody = z
-  .object({
-    username: z.string().min(1, 'username is required').max(255),
-    password: z.string().min(1, 'password is required').max(1024),
-  })
-  .strict();
-
 router.post(
   '/login',
-  validateBody(LoginBody),
+  validateBody(LoginRequest),
   asyncHandler(async (req, res) => {
     const { username, password } = req.body;
     const user = verifyCredentials(username, password);

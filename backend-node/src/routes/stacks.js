@@ -8,7 +8,14 @@ import { authenticate, requireAdmin } from '../auth.js';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError, intQuery } from '../util.js';
-import { opt, validateBody, validateParams, z } from '../validate.js';
+import { validateBody, validateParams } from '../validate.js';
+import {
+  CreateStackRequest,
+  StackNameParam,
+  StackServiceActionParam,
+  StackServiceParam,
+  UpdateStackRequest,
+} from '../schemas/index.js';
 
 const router = Router();
 router.use(authenticate);
@@ -16,34 +23,6 @@ router.use(authenticate);
 const COMPOSE_FILENAME = 'docker-compose.yml';
 const ENV_FILENAME = '.env';
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/;
-const SERVICE_ACTIONS = ['up', 'start', 'stop', 'restart', 'pull', 'rm'];
-
-// Path-param schemas: keep stack/service names tightly constrained.
-const NameParam = z.object({
-  name: z.string().regex(NAME_RE, 'invalid stack name'),
-});
-const NameAndServiceParam = NameParam.extend({
-  service: z.string().min(1).max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, 'invalid service name'),
-});
-const NameServiceActionParam = NameAndServiceParam.extend({
-  action: z.enum(SERVICE_ACTIONS),
-});
-
-const CreateStackBody = z
-  .object({
-    name: z.string().regex(NAME_RE, 'invalid stack name'),
-    compose: z.string().min(1, 'compose is required').max(1024 * 1024),
-    env: opt(z.string().max(64 * 1024)),
-    deploy: z.boolean().default(true),
-  })
-  .strict();
-
-const UpdateStackBody = z
-  .object({
-    compose: opt(z.string().max(1024 * 1024)),
-    env: opt(z.string().max(64 * 1024)),
-  })
-  .strict();
 
 function validateName(name) {
   if (!NAME_RE.test(name || '')) {
@@ -259,7 +238,7 @@ function streamCompose(res, name, ...args) {
 router.post(
   '/',
   requireAdmin,
-  validateBody(CreateStackBody),
+  validateBody(CreateStackRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     await ensureRoot(true);
@@ -277,8 +256,8 @@ router.post(
 router.put(
   '/:name',
   requireAdmin,
-  validateParams(NameParam),
-  validateBody(UpdateStackBody),
+  validateParams(StackNameParam),
+  validateBody(UpdateStackRequest),
   asyncHandler(async (req, res) => {
     if (!isManaged(req.params.name))
       throw new HttpError(404, 'Stack not found (or not managed)');
@@ -347,7 +326,7 @@ router.post(
 router.post(
   '/:name/services/:service/:action',
   requireAdmin,
-  validateParams(NameServiceActionParam),
+  validateParams(StackServiceActionParam),
   (req, res) => {
     const { action, service, name } = req.params;
     if (action === 'up') return streamCompose(res, name, 'up', '-d', service);
@@ -358,7 +337,7 @@ router.post(
 
 router.get(
   '/:name/services/:service/logs',
-  validateParams(NameAndServiceParam),
+  validateParams(StackServiceParam),
   (req, res) => {
     const { service, name } = req.params;
     const tail = intQuery(req.query.tail, 200, { min: 1, max: 5000 });

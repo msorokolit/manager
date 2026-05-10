@@ -3,19 +3,12 @@ import { Router } from 'express';
 import { authenticate, requireAdmin } from '../auth.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, boolQuery, HttpError, pipeNdjson } from '../util.js';
-import { opt, validateBody, z } from '../validate.js';
+import { validateBody } from '../validate.js';
+import { PullRequest } from '../schemas/index.js';
 import { getRegistryAuth } from './registries.js';
 
 const router = Router();
 router.use(authenticate);
-
-const PullBody = z
-  .object({
-    repository: z.string().min(1, 'repository is required').max(512),
-    tag: opt(z.string().max(255)),
-    registry: opt(z.string().max(128)),
-  })
-  .strict();
 
 function summary(i) {
   return {
@@ -41,7 +34,7 @@ router.get(
 router.post(
   '/pull',
   requireAdmin,
-  validateBody(PullBody),
+  validateBody(PullRequest),
   asyncHandler(async (req, res) => {
     const { repository, tag = null, registry = null } = req.body;
 

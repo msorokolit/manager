@@ -6,29 +6,10 @@ import { authenticate, requireAdmin } from '../auth.js';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError } from '../util.js';
-import { opt, validateBody, z } from '../validate.js';
+import { validateBody } from '../validate.js';
+import { RegistryRequest, RegistryUpdateRequest } from '../schemas/index.js';
 
 const router = Router();
-
-const RegistryBody = z
-  .object({
-    name: z
-      .string()
-      .min(1)
-      .max(128)
-      .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, 'invalid registry name'),
-    url: z.string().url('url must be a valid URL').max(2048).optional(),
-    username: z.string().min(1).max(255),
-    password: z.string().min(1).max(2048),
-    email: opt(z.string().email().max(255)),
-  })
-  .strict();
-
-// PUT body is the same but the name comes from the path; let it be optional
-// in the body and we'll override it with the path param.
-const RegistryUpdateBody = RegistryBody.partial({ name: true }).extend({
-  name: opt(z.string()),
-});
 router.use(authenticate);
 
 let writeLock = Promise.resolve();
@@ -105,7 +86,7 @@ router.get(
 router.post(
   '/',
   requireAdmin,
-  validateBody(RegistryBody),
+  validateBody(RegistryRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     await withLock(async () => {
@@ -125,7 +106,7 @@ router.post(
 router.put(
   '/:name',
   requireAdmin,
-  validateBody(RegistryUpdateBody),
+  validateBody(RegistryUpdateRequest),
   asyncHandler(async (req, res) => {
     // Name comes from the URL path; body-level `name` (if any) is ignored.
     const name = req.params.name;

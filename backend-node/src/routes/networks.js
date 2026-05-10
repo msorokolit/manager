@@ -3,39 +3,15 @@ import { Router } from 'express';
 import { authenticate, requireAdmin } from '../auth.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError } from '../util.js';
-import { opt, validateBody, z } from '../validate.js';
+import { validateBody } from '../validate.js';
+import {
+  ConnectRequest,
+  CreateNetworkRequest,
+  DisconnectRequest,
+} from '../schemas/index.js';
 
 const router = Router();
 router.use(authenticate);
-
-const NETWORK_DRIVERS = ['bridge', 'overlay', 'macvlan', 'ipvlan', 'host', 'none'];
-
-const CreateNetworkBody = z
-  .object({
-    name: z.string().min(1).max(255),
-    driver: z.string().max(64).default('bridge'),
-    internal: z.boolean().default(false),
-    attachable: z.boolean().default(true),
-    labels: opt(z.record(z.string(), z.string())),
-  })
-  .strict();
-
-const ConnectBody = z
-  .object({
-    container: z.string().min(1, 'container is required').max(128),
-    aliases: opt(z.array(z.string())),
-    ipv4_address: opt(z.string()),
-    ipv6_address: opt(z.string()),
-    links: opt(z.array(z.string())),
-  })
-  .strict();
-
-const DisconnectBody = z
-  .object({
-    container: z.string().min(1, 'container is required').max(128),
-    force: z.boolean().default(false),
-  })
-  .strict();
 
 function summary(n) {
   return {
@@ -63,7 +39,7 @@ router.get(
 router.post(
   '/',
   requireAdmin,
-  validateBody(CreateNetworkBody),
+  validateBody(CreateNetworkRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     const n = await getClient().createNetwork({
@@ -105,7 +81,7 @@ router.delete(
 router.post(
   '/:id/connect',
   requireAdmin,
-  validateBody(ConnectBody),
+  validateBody(ConnectRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     await getClient().getNetwork(req.params.id).connect({
@@ -129,7 +105,7 @@ router.post(
 router.post(
   '/:id/disconnect',
   requireAdmin,
-  validateBody(DisconnectBody),
+  validateBody(DisconnectRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     await getClient().getNetwork(req.params.id).disconnect({

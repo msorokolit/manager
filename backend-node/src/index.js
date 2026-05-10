@@ -7,10 +7,12 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import cors from 'cors';
 import helmet from 'helmet';
+import swaggerUi from 'swagger-ui-express';
 import { WebSocketServer } from 'ws';
 
 import { settings, VERSION } from './config.js';
 import { sendError } from './util.js';
+import { buildOpenApiSpec } from './openapi.js';
 
 import authRouter from './routes/auth.js';
 import systemRouter from './routes/system.js';
@@ -144,6 +146,24 @@ app.get('/api/config', (_req, res) => {
     backend: 'node',
   });
 });
+
+// OpenAPI spec + Swagger UI — public so the spec is browseable without a token.
+const openApiSpec = buildOpenApiSpec();
+app.get('/api/openapi.json', (_req, res) => res.json(openApiSpec));
+app.use(
+  '/api/docs',
+  // Tighten CSP slightly for the docs page so the inline initializer Swagger
+  // UI ships with isn't blocked.
+  (req, res, next) => {
+    res.removeHeader('Content-Security-Policy');
+    next();
+  },
+  swaggerUi.serve,
+  swaggerUi.setup(openApiSpec, {
+    customSiteTitle: 'Docker Manager API',
+    swaggerOptions: { persistAuthorization: true, displayRequestDuration: true },
+  }),
+);
 
 // Auth (login / me) — public so the SPA can call /login without a token.
 app.use('/api/auth', authRouter);

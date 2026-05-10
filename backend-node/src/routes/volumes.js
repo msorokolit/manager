@@ -3,23 +3,11 @@ import { Router } from 'express';
 import { authenticate, requireAdmin } from '../auth.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, boolQuery, HttpError } from '../util.js';
-import { opt, validateBody, z } from '../validate.js';
+import { validateBody } from '../validate.js';
+import { CreateVolumeRequest } from '../schemas/index.js';
 
 const router = Router();
 router.use(authenticate);
-
-const CreateVolumeBody = z
-  .object({
-    name: z
-      .string()
-      .min(1)
-      .max(255)
-      .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, 'invalid volume name'),
-    driver: z.string().max(64).default('local'),
-    labels: opt(z.record(z.string(), z.string())),
-    driver_opts: opt(z.record(z.string(), z.string())),
-  })
-  .strict();
 
 function summary(v) {
   return {
@@ -44,7 +32,7 @@ router.get(
 router.post(
   '/',
   requireAdmin,
-  validateBody(CreateVolumeBody),
+  validateBody(CreateVolumeRequest),
   asyncHandler(async (req, res) => {
     const b = req.body;
     const v = await getClient().createVolume({

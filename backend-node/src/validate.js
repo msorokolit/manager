@@ -1,10 +1,8 @@
-// Zod-backed request validation.
+// JSON Schema-backed request validation, powered by AJV.
 //
-// Each route that accepts a body (or unusually structured query/params)
-// declares a Zod schema and wraps itself with one of the middlewares below.
-// On success, the parsed value replaces the raw input on the request, so
-// downstream handlers can rely on the shape and types being exactly what the
-// schema describes.
+// Schemas are TypeBox objects, which are themselves JSON Schema, so the same
+// definition drives both runtime validation and the auto-generated OpenAPI
+// document.
 //
 // On failure we return:
 //
@@ -13,61 +11,111 @@
 //     "errors": [{ "path": "ports.80/tcp", "message": "...", "code": "..." }]
 //   }
 
-import { z } from 'zod';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
 
-function formatErrors(err) {
-  return err.issues.map((i) => ({
-    path: i.path.join('.'),
-    message: i.message,
-    code: i.code,
-  }));
+const ajv = new Ajv({
+  allErrors: true,
+  // We don't want AJV to silently mutate the request body.
+  removeAdditional: false,
+  useDefaults: true,
+  coerceTypes: false,
+  // Schemas may be re-compiled per route file load; allow that.
+  addUsedSchema: false,
+  strict: false,
+});
+addFormats(ajv);
+
+function jsonPointerToPath(pointer) {
+  if (!pointer) return '';
+  // "/users/0/email" -> "users.0.email"
+  return pointer
+    .replace(/^\//, '')
+    .replace(/~1/g, '/')
+    .replace(/~0/g, '~')
+    .split('/')
+    .join('.');
+}
+
+function formatError(err) {
+  let path = jsonPointerToPath(err.instancePath || '');
+  if (err.keyword === 'required' && err.params && err.params.missingProperty) {
+    path = path
+      ? `${path}.${err.params.missingProperty}`
+      : err.params.missingProperty;
+  } else if (
+    err.keyword === 'additionalProperties' &&
+    err.params &&
+    err.params.additionalProperty
+  ) {
+    path = path
+      ? `${path}.${err.params.additionalProperty}`
+      : err.params.additionalProperty;
+  }
+  let message = err.message || 'invalid';
+  if (err.keyword === 'additionalProperties' && err.params && err.params.additionalProperty) {
+    message = `Unrecognized field '${err.params.additionalProperty}'`;
+  }
+  return { path, message, code: err.keyword };
+}
+
+function makeMiddleware(schema, accessor) {
+  const validator = ajv.compile(schema);
+  return (req, res, next) => {
+    const data = accessor(req);
+    const valid = validator(data == null ? {} : data);
+    if (!valid) {
+      return res.status(400).json({
+        detail: 'Validation failed',
+        errors: (validator.errors || []).map(formatError),
+      });
+    }
+    next();
+  };
 }
 
 export function validateBody(schema) {
+  const validator = ajv.compile(schema);
   return (req, res, next) => {
-    const result = schema.safeParse(req.body == null ? {} : req.body);
-    if (!result.success) {
+    const data = req.body == null ? {} : req.body;
+    if (!validator(data)) {
       return res.status(400).json({
         detail: 'Validation failed',
-        errors: formatErrors(result.error),
+        errors: (validator.errors || []).map(formatError),
       });
     }
-    req.body = result.data;
+    req.body = data;
     next();
   };
 }
 
 export function validateQuery(schema) {
+  const validator = ajv.compile(schema);
   return (req, res, next) => {
-    const result = schema.safeParse(req.query == null ? {} : req.query);
-    if (!result.success) {
+    const data = req.query == null ? {} : req.query;
+    if (!validator(data)) {
       return res.status(400).json({
         detail: 'Validation failed',
-        errors: formatErrors(result.error),
+        errors: (validator.errors || []).map(formatError),
       });
     }
-    // Don't mutate req.query (Express 5 makes it a getter); attach instead.
-    req.validatedQuery = result.data;
+    // Don't mutate req.query (Express 5 makes it a getter).
+    req.validatedQuery = data;
     next();
   };
 }
 
 export function validateParams(schema) {
+  const validator = ajv.compile(schema);
   return (req, res, next) => {
-    const result = schema.safeParse(req.params == null ? {} : req.params);
-    if (!result.success) {
+    const data = req.params == null ? {} : req.params;
+    if (!validator(data)) {
       return res.status(400).json({
         detail: 'Invalid path parameter',
-        errors: formatErrors(result.error),
+        errors: (validator.errors || []).map(formatError),
       });
     }
-    req.params = result.data;
+    req.params = data;
     next();
   };
 }
-
-// Convenience helper: makes a field accept value | null | undefined without
-// the noisy `.nullable().optional()` repetition in the schemas themselves.
-export const opt = (s) => s.nullable().optional();
-
-export { z };
