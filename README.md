@@ -6,7 +6,11 @@ single Docker engine: containers, images, networks, volumes, and host info.
 
 The stack is intentionally small and easy to audit:
 
-- **Backend**: FastAPI + the official `docker` Python SDK
+- **Backend (default)**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode))
+  in `backend-node/`
+- **Backend (alternate)**: FastAPI + the official `docker` Python SDK in `backend/`.
+  Both speak the same HTTP API and are wire-compatible, so the same SPA serves
+  both. Build with `Dockerfile.python` if you'd rather run the Python edition.
 - **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
   (loaded via CDN) — no build step is required
 - **Auth**: HTTP Basic with two roles (`admin`, optional read-only `viewer`)
@@ -67,10 +71,22 @@ docker compose up -d --build
 
 Then open <http://localhost:8000> and log in with the credentials from `.env`.
 
-## Quick start (local Python)
+## Quick start (local Node.js)
 
-Requires Python 3.11+ and a reachable Docker daemon (e.g. via
+Requires Node.js 20+ and a reachable Docker daemon (e.g. via
 `/var/run/docker.sock` or the `DOCKER_HOST` environment variable).
+
+```bash
+cd backend-node
+npm install
+ADMIN_USER=admin ADMIN_PASSWORD=admin npm start
+# server on http://localhost:8000
+```
+
+## Quick start (local Python — alternate backend)
+
+Requires Python 3.11+. The Python backend exposes the same API and serves the
+same SPA, so you can pick either:
 
 ```bash
 cd backend
@@ -80,8 +96,9 @@ ADMIN_USER=admin ADMIN_PASSWORD=admin \
   uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-The frontend is served from the same process at `/`.
-The OpenAPI docs are available at `/docs`.
+The frontend is served from the same process at `/`. The Python backend also
+ships an OpenAPI schema at `/docs` (Swagger UI). The Node backend serves the
+same surface at the same URLs but does not auto-generate Swagger docs.
 
 ## Configuration
 
@@ -134,28 +151,41 @@ All configuration is via environment variables.
 ## Project layout
 
 ```
-backend/
+backend-node/                   Default Node.js backend (Express + dockerode)
+  package.json
+  src/
+    index.js                    HTTP + WS server, SPA serving, route wiring
+    config.js                   Env-driven settings
+    auth.js                     HTTP Basic + role gating
+    docker-client.js            Lazy dockerode singleton
+    util.js                     asyncHandler, NDJSON/raw stream helpers, errors
+    routes/
+      system.js                 ping, info, version, df, events, events/stream
+      containers.js             list/inspect/run/start/stop/.../logs/stream/stats/stream/prune
+      images.js                 list/inspect/pull (streaming)/remove/prune
+      networks.js               list/inspect/create/connect/disconnect/remove/prune
+      volumes.js                list/inspect/create/remove/prune
+      volume-browser.js         list/get/upload/mkdir/delete/stop (sidecar-backed)
+      stacks.js                 CRUD + up/down/restart/pull/logs/validate + per-service actions
+      registries.js             list/upsert/delete/test (file-backed credential store)
+      exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
+
+backend/                        Alternate Python backend (FastAPI + docker-py)
   app/
-    main.py            FastAPI app + static SPA serving
-    config.py          Env-driven settings
-    auth.py            HTTP Basic + role gating
-    docker_client.py   Lazy DockerClient singleton
-    routers/
-      system.py        info, version, df, ping, events
-      containers.py    list/inspect/run/start/stop/.../logs/stream/stats/prune
-      images.py        list/inspect/pull (streaming)/remove/prune
-      networks.py      list/inspect/create/remove/prune
-      volumes.py       list/inspect/create/remove/prune
-      stacks.py        list/get/create/update/up/down/restart/pull/logs/delete
-      registries.py    list/upsert/delete/test (file-backed credential store)
-      volume_browser.py list/get/upload/mkdir/delete/stop (sidecar-backed)
-      exec.py          POST /api/exec/ticket + WS /api/containers/{id}/exec
+    main.py                     FastAPI app + static SPA serving
+    config.py                   Env-driven settings
+    auth.py                     HTTP Basic + role gating
+    docker_client.py            Lazy DockerClient singleton
+    routers/                    Same per-resource set as the Node version
   requirements.txt
-frontend/
+
+frontend/                       Wire-compatible with both backends
   index.html
-  app.js               SPA: routing, views, dialogs
+  app.js                        SPA: routing, views, dialogs
   styles.css
-Dockerfile
+
+Dockerfile                      Node backend image (default)
+Dockerfile.python               Python backend image (alternate)
 docker-compose.yml
 .env.example
 ```
