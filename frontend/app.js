@@ -37,9 +37,14 @@
   }
 
   // ---------- API ----------
+  function authHeader() {
+    return state.auth && state.auth.token ? `Bearer ${state.auth.token}` : '';
+  }
+
   async function api(path, opts = {}) {
     const headers = new Headers(opts.headers || {});
-    if (state.auth) headers.set('Authorization', `Basic ${state.auth.basic}`);
+    const ah = authHeader();
+    if (ah) headers.set('Authorization', ah);
     if (opts.body && !(opts.body instanceof FormData) && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json');
     }
@@ -168,11 +173,24 @@
     state.auth = null; saveAuth(null); render();
   }
   async function login(username, password) {
-    const basic = btoa(`${username}:${password}`);
-    const res = await fetch('/api/system/ping', { headers: { Authorization: `Basic ${basic}` } });
-    if (!res.ok) throw new Error(res.status === 401 ? 'Invalid credentials' : `Login failed (${res.status})`);
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      let detail = `Login failed (${res.status})`;
+      try { const j = await res.json(); detail = j.detail || detail; } catch {}
+      if (res.status === 401) detail = 'Invalid credentials';
+      throw new Error(detail);
+    }
     const data = await res.json();
-    state.auth = { user: data.user, role: data.role, basic };
+    state.auth = {
+      user: data.user,
+      role: data.role,
+      token: data.token,
+      expires_at: Date.now() + (data.expires_in || 0) * 1000,
+    };
     saveAuth(state.auth);
   }
 
@@ -894,7 +912,7 @@
       try {
         const tail = wrap.querySelector('#log-tail').value || 200;
         const res = await fetch(`/api/containers/${id}/logs/stream?tail=${tail}`, {
-          headers: { Authorization: `Basic ${state.auth.basic}` }, signal: abortCtrl.signal,
+          headers: { Authorization: authHeader() }, signal: abortCtrl.signal,
         });
         const reader = res.body.getReader();
         const dec = new TextDecoder();
@@ -1305,7 +1323,7 @@
           try {
             const res = await fetch('/api/images/pull', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Basic ${state.auth.basic}` },
+              headers: { 'Content-Type': 'application/json', Authorization: authHeader() },
               body: JSON.stringify({ repository: repo, tag, registry }),
             });
             if (!res.ok) throw new Error(`Pull failed: ${res.status}`);
@@ -1791,7 +1809,7 @@
       const res = await fetch(path, {
         method: opts.method || 'POST',
         headers: {
-          Authorization: `Basic ${state.auth.basic}`,
+          Authorization: authHeader(),
           ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
         },
         body: opts.body || null,
@@ -1856,7 +1874,7 @@
             const res = await fetch('/api/stacks', {
               method: 'POST',
               headers: {
-                Authorization: `Basic ${state.auth.basic}`,
+                Authorization: authHeader(),
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify(payload),
@@ -2161,7 +2179,7 @@
       if (act === 'dl') {
         try {
           const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(child)}`, {
-            headers: { Authorization: `Basic ${state.auth.basic}` },
+            headers: { Authorization: authHeader() },
           });
           if (!res.ok) throw new Error(`Download failed (${res.status})`);
           const blob = await res.blob();
@@ -2203,7 +2221,7 @@
       try {
         const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
           method: 'POST',
-          headers: { Authorization: `Basic ${state.auth.basic}` },
+          headers: { Authorization: authHeader() },
           body: fd,
         });
         if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
@@ -2392,7 +2410,7 @@
       wrap.querySelector('#ev-toggle').textContent = '⏹ Stop';
       try {
         const res = await fetch('/api/system/events/stream', {
-          headers: { Authorization: `Basic ${state.auth.basic}` }, signal: evCtrl.signal,
+          headers: { Authorization: authHeader() }, signal: evCtrl.signal,
         });
         if (!res.ok) throw new Error(`Events stream failed (${res.status})`);
         const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
@@ -2478,7 +2496,7 @@
       statHistory = { cpu: [], mem: [] };
       try {
         const res = await fetch(`/api/containers/${encodeURIComponent(id)}/stats/stream`, {
-          headers: { Authorization: `Basic ${state.auth.basic}` }, signal: statCtrl.signal,
+          headers: { Authorization: authHeader() }, signal: statCtrl.signal,
         });
         if (!res.ok) throw new Error(`Stats stream failed (${res.status})`);
         const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
@@ -2569,8 +2587,16 @@
 
   (async () => {
     if (state.auth) {
-      try { await api('/api/system/ping'); }
-      catch { state.auth = null; saveAuth(null); }
+      try {
+        const me = await api('/api/auth/me');
+        // Refresh role/user just in case the server-side configuration changed.
+        state.auth.user = me.user;
+        state.auth.role = me.role;
+        saveAuth(state.auth);
+      } catch {
+        state.auth = null;
+        saveAuth(null);
+      }
       await bootstrap();
     }
     render();

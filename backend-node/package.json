@@ -11,6 +11,7 @@
   "dependencies": {
     "dockerode": "^4.0.2",
     "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.3",
     "multer": "^1.4.5-lts.1",
     "tar-stream": "^3.1.7",
     "ws": "^8.18.0"

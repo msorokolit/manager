@@ -1,7 +1,11 @@
-// HTTP Basic auth with two roles: admin (full) and viewer (read-only).
+// JWT bearer auth with two roles: admin (full) and viewer (read-only).
+//
+// `verifyCredentials` is exposed for the /api/auth/login endpoint; everywhere
+// else the bearer middleware (`authenticate`) is what protects routes.
 import { Buffer } from 'node:buffer';
 import { timingSafeEqual } from 'node:crypto';
 import { settings } from './config.js';
+import { verifyToken } from './jwt.js';
 
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -14,49 +18,51 @@ function safeEqual(a, b) {
   }
 }
 
-function unauthorized(res) {
-  res.set('WWW-Authenticate', 'Basic realm="Docker Manager"');
-  return res.status(401).json({ detail: 'Invalid credentials' });
+function unauthorized(res, detail = 'Authentication required') {
+  return res.status(401).json({ detail });
 }
 
 /**
- * Parse Basic credentials from a request and return either a `User` or null.
- * Used both by the Express middleware and the WebSocket-ticket endpoint.
+ * Match a username/password pair against the configured admin / viewer
+ * accounts. Returns a User object (`{username, role}`) or null. Used only
+ * by the login endpoint.
  */
-export function parseBasic(req) {
-  const h = req.headers && req.headers.authorization;
-  if (!h || !h.startsWith('Basic ')) return null;
-  let decoded;
-  try {
-    decoded = Buffer.from(h.slice(6), 'base64').toString('utf8');
-  } catch {
-    return null;
-  }
-  const i = decoded.indexOf(':');
-  if (i < 0) return null;
-  const user = decoded.slice(0, i);
-  const pass = decoded.slice(i + 1);
-
+export function verifyCredentials(username, password) {
+  if (typeof username !== 'string' || typeof password !== 'string') return null;
+  if (!username || !password) return null;
   if (
-    safeEqual(user, settings.adminUser) &&
-    safeEqual(pass, settings.adminPassword)
+    safeEqual(username, settings.adminUser) &&
+    safeEqual(password, settings.adminPassword)
   ) {
-    return { username: user, role: 'admin' };
+    return { username, role: 'admin' };
   }
   if (
     settings.viewerUser &&
     settings.viewerPassword &&
-    safeEqual(user, settings.viewerUser) &&
-    safeEqual(pass, settings.viewerPassword)
+    safeEqual(username, settings.viewerUser) &&
+    safeEqual(password, settings.viewerPassword)
   ) {
-    return { username: user, role: 'viewer' };
+    return { username, role: 'viewer' };
   }
   return null;
 }
 
+/**
+ * Pull a Bearer token off a request and validate it. Returns a User on
+ * success or null on any failure.
+ */
+export function parseBearer(req) {
+  const h = req.headers && req.headers.authorization;
+  if (!h || !h.startsWith('Bearer ')) return null;
+  const token = h.slice(7).trim();
+  const claims = verifyToken(token);
+  if (!claims || !claims.sub || !claims.role) return null;
+  return { username: claims.sub, role: claims.role };
+}
+
 export function authenticate(req, res, next) {
-  const user = parseBasic(req);
-  if (!user) return unauthorized(res);
+  const user = parseBearer(req);
+  if (!user) return unauthorized(res, 'Invalid or missing bearer token');
   req.user = user;
   next();
 }

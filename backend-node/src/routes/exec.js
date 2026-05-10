@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
-import { authenticate, parseBasic } from '../auth.js';
+import { authenticate } from '../auth.js';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError } from '../util.js';

@@ -35,6 +35,11 @@ export const settings = Object.freeze({
   browserImage: process.env.BROWSER_IMAGE || 'python:3-alpine',
   port: parseInt(process.env.PORT || '8000', 10),
   host: process.env.HOST || '0.0.0.0',
+  jwtSecret: process.env.JWT_SECRET || null,
+  jwtTtlSeconds: Math.max(
+    60,
+    parseInt(process.env.JWT_TTL_SECONDS || '43200', 10), // 12h default
+  ),
 });
 
 export const VERSION = '0.1.0';

@@ -10,7 +10,7 @@ The stack is intentionally small and easy to audit:
   in `backend-node/`. Pure ESM, no transpilation, ~10 source files.
 - **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
   (loaded via CDN) — no build step is required
-- **Auth**: HTTP Basic with two roles (`admin`, optional read-only `viewer`)
+- **Auth**: JWT bearer (HS256), two roles (`admin`, optional read-only `viewer`)
 - **Packaging**: A single Docker image; runs via `docker compose`
 
 ## Features
@@ -103,6 +103,8 @@ All configuration is via environment variables.
 | `DATA_DIR`           | `/data`          | Base directory for the registries file                                |
 | `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
 | `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
+| `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
+| `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds (default 12h)                                |
 
 ## Security notes
 
@@ -115,12 +117,21 @@ All configuration is via environment variables.
 - For an audit-friendly read-only deployment, set `ALLOW_DESTRUCTIVE=false` and
   use the `viewer` account. Note that the in-browser terminal and all stack
   mutations require the `admin` role and so are disabled in this mode too.
-- HTTP Basic credentials are sent on every request; always front this with TLS
-  in production (Caddy, Traefik, nginx, an ingress controller, etc.).
-- The terminal endpoint is a WebSocket. Browsers cannot attach an HTTP Basic
-  header to `new WebSocket(...)`, so authentication uses a one-shot ticket
-  (`POST /api/exec/ticket`) that is consumed on connect and expires in 60s.
-  Tickets are bound to the issuing role and only admins can mint them.
+- Authentication uses **JWT bearer tokens (HS256)**. Clients call
+  `POST /api/auth/login` with `{username, password}` and receive a token they
+  send as `Authorization: Bearer <token>` on every other request. **Always
+  set `JWT_SECRET`** in production — without it a random secret is generated
+  on each restart and every issued token is invalidated. Always front the
+  service with TLS so the login payload and bearer token aren't transmitted
+  in clear text.
+- The verifier explicitly pins HS256, rejects `alg: none` and other
+  algorithms, validates `exp`, and re-derives `username`/`role` from the
+  signed claims so a tampered payload yields 401.
+- The terminal endpoint is a WebSocket. Browsers cannot attach an
+  `Authorization` header to `new WebSocket(...)`, so authentication uses a
+  one-shot ticket (`POST /api/exec/ticket`, requires a Bearer JWT) that is
+  consumed on connect and expires in 60s. Tickets are bound to the issuing
+  role and only admins can mint them.
 - Registry credentials are stored in plain text on disk so the daemon can
   consume them on pull. The file is created with mode `0600` and lives on the
   manager host; back it up like any other secret material. Never store
@@ -140,6 +151,7 @@ backend-node/
     config.js                   Env-driven settings
     auth.js                     HTTP Basic + role gating
     docker-client.js            Lazy dockerode singleton
+    jwt.js                      HS256 sign/verify (random secret if JWT_SECRET unset)
     util.js                     asyncHandler, NDJSON/raw stream helpers, errors
     routes/
       system.js                 ping, info, version, df, events, events/stream
@@ -151,6 +163,7 @@ backend-node/
       stacks.js                 CRUD + up/down/restart/pull/logs/validate + per-service actions
       registries.js             list/upsert/delete/test (file-backed credential store)
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
+      auth.js                   POST /api/auth/login + GET /api/auth/me
 
 frontend/
   index.html
@@ -171,6 +184,7 @@ unless an endpoint is admin-only). Mutating endpoints are gated by
 | Resource     | Endpoints                                                              |
 | ------------ | ---------------------------------------------------------------------- |
 | meta         | `GET /api/health`, `GET /api/config`                                   |
+| auth         | `POST /api/auth/login` (public), `GET /api/auth/me` (Bearer)           |
 | system       | `GET /api/system/{ping,info,version,df,events,events/stream}`          |
 | containers   | list / inspect / run / start / stop / restart / pause / unpause / kill / remove / prune / logs / logs/stream / stats / stats/stream |
 | images       | list / inspect / pull (NDJSON progress) / remove / prune               |
@@ -181,11 +195,17 @@ unless an endpoint is admin-only). Mutating endpoints are gated by
 | registries   | list / upsert (POST or PUT) / delete / test                            |
 | exec         | `POST /api/exec/ticket` + `WS /api/containers/:id/exec?ticket=&cmd=&cols=&rows=` |
 
-Most endpoints accept the same Basic credentials used by the UI, e.g.
+All endpoints other than `POST /api/auth/login`, `GET /api/health` and
+`GET /api/config` require a Bearer JWT. Typical usage:
 
 ```bash
-curl -u admin:secret http://localhost:8000/api/containers | jq
-curl -u admin:secret -X POST http://localhost:8000/api/containers/<id>/restart
+TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"secret"}' \
+  http://localhost:8000/api/auth/login | jq -r .token)
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/containers | jq
+curl -H "Authorization: Bearer $TOKEN" -X POST \
+  http://localhost:8000/api/containers/<id>/restart
 ```
 
 ## License

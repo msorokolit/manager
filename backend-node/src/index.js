@@ -10,6 +10,7 @@ import { WebSocketServer } from 'ws';
 import { settings, VERSION } from './config.js';
 import { sendError } from './util.js';
 
+import authRouter from './routes/auth.js';
 import systemRouter from './routes/system.js';
 import containersRouter from './routes/containers.js';
 import imagesRouter from './routes/images.js';
@@ -70,7 +71,10 @@ app.get('/api/config', (_req, res) => {
   });
 });
 
-// Resource routers — base paths intentionally match the Python backend.
+// Auth (login / me) — public so the SPA can call /login without a token.
+app.use('/api/auth', authRouter);
+
+// All other resource routers require a valid Bearer JWT.
 app.use('/api/system', systemRouter);
 app.use('/api/containers', containersRouter);
 app.use('/api/images', imagesRouter);
