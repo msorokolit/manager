@@ -40,6 +40,23 @@ export const settings = Object.freeze({
     60,
     parseInt(process.env.JWT_TTL_SECONDS || '43200', 10), // 12h default
   ),
+  // Security headers
+  helmetDisabled: bool('HELMET_DISABLED', false),
+  cspDisabled: bool('CSP_DISABLED', false),
+  // Extra CSP source allow-listings (comma-separated). Useful when an
+  // operator forks the SPA and adds another CDN.
+  cspExtraScriptSrc: (process.env.CSP_EXTRA_SCRIPT_SRC || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+  cspExtraStyleSrc: (process.env.CSP_EXTRA_STYLE_SRC || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+  cspExtraConnectSrc: (process.env.CSP_EXTRA_CONNECT_SRC || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 });
 
 export const VERSION = '0.1.0';

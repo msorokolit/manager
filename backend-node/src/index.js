@@ -1,10 +1,12 @@
-// FastAPI-equivalent entrypoint for the Docker Manager Node.js backend.
+// Entrypoint for the Docker Manager Node.js backend.
 import express from 'express';
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import cors from 'cors';
+import helmet from 'helmet';
 import { WebSocketServer } from 'ws';
 
 import { settings, VERSION } from './config.js';
@@ -23,22 +25,94 @@ import execRouter, { handleExecWebSocket } from './routes/exec.js';
 
 const app = express();
 
+// Trust the first hop so Express handles X-Forwarded-* correctly when run
+// behind a reverse proxy (Caddy / Traefik / nginx / an ingress).
+app.set('trust proxy', 1);
+
+// ---------- Security headers (helmet) ----------
+//
+// Notes on the CSP policy below:
+//   - Tailwind is loaded from the CDN at runtime and injects <style> tags into
+//     the document, so style-src needs 'unsafe-inline' AND the Tailwind/jsDelivr
+//     hosts. There's no way to avoid 'unsafe-inline' for styles without
+//     switching to a build-time Tailwind setup.
+//   - index.html contains a single inline <script> block that configures the
+//     Tailwind runtime; permitting 'unsafe-inline' for scripts covers it. If
+//     you want a stricter policy, fork the frontend to remove that block (or
+//     replace inline scripts with hashed ones) and tighten directives via the
+//     CSP_EXTRA_* env vars.
+//   - WebSocket exec uses the same origin, which 'connect-src 'self'' allows
+//     for both ws:// and wss:// in modern browsers.
+//   - upgradeInsecureRequests is intentionally NOT set: many deployments run
+//     plain HTTP behind a TLS-terminating reverse proxy, and forcing https in
+//     the page would break those.
+if (!settings.helmetDisabled) {
+  const helmetOpts = {
+    // CDN scripts don't ship CORP/COEP headers, so leave these off.
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: 'same-site' },
+    // Disable HSTS by default — a TLS-terminating proxy is a better place to
+    // set Strict-Transport-Security with a deployment-appropriate max-age.
+    strictTransportSecurity: false,
+  };
+  if (settings.cspDisabled) {
+    helmetOpts.contentSecurityPolicy = false;
+  } else {
+    helmetOpts.contentSecurityPolicy = {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https://cdn.tailwindcss.com',
+          'https://cdn.jsdelivr.net',
+          ...settings.cspExtraScriptSrc,
+        ],
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https://cdn.jsdelivr.net',
+          ...settings.cspExtraStyleSrc,
+        ],
+        imgSrc: ["'self'", 'data:'],
+        fontSrc: ["'self'", 'data:', 'https://cdn.jsdelivr.net'],
+        connectSrc: ["'self'", ...settings.cspExtraConnectSrc],
+        workerSrc: ["'self'", 'blob:'],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"],
+        formAction: ["'self'"],
+      },
+    };
+  }
+  app.use(helmet(helmetOpts));
+}
+
+// ---------- CORS ----------
+//
+// If CORS_ORIGINS is empty, no Access-Control-* headers are emitted (the SPA
+// is served from the same origin as the API, so cross-origin browser requests
+// shouldn't normally happen). When set, we enable credentialed CORS for the
+// listed origins and reject everything else.
 if (settings.corsOrigins.length) {
-  // Lightweight inline CORS — avoids an extra dep.
-  app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && settings.corsOrigins.includes(origin)) {
-      res.set('Access-Control-Allow-Origin', origin);
-      res.set('Access-Control-Allow-Credentials', 'true');
-      res.set('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-      res.set(
-        'Access-Control-Allow-Headers',
-        'Authorization, Content-Type, X-Requested-With',
-      );
-    }
-    if (req.method === 'OPTIONS') return res.status(204).end();
-    next();
-  });
+  app.use(
+    cors({
+      origin: (origin, cb) => {
+        // Same-origin / curl / server-to-server: no Origin header. Always pass.
+        if (!origin) return cb(null, true);
+        if (settings.corsOrigins.includes(origin)) return cb(null, true);
+        // Silent deny: omit ACAO headers so the browser rejects the response
+        // (and refuses to send the real request after a failed preflight).
+        return cb(null, false);
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With'],
+      exposedHeaders: ['Content-Disposition', 'Content-Length'],
+      maxAge: 600,
+    }),
+  );
 }
 
 app.use(express.json({ limit: '10mb' }));

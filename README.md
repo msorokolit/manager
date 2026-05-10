@@ -105,6 +105,10 @@ All configuration is via environment variables.
 | `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
 | `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
 | `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds (default 12h)                                |
+| `CORS_ORIGINS`       | _(empty)_        | Comma-separated origin allow-list. Empty means same-origin only — no CORS headers emitted. Set to e.g. `https://ops.example.com` to enable cross-origin browser access. |
+| `HELMET_DISABLED`    | `false`          | Disable [Helmet](https://helmetjs.github.io/) entirely. NOT recommended. |
+| `CSP_DISABLED`       | `false`          | Keep all other Helmet headers but drop the Content-Security-Policy header (useful if you proxy through a CDN that injects its own CSP). |
+| `CSP_EXTRA_SCRIPT_SRC` / `CSP_EXTRA_STYLE_SRC` / `CSP_EXTRA_CONNECT_SRC` | _(empty)_ | Comma-separated additional sources to allow if you fork the SPA to load assets from another CDN. |
 
 ## Security notes
 
@@ -127,6 +131,30 @@ All configuration is via environment variables.
 - The verifier explicitly pins HS256, rejects `alg: none` and other
   algorithms, validates `exp`, and re-derives `username`/`role` from the
   signed claims so a tampered payload yields 401.
+- All HTTP responses carry a [Helmet](https://helmetjs.github.io/) baseline
+  set of security headers: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Resource-Policy: same-site`, and a
+  `Content-Security-Policy` tuned for the CDN-loaded Tailwind + xterm.js
+  assets the SPA uses. `Strict-Transport-Security` is intentionally
+  **not** set so that operators running behind a TLS-terminating proxy
+  can pick a sensible `max-age` themselves; if you don't have a proxy,
+  add HSTS at your reverse-proxy layer rather than enabling helmet's
+  default.
+- The bundled CSP allows `'unsafe-inline'` for both scripts and styles —
+  required because Tailwind's CDN runtime injects `<style>` tags into the
+  document and `index.html` carries one inline `<script>` block that
+  configures it. The CSP otherwise restricts `script-src` to `self`
+  + `cdn.tailwindcss.com` + `cdn.jsdelivr.net`, denies framing
+  (`frame-ancestors 'none'`), denies `<object>`, and pins `connect-src`
+  to `self` (covers ws:// and wss:// for the exec WebSocket on the same
+  origin).
+- CORS is disabled by default (same-origin SPA + API). Set `CORS_ORIGINS`
+  to a comma-separated allow-list to enable credentialed cross-origin
+  browser access — disallowed origins receive responses with no
+  `Access-Control-Allow-Origin` header and the browser refuses the
+  response.
 - The terminal endpoint is a WebSocket. Browsers cannot attach an
   `Authorization` header to `new WebSocket(...)`, so authentication uses a
   one-shot ticket (`POST /api/exec/ticket`, requires a Bearer JWT) that is
