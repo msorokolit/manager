@@ -9,9 +9,99 @@ import {
   pipeNdjson,
   pipeRaw,
 } from '../util.js';
+import { opt, validateBody, z } from '../validate.js';
 
 const router = Router();
 router.use(authenticate);
+
+// ---------- Zod schemas for the rich create-container body ----------
+const Ulimit = z
+  .object({
+    name: z.string().min(1),
+    soft: z.number().int().nullable().optional(),
+    hard: z.number().int().nullable().optional(),
+  })
+  .strict();
+
+const Healthcheck = z
+  .object({
+    test: opt(z.union([z.array(z.string()), z.string()])),
+    interval: opt(z.number().int().nonnegative()),
+    timeout: opt(z.number().int().nonnegative()),
+    retries: opt(z.number().int().nonnegative()),
+    start_period: opt(z.number().int().nonnegative()),
+  })
+  .strict();
+
+const VolumeSpec = z
+  .object({
+    bind: z.string().min(1),
+    mode: z.string().optional(),
+  })
+  .strict();
+
+const RESTART_POLICIES = ['no', 'always', 'unless-stopped', 'on-failure'];
+
+const CreateContainerBody = z
+  .object({
+    image: z.string().min(1, 'image is required').max(512),
+    name: opt(z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/, 'invalid container name')),
+    command: opt(z.union([z.string(), z.array(z.string())])),
+    entrypoint: opt(z.union([z.string(), z.array(z.string())])),
+    env: opt(z.record(z.string(), z.string())),
+    ports: opt(z.record(z.string(), z.union([z.number(), z.string(), z.null()]))),
+    volumes: opt(z.record(z.string(), VolumeSpec)),
+    restart_policy: opt(z.enum(RESTART_POLICIES)),
+    network: opt(z.string()),
+    network_mode: opt(z.string()),
+    labels: opt(z.record(z.string(), z.string())),
+    detach: z.boolean().default(true),
+    pull: z.boolean().default(false),
+
+    user: opt(z.string()),
+    working_dir: opt(z.string()),
+    hostname: opt(z.string().max(253)),
+    domainname: opt(z.string().max(253)),
+    init: opt(z.boolean()),
+    stop_signal: opt(z.string()),
+    stop_grace_period: opt(z.number().int().nonnegative()),
+    tty: opt(z.boolean()),
+    stdin_open: opt(z.boolean()),
+    auto_remove: opt(z.boolean()),
+    read_only: opt(z.boolean()),
+
+    dns: opt(z.array(z.string())),
+    dns_search: opt(z.array(z.string())),
+    dns_opt: opt(z.array(z.string())),
+    extra_hosts: opt(z.record(z.string(), z.string())),
+    mac_address: opt(z.string()),
+
+    tmpfs: opt(z.record(z.string(), z.string())),
+
+    cpus: opt(z.number().nonnegative()),
+    cpu_shares: opt(z.number().int().nonnegative()),
+    cpuset_cpus: opt(z.string()),
+    mem_limit: opt(z.union([z.string(), z.number().int()])),
+    mem_reservation: opt(z.union([z.string(), z.number().int()])),
+    memswap_limit: opt(z.union([z.string(), z.number().int()])),
+    pids_limit: opt(z.number().int()),
+    shm_size: opt(z.union([z.string(), z.number().int().nonnegative()])),
+    ulimits: opt(z.array(Ulimit)),
+    devices: opt(z.array(z.string())),
+    gpus: opt(z.union([z.number().int(), z.string()])),
+
+    privileged: opt(z.boolean()),
+    cap_add: opt(z.array(z.string())),
+    cap_drop: opt(z.array(z.string())),
+    security_opt: opt(z.array(z.string())),
+    sysctls: opt(z.record(z.string(), z.string())),
+
+    healthcheck: opt(Healthcheck),
+
+    log_driver: opt(z.string()),
+    log_opts: opt(z.record(z.string(), z.string())),
+  })
+  .strict();
 
 function portsObj(arr) {
   // dockerode list returns Ports: [{IP, PrivatePort, PublicPort, Type}]
@@ -208,14 +298,9 @@ router.delete(
 );
 
 // Build the dockerode createContainer payload from our rich JSON schema.
-function buildCreateOptions(req) {
-  const o = req || {};
-  if (!o.image) {
-    const e = new Error('image is required');
-    e.statusCode = 400;
-    throw e;
-  }
-
+// The body is already validated upstream by validateBody(CreateContainerBody),
+// so this function trusts the shape + types it receives.
+function buildCreateOptions(o) {
   const env = o.env
     ? Object.entries(o.env).map(([k, v]) => `${k}=${v}`)
     : undefined;
@@ -405,8 +490,9 @@ function buildCreateOptions(req) {
 router.post(
   '/',
   requireAdmin,
+  validateBody(CreateContainerBody),
   asyncHandler(async (req, res) => {
-    const body = req.body || {};
+    const body = req.body;
     const docker = getClient();
     if (body.pull) {
       // Pull synchronously before create.

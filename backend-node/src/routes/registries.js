@@ -6,8 +6,29 @@ import { authenticate, requireAdmin } from '../auth.js';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, HttpError } from '../util.js';
+import { opt, validateBody, z } from '../validate.js';
 
 const router = Router();
+
+const RegistryBody = z
+  .object({
+    name: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, 'invalid registry name'),
+    url: z.string().url('url must be a valid URL').max(2048).optional(),
+    username: z.string().min(1).max(255),
+    password: z.string().min(1).max(2048),
+    email: opt(z.string().email().max(255)),
+  })
+  .strict();
+
+// PUT body is the same but the name comes from the path; let it be optional
+// in the body and we'll override it with the path param.
+const RegistryUpdateBody = RegistryBody.partial({ name: true }).extend({
+  name: opt(z.string()),
+});
 router.use(authenticate);
 
 let writeLock = Promise.resolve();
@@ -81,17 +102,11 @@ router.get(
   }),
 );
 
-function validatePayload(body) {
-  if (!body || !body.name) throw new HttpError(400, 'name is required');
-  if (!body.username) throw new HttpError(400, 'username is required');
-  if (!body.password) throw new HttpError(400, 'password is required');
-}
-
 router.post(
   '/',
   requireAdmin,
+  validateBody(RegistryBody),
   asyncHandler(async (req, res) => {
-    validatePayload(req.body);
     const b = req.body;
     await withLock(async () => {
       const creds = await load();
@@ -110,12 +125,18 @@ router.post(
 router.put(
   '/:name',
   requireAdmin,
+  validateBody(RegistryUpdateBody),
   asyncHandler(async (req, res) => {
-    const b = { ...(req.body || {}), name: req.params.name };
-    validatePayload(b);
+    // Name comes from the URL path; body-level `name` (if any) is ignored.
+    const name = req.params.name;
+    const b = { ...req.body, name };
+    if (!name) throw new HttpError(400, 'name is required');
+    if (!b.username || !b.password) {
+      throw new HttpError(400, 'username and password are required');
+    }
     await withLock(async () => {
       const creds = await load();
-      creds[b.name] = {
+      creds[name] = {
         url: b.url || 'https://index.docker.io/v1/',
         username: b.username,
         password: b.password,
@@ -123,7 +144,7 @@ router.put(
       };
       await save(creds);
     });
-    res.json({ name: b.name, saved: true });
+    res.json({ name, saved: true });
   }),
 );
 

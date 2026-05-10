@@ -6,8 +6,11 @@ single Docker engine: containers, images, networks, volumes, and host info.
 
 The stack is intentionally small and easy to audit:
 
-- **Backend**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode))
-  in `backend-node/`. Pure ESM, no transpilation, ~10 source files.
+- **Backend**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode)
+  + [`zod`](https://zod.dev) + [`helmet`](https://helmetjs.github.io) +
+  [`cors`](https://github.com/expressjs/cors) +
+  [`jsonwebtoken`](https://github.com/auth0/node-jsonwebtoken)) in
+  `backend-node/`. Pure ESM, no transpilation, ~13 source files.
 - **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
   (loaded via CDN) — no build step is required
 - **Auth**: JWT bearer (HS256), two roles (`admin`, optional read-only `viewer`)
@@ -110,6 +113,28 @@ All configuration is via environment variables.
 | `CSP_DISABLED`       | `false`          | Keep all other Helmet headers but drop the Content-Security-Policy header (useful if you proxy through a CDN that injects its own CSP). |
 | `CSP_EXTRA_SCRIPT_SRC` / `CSP_EXTRA_STYLE_SRC` / `CSP_EXTRA_CONNECT_SRC` | _(empty)_ | Comma-separated additional sources to allow if you fork the SPA to load assets from another CDN. |
 
+## Request validation
+
+Every endpoint that accepts a body validates it with [Zod](https://zod.dev)
+before the handler runs. Schemas use `.strict()` so unknown fields are
+rejected, type mismatches are caught (including in deeply-nested arrays /
+records), and field-level errors come back in a uniform shape:
+
+```json
+{
+  "detail": "Validation failed",
+  "errors": [
+    { "path": "ports.80/tcp", "message": "Expected number, received string", "code": "invalid_type" },
+    { "path": "ulimits.0.soft", "message": "Expected number, received string", "code": "invalid_type" },
+    { "path": "", "message": "Unrecognized key(s) in object: 'sneaky'", "code": "unrecognized_keys" }
+  ]
+}
+```
+
+Path parameters are validated where they affect filesystem or shell-out
+behaviour (stack name, service name, action enum) so e.g. `service: "../etc"`
+is rejected at the routing layer rather than relying on downstream sanitising.
+
 ## Security notes
 
 - This UI is intended for **trusted operators** on a private network. Mounting
@@ -180,6 +205,7 @@ backend-node/
     auth.js                     HTTP Basic + role gating
     docker-client.js            Lazy dockerode singleton
     jwt.js                      HS256 sign/verify (random secret if JWT_SECRET unset)
+    validate.js                 zod-based body / query / params validation middleware
     util.js                     asyncHandler, NDJSON/raw stream helpers, errors
     routes/
       system.js                 ping, info, version, df, events, events/stream
