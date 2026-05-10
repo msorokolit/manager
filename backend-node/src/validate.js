@@ -14,17 +14,32 @@
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 
+// Two AJV instances: one strict (for JSON request bodies) and one with type
+// coercion enabled (for query strings and path params, where everything
+// arrives as a string).
 const ajv = new Ajv({
   allErrors: true,
-  // We don't want AJV to silently mutate the request body.
   removeAdditional: false,
   useDefaults: true,
   coerceTypes: false,
-  // Schemas may be re-compiled per route file load; allow that.
   addUsedSchema: false,
   strict: false,
 });
 addFormats(ajv);
+
+const ajvCoerce = new Ajv({
+  allErrors: true,
+  removeAdditional: false,
+  useDefaults: true,
+  // Query/params arrive as strings; coerce booleans, integers and numbers
+  // back to their declared types so handlers can rely on them. 'array'
+  // additionally turns a single-value string into a one-element array when
+  // the schema asks for one.
+  coerceTypes: 'array',
+  addUsedSchema: false,
+  strict: false,
+});
+addFormats(ajvCoerce);
 
 function jsonPointerToPath(pointer) {
   if (!pointer) return '';
@@ -90,25 +105,27 @@ export function validateBody(schema) {
 }
 
 export function validateQuery(schema) {
-  const validator = ajv.compile(schema);
+  const validator = ajvCoerce.compile(schema);
   return (req, res, next) => {
-    const data = req.query == null ? {} : req.query;
+    // Clone so coercion doesn't mutate the underlying req.query (Express 5
+    // makes that a getter). Strings on the wire become booleans/integers
+    // here, matching the declared schema.
+    const data = req.query == null ? {} : { ...req.query };
     if (!validator(data)) {
       return res.status(400).json({
         detail: 'Validation failed',
         errors: (validator.errors || []).map(formatError),
       });
     }
-    // Don't mutate req.query (Express 5 makes it a getter).
     req.validatedQuery = data;
     next();
   };
 }
 
 export function validateParams(schema) {
-  const validator = ajv.compile(schema);
+  const validator = ajvCoerce.compile(schema);
   return (req, res, next) => {
-    const data = req.params == null ? {} : req.params;
+    const data = req.params == null ? {} : { ...req.params };
     if (!validator(data)) {
       return res.status(400).json({
         detail: 'Invalid path parameter',

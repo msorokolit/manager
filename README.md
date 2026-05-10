@@ -15,8 +15,10 @@ The stack is intentionally small and easy to audit:
   in `backend-node/`. Pure ESM, no transpilation. Schemas are JSON Schema
   fragments that drive both runtime validation **and** the auto-generated
   OpenAPI 3.1 spec — single source of truth.
-- **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
-  (loaded via CDN) — no build step is required
+- **Frontend**: A single-page app written in vanilla JS, styled with Tailwind,
+  bundled with **webpack** under `frontend/`. xterm.js, Tailwind utilities and
+  the application code are all served as a content-hashed bundle from the
+  same origin — no third-party CDN at runtime.
 - **Auth**: JWT bearer (HS256), two roles (`admin`, optional read-only `viewer`)
 - **Packaging**: A single Docker image; runs via `docker compose`
 
@@ -81,13 +83,24 @@ Requires Node.js 20+ and a reachable Docker daemon (e.g. via
 `/var/run/docker.sock` or the `DOCKER_HOST` environment variable).
 
 ```bash
-cd backend-node
+# 1. Build the SPA bundle once.
+cd frontend
+npm install
+npm run build       # writes frontend/dist/{index.html, main.<hash>.js, main.<hash>.css}
+
+# 2. Start the backend, which serves both the API and the bundle.
+cd ../backend-node
 npm install
 ADMIN_USER=admin ADMIN_PASSWORD=admin npm start
 # server on http://localhost:8000
 ```
 
-The frontend is served from the same process at `/`.
+For iterative frontend work, run `npm run dev` in `frontend/` (webpack `--watch`)
+in one terminal and `npm start` in `backend-node/` in another; the backend
+serves whatever's currently in `frontend/dist/`.
+
+The Docker image bakes the bundle into a multi-stage build, so end-users
+running `docker compose up -d --build` don't need to run `npm` themselves.
 
 ## Configuration
 
@@ -208,20 +221,26 @@ is rejected at the routing layer rather than relying on downstream sanitising.
   `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: no-referrer`,
   `Cross-Origin-Opener-Policy: same-origin`,
   `Cross-Origin-Resource-Policy: same-site`, and a
-  `Content-Security-Policy` tuned for the CDN-loaded Tailwind + xterm.js
-  assets the SPA uses. `Strict-Transport-Security` is intentionally
-  **not** set so that operators running behind a TLS-terminating proxy
-  can pick a sensible `max-age` themselves; if you don't have a proxy,
-  add HSTS at your reverse-proxy layer rather than enabling helmet's
-  default.
-- The bundled CSP allows `'unsafe-inline'` for both scripts and styles —
-  required because Tailwind's CDN runtime injects `<style>` tags into the
-  document and `index.html` carries one inline `<script>` block that
-  configures it. The CSP otherwise restricts `script-src` to `self`
-  + `cdn.tailwindcss.com` + `cdn.jsdelivr.net`, denies framing
-  (`frame-ancestors 'none'`), denies `<object>`, and pins `connect-src`
-  to `self` (covers ws:// and wss:// for the exec WebSocket on the same
-  origin).
+  `Content-Security-Policy` tuned for the bundled SPA (see CSP details below).
+  `Strict-Transport-Security` is intentionally **not** set so that operators
+  running behind a TLS-terminating proxy can pick a sensible `max-age`
+  themselves; if you don't have a proxy, add HSTS at your reverse-proxy
+  layer rather than enabling helmet's default.
+- All HTTP responses carry a [Helmet](https://helmetjs.github.io) security-
+  header baseline plus a strict CSP, since the SPA is now bundled and served
+  from the same origin (no third-party CDN at runtime):
+    - `default-src 'self'`
+    - `script-src 'self'` (no `'unsafe-inline'`, no third-party hosts)
+    - `style-src 'self' 'unsafe-inline'` — the inline allowance covers a
+      handful of `style="..."` attributes the SPA uses (e.g. on the terminal
+      modal); everything else is in the bundled CSS
+    - `connect-src 'self'` — covers `ws://` / `wss://` to the exec WebSocket
+    - `img-src 'self' data:`, `font-src 'self' data:`,
+      `worker-src 'self' blob:`
+    - `object-src 'none'`, `frame-ancestors 'none'`, `base-uri 'self'`
+  CSP is dropped only on `/api/docs/` (Swagger UI's inline initializer); the
+  rest of the app keeps the full policy. `CSP_EXTRA_*` env vars allow forks
+  to add additional sources without disabling CSP entirely.
 - CORS is disabled by default (same-origin SPA + API). Set `CORS_ORIGINS`
   to a comma-separated allow-list to enable credentialed cross-origin
   browser access — disallowed origins receive responses with no
@@ -271,10 +290,16 @@ backend-node/
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
       auth.js                   POST /api/auth/login + GET /api/auth/me
 
-frontend/
-  index.html
-  app.js                        SPA: routing, views, dialogs
-  styles.css
+frontend/                       Webpack-bundled SPA
+  package.json
+  webpack.config.cjs
+  postcss.config.cjs
+  tailwind.config.cjs
+  src/
+    index.html                  Template (no CDN tags; webpack injects script/link)
+    index.js                    SPA: routing, views, dialogs (imports xterm + styles)
+    styles.css                  @tailwind directives + custom rules
+  dist/                         Build output (gitignored): served at /
 
 Dockerfile
 docker-compose.yml

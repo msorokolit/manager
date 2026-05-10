@@ -1,4 +1,9 @@
-/* Docker Manager UI — single-page application */
+/* Docker Manager UI — single-page application (webpack-bundled) */
+import './styles.css';
+import '@xterm/xterm/css/xterm.css';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+
 (() => {
   'use strict';
 
@@ -1696,7 +1701,7 @@
           theme: { background: '#000000', foreground: '#e2e8f0' },
           convertEol: true,
         });
-        fit = new FitAddon.FitAddon();
+        fit = new FitAddon();
         term.loadAddon(fit);
         term.open(wrap.querySelector('#term-host'));
         try { fit.fit(); } catch {}

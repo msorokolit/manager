@@ -1,3 +1,18 @@
+# ---------- Frontend bundle stage ----------
+# Bundles the SPA with webpack, producing a static dist/ tree containing
+# index.html + content-hashed JS/CSS bundles + sourcemaps.
+FROM node:22-slim AS frontend-build
+
+WORKDIR /app/frontend
+
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --silent
+
+COPY frontend ./
+RUN npm run build
+
+
+# ---------- Runtime stage ----------
 FROM node:22-slim AS base
 
 ENV NODE_ENV=production
@@ -25,11 +40,14 @@ COPY backend-node/package.json backend-node/package-lock.json* /app/backend-node
 RUN cd /app/backend-node && npm install --omit=dev --silent
 
 COPY backend-node /app/backend-node
-COPY frontend /app/frontend
+
+# Pull in only the built bundle from the frontend stage — no node_modules
+# from frontend/, no Tailwind / webpack / xterm sources in the runtime image.
+COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 
 RUN mkdir -p /data/stacks
 
-ENV STATIC_DIR=/app/frontend \
+ENV STATIC_DIR=/app/frontend/dist \
     DATA_DIR=/data \
     STACKS_DIR=/data/stacks \
     REGISTRIES_FILE=/data/registries.json \

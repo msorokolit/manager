@@ -23,8 +23,11 @@ export const settings = Object.freeze({
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
+  // Default points at the webpack-built bundle. Run `npm run build` in
+  // frontend/ first, or set STATIC_DIR to a different directory.
   staticDir:
-    process.env.STATIC_DIR || path.resolve(__dirname, '..', '..', 'frontend'),
+    process.env.STATIC_DIR ||
+    path.resolve(__dirname, '..', '..', 'frontend', 'dist'),
   logTailDefault: parseInt(process.env.LOG_TAIL_DEFAULT || '200', 10),
   dataDir,
   stacksDir: process.env.STACKS_DIR || path.join(dataDir, 'stacks'),

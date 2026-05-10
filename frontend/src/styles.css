@@ -1,4 +1,14 @@
-/* Custom styles complementing the Tailwind CDN. */
+/* Tailwind enters here. The directives are replaced at build time by the
+   PostCSS Tailwind plugin with `base`, `components` and `utilities` layers
+   built from the classes the JIT detected by scanning src/ **.{html,js}. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* xterm.js styling is imported from JS via @xterm/xterm/css/xterm.css so
+   webpack picks it up and inlines the cursor / scrollbar selectors. */
+
+/* ---------- App-specific custom styles (formerly styles.css) ---------- */
 
 html, body { height: 100%; }
 

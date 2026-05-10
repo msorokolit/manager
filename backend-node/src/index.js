@@ -50,24 +50,19 @@ app.set('trust proxy', 1);
 
 // ---------- Security headers (helmet) ----------
 //
-// Notes on the CSP policy below:
-//   - Tailwind is loaded from the CDN at runtime and injects <style> tags into
-//     the document, so style-src needs 'unsafe-inline' AND the Tailwind/jsDelivr
-//     hosts. There's no way to avoid 'unsafe-inline' for styles without
-//     switching to a build-time Tailwind setup.
-//   - index.html contains a single inline <script> block that configures the
-//     Tailwind runtime; permitting 'unsafe-inline' for scripts covers it. If
-//     you want a stricter policy, fork the frontend to remove that block (or
-//     replace inline scripts with hashed ones) and tighten directives via the
-//     CSP_EXTRA_* env vars.
-//   - WebSocket exec uses the same origin, which 'connect-src 'self'' allows
-//     for both ws:// and wss:// in modern browsers.
-//   - upgradeInsecureRequests is intentionally NOT set: many deployments run
-//     plain HTTP behind a TLS-terminating reverse proxy, and forcing https in
-//     the page would break those.
+// Now that the SPA is bundled with webpack and served entirely from the same
+// origin, the CSP is much stricter than it used to be: no third-party hosts,
+// no script-src 'unsafe-inline'. We still allow style-src 'unsafe-inline'
+// because the SPA uses inline `style="..."` attributes in a few places (e.g.
+// the terminal modal), which the CSP spec includes under style-src.
+// Operators with custom forks can extend any directive via the CSP_EXTRA_*
+// env vars; CSP_DISABLED / HELMET_DISABLED are full escape hatches.
+//
+// upgradeInsecureRequests is intentionally NOT set: many deployments run
+// plain HTTP behind a TLS-terminating reverse proxy, and forcing https in
+// the page would break those.
 if (!settings.helmetDisabled) {
   const helmetOpts = {
-    // CDN scripts don't ship CORP/COEP headers, so leave these off.
     crossOriginEmbedderPolicy: false,
     crossOriginResourcePolicy: { policy: 'same-site' },
     // Disable HSTS by default — a TLS-terminating proxy is a better place to
@@ -81,21 +76,10 @@ if (!settings.helmetDisabled) {
       useDefaults: false,
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: [
-          "'self'",
-          "'unsafe-inline'",
-          'https://cdn.tailwindcss.com',
-          'https://cdn.jsdelivr.net',
-          ...settings.cspExtraScriptSrc,
-        ],
-        styleSrc: [
-          "'self'",
-          "'unsafe-inline'",
-          'https://cdn.jsdelivr.net',
-          ...settings.cspExtraStyleSrc,
-        ],
+        scriptSrc: ["'self'", ...settings.cspExtraScriptSrc],
+        styleSrc: ["'self'", "'unsafe-inline'", ...settings.cspExtraStyleSrc],
         imgSrc: ["'self'", 'data:'],
-        fontSrc: ["'self'", 'data:', 'https://cdn.jsdelivr.net'],
+        fontSrc: ["'self'", 'data:'],
         connectSrc: ["'self'", ...settings.cspExtraConnectSrc],
         workerSrc: ["'self'", 'blob:'],
         objectSrc: ["'none'"],
