@@ -6,11 +6,8 @@ single Docker engine: containers, images, networks, volumes, and host info.
 
 The stack is intentionally small and easy to audit:
 
-- **Backend (default)**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode))
-  in `backend-node/`
-- **Backend (alternate)**: FastAPI + the official `docker` Python SDK in `backend/`.
-  Both speak the same HTTP API and are wire-compatible, so the same SPA serves
-  both. Build with `Dockerfile.python` if you'd rather run the Python edition.
+- **Backend**: Node.js (Express + [`dockerode`](https://github.com/apocas/dockerode))
+  in `backend-node/`. Pure ESM, no transpilation, ~10 source files.
 - **Frontend**: A single-page app written in vanilla JS, styled with Tailwind
   (loaded via CDN) — no build step is required
 - **Auth**: HTTP Basic with two roles (`admin`, optional read-only `viewer`)
@@ -83,22 +80,7 @@ ADMIN_USER=admin ADMIN_PASSWORD=admin npm start
 # server on http://localhost:8000
 ```
 
-## Quick start (local Python — alternate backend)
-
-Requires Python 3.11+. The Python backend exposes the same API and serves the
-same SPA, so you can pick either:
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-ADMIN_USER=admin ADMIN_PASSWORD=admin \
-  uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-The frontend is served from the same process at `/`. The Python backend also
-ships an OpenAPI schema at `/docs` (Swagger UI). The Node backend serves the
-same surface at the same URLs but does not auto-generate Swagger docs.
+The frontend is served from the same process at `/`.
 
 ## Configuration
 
@@ -151,7 +133,7 @@ All configuration is via environment variables.
 ## Project layout
 
 ```
-backend-node/                   Default Node.js backend (Express + dockerode)
+backend-node/
   package.json
   src/
     index.js                    HTTP + WS server, SPA serving, route wiring
@@ -170,30 +152,34 @@ backend-node/                   Default Node.js backend (Express + dockerode)
       registries.js             list/upsert/delete/test (file-backed credential store)
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
 
-backend/                        Alternate Python backend (FastAPI + docker-py)
-  app/
-    main.py                     FastAPI app + static SPA serving
-    config.py                   Env-driven settings
-    auth.py                     HTTP Basic + role gating
-    docker_client.py            Lazy DockerClient singleton
-    routers/                    Same per-resource set as the Node version
-  requirements.txt
-
-frontend/                       Wire-compatible with both backends
+frontend/
   index.html
   app.js                        SPA: routing, views, dialogs
   styles.css
 
-Dockerfile                      Node backend image (default)
-Dockerfile.python               Python backend image (alternate)
+Dockerfile
 docker-compose.yml
 .env.example
 ```
 
 ## API
 
-The full OpenAPI schema is auto-generated and available at
-`http://localhost:8000/docs` (Swagger UI) or `/openapi.json`.
+51 HTTP endpoints + 1 WebSocket. All require HTTP Basic auth (admin or viewer
+unless an endpoint is admin-only). Mutating endpoints are gated by
+`ALLOW_DESTRUCTIVE`.
+
+| Resource     | Endpoints                                                              |
+| ------------ | ---------------------------------------------------------------------- |
+| meta         | `GET /api/health`, `GET /api/config`                                   |
+| system       | `GET /api/system/{ping,info,version,df,events,events/stream}`          |
+| containers   | list / inspect / run / start / stop / restart / pause / unpause / kill / remove / prune / logs / logs/stream / stats / stats/stream |
+| images       | list / inspect / pull (NDJSON progress) / remove / prune               |
+| networks     | list / inspect / create / connect / disconnect / remove / prune        |
+| volumes      | list / inspect / create / remove / prune                               |
+| volume-browser | list / get / upload / mkdir / delete / stop                          |
+| stacks       | list / get / create / update / up / down / restart / pull / logs / validate / delete + per-service `{up,start,stop,restart,pull,rm,logs}` |
+| registries   | list / upsert (POST or PUT) / delete / test                            |
+| exec         | `POST /api/exec/ticket` + `WS /api/containers/:id/exec?ticket=&cmd=&cols=&rows=` |
 
 Most endpoints accept the same Basic credentials used by the UI, e.g.
 
