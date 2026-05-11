@@ -82,24 +82,29 @@ Then open <http://localhost:8000> and log in with the credentials from `.env`.
 Requires Node.js 20+ and a reachable Docker daemon (e.g. via
 `/var/run/docker.sock` or the `DOCKER_HOST` environment variable).
 
-```bash
-# 1. Build the SPA bundle once.
-cd frontend
-npm install
-npm run build       # writes frontend/dist/{index.html, main.<hash>.js, main.<hash>.css}
+The repo is an [npm workspace](https://docs.npmjs.com/cli/v10/using-npm/workspaces),
+so a single install at the root pulls down both the frontend and backend deps:
 
-# 2. Start the backend, which serves both the API and the bundle.
-cd ../backend-node
-npm install
+```bash
+npm install                          # installs frontend + backend deps in one go
+npm run build                        # builds the SPA bundle into frontend/dist/
 ADMIN_USER=admin ADMIN_PASSWORD=admin npm start
 # server on http://localhost:8000
 ```
 
-For iterative frontend work, run `npm run dev` in `frontend/` (webpack `--watch`)
-in one terminal and `npm start` in `backend-node/` in another; the backend
-serves whatever's currently in `frontend/dist/`.
+Useful scripts at the root (defined in `package.json`):
 
-The Docker image bakes the bundle into a multi-stage build, so end-users
+| Script | What it does |
+| --- | --- |
+| `npm install` | Install deps for every workspace |
+| `npm run build` | Production webpack build of the SPA → `frontend/dist/` |
+| `npm start` | Start the backend (serves API + bundle on `:8000`) |
+| `npm run preview` | `build` then `start` — production-mode end-to-end |
+| `npm run dev` | Run **both** workers in parallel (webpack `--watch` + node `--watch`), color-prefixed via [concurrently](https://github.com/open-cli-tools/concurrently) |
+| `npm run dev:frontend` / `npm run dev:backend` | Run just one watcher |
+| `npm run clean` | Wipe `dist/` + every `node_modules/` |
+
+The Docker image still bakes the bundle into a multi-stage build, so end-users
 running `docker compose up -d --build` don't need to run `npm` themselves.
 
 ## Configuration
