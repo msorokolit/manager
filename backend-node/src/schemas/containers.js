@@ -1,6 +1,21 @@
 import { Type } from '@sinclair/typebox';
 import { Opt, StringEnum } from './_common.js';
 
+// Memory size string accepted by docker-cli: optional decimal followed by an
+// optional k/m/g/t suffix, optional trailing 'b'. Examples: "512m", "1.5g",
+// "0", "256". Bare integers are also fine. Schema accepts the string form OR
+// a non-negative integer (interpreted as bytes by the daemon).
+const MEM_SIZE_PATTERN = '^\\d+(?:\\.\\d+)?[kKmMgGtT]?[bB]?$';
+const MemSize = Type.Union([
+  Type.String({ pattern: MEM_SIZE_PATTERN }),
+  Type.Integer({ minimum: 0 }),
+]);
+// `memswap_limit` additionally accepts -1 ("disable swap").
+const MemSizeOrUnlimited = Type.Union([
+  Type.String({ pattern: MEM_SIZE_PATTERN }),
+  Type.Integer({ minimum: -1 }),
+]);
+
 const Ulimit = Type.Object(
   {
     name: Type.String({ minLength: 1 }),
@@ -76,11 +91,11 @@ export const CreateContainerRequest = Type.Object(
     cpus: Opt(Type.Number({ minimum: 0 })),
     cpu_shares: Opt(Type.Integer({ minimum: 0 })),
     cpuset_cpus: Opt(Type.String()),
-    mem_limit: Opt(Type.Union([Type.String(), Type.Integer()])),
-    mem_reservation: Opt(Type.Union([Type.String(), Type.Integer()])),
-    memswap_limit: Opt(Type.Union([Type.String(), Type.Integer()])),
+    mem_limit: Opt(MemSize),
+    mem_reservation: Opt(MemSize),
+    memswap_limit: Opt(MemSizeOrUnlimited),
     pids_limit: Opt(Type.Integer()),
-    shm_size: Opt(Type.Union([Type.String(), Type.Integer({ minimum: 0 })])),
+    shm_size: Opt(MemSize),
     ulimits: Opt(Type.Array(Ulimit)),
     devices: Opt(Type.Array(Type.String())),
     gpus: Opt(Type.Union([Type.Integer(), Type.String()])),

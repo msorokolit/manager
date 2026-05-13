@@ -36,6 +36,7 @@
 import { Router } from 'express';
 import { authenticate, requireAdmin } from './auth.js';
 import { validateBody, validateParams, validateQuery } from './validate.js';
+import { expensiveConcurrency } from './rate-limit.js';
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
 
@@ -59,11 +60,14 @@ export function createApiRouter(basePath, defaults = {}) {
 
     const auth = spec.auth !== false;
     const admin = !!spec.admin;
+    const expensive = !!spec.expensive;
     const tags = spec.tags || (defaults.tag ? [defaults.tag] : []);
 
     const mws = [];
     if (auth) mws.push(authenticate);
     if (admin) mws.push(requireAdmin);
+    // The concurrency cap is per-user, so authenticate must have run first.
+    if (expensive) mws.push(expensiveConcurrency());
     if (spec.params) mws.push(validateParams(spec.params));
     if (spec.query) mws.push(validateQuery(spec.query));
     if (spec.body) mws.push(validateBody(spec.body));
@@ -79,6 +83,7 @@ export function createApiRouter(basePath, defaults = {}) {
       tags,
       auth,
       admin,
+      expensive,
       summary: spec.summary,
       description: spec.description,
       body: spec.body,

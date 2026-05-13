@@ -40,6 +40,24 @@ export function getClient() {
 }
 
 /**
+ * Strip information from a daemon error message that callers shouldn't see:
+ *
+ *   - Absolute filesystem paths (e.g. /var/lib/docker/overlay2/abc...) become
+ *     "<path>". This catches host-path leaks where a misconfigured volume
+ *     mount surfaces an internal directory in the error.
+ *   - Long hex hashes (>= 12 chars) become "<hash>" — uninteresting noise
+ *     that just bloats the response.
+ *   - Trims to 1 KB so a runaway daemon error can't fill the response.
+ */
+function sanitizeDaemonMessage(msg) {
+  if (!msg || typeof msg !== 'string') return msg;
+  return msg
+    .replace(/(\/(?:var|run|home|root|etc|proc|sys|tmp|opt|usr|app|data)\/[^\s'"]+)/g, '<path>')
+    .replace(/\b[a-f0-9]{12,}\b/g, '<hash>')
+    .slice(0, 1024);
+}
+
+/**
  * Map an error from dockerode (or a connection error) onto a HTTP-friendly
  * shape so route handlers can throw uniformly.
  */
@@ -48,10 +66,11 @@ export function dockerError(err) {
   if (err.code === 'ENOENT' || err.code === 'ECONNREFUSED' || err.code === 'EACCES') {
     return {
       status: 503,
-      detail: `Cannot connect to Docker daemon: ${err.message}`,
+      detail: `Cannot connect to Docker daemon: ${sanitizeDaemonMessage(err.message)}`,
     };
   }
-  const msg = (err.json && err.json.message) || err.reason || err.message;
+  const raw = (err.json && err.json.message) || err.reason || err.message;
+  const msg = sanitizeDaemonMessage(raw);
   if (err.statusCode === 404) return { status: 404, detail: msg || 'Not found' };
   if (err.statusCode === 409) return { status: 409, detail: msg || 'Conflict' };
   if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
@@ -59,3 +78,6 @@ export function dockerError(err) {
   }
   return { status: 502, detail: msg || 'Docker daemon error' };
 }
+
+// Visible-for-testing.
+export { sanitizeDaemonMessage };

@@ -13,6 +13,7 @@ import { WebSocketServer } from 'ws';
 import { settings, VERSION } from './config.js';
 import { sendError } from './util.js';
 import { buildOpenApiSpec } from './openapi.js';
+import { globalLimiter, loginLimiter } from './rate-limit.js';
 
 import authApi from './routes/auth.js';
 import systemApi from './routes/system.js';
@@ -120,6 +121,10 @@ if (settings.corsOrigins.length) {
 
 app.use(express.json({ limit: '10mb' }));
 
+// Global IP-keyed rate limit (no-op when RATE_LIMIT_DISABLED=true). The
+// login route adds a tighter, dedicated limiter on top of this further down.
+app.use(globalLimiter());
+
 // Meta endpoints
 app.get('/api/health', (_req, res) =>
   res.json({ status: 'ok', version: VERSION }),
@@ -174,6 +179,12 @@ app.use(
 // Mount every api module on its declared base path. Authentication is now
 // per-route (via the route-builder middleware chain), so there's no longer a
 // global authenticate middleware up here.
+//
+// /api/auth/login gets a tighter per-IP limiter on top of the global one to
+// slow down credential stuffing. Mount it before the auth router so the
+// limiter sees the request first.
+app.use('/api/auth/login', loginLimiter());
+
 for (const a of apis) {
   app.use(a.basePath, a.router);
 }

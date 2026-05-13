@@ -129,7 +129,13 @@ All configuration is via environment variables.
 | `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
 | `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
 | `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
-| `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds (default 12h)                                |
+| `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds. Floor 60s, ceiling 30 days.                |
+| `RATE_LIMIT_DISABLED`| `false`          | Turn off the rate limiters entirely (dev only)                        |
+| `RATE_LIMIT_GLOBAL_PER_MIN` | `600`     | Per-IP request budget per minute, applied app-wide                    |
+| `RATE_LIMIT_LOGIN_PER_MIN`  | `10`      | Per-IP budget on `POST /api/auth/login` (credential-stuffing brake)   |
+| `EXPENSIVE_CONCURRENCY_PER_USER` | `2` | Max simultaneous in-flight expensive requests (image pull, compose `up`/`pull`/`down`) per authenticated user. `0` disables. |
+| `COMPOSE_DEADLINE_MS`| `1800000`        | Wall-clock deadline for a streaming compose subprocess. Bounded by SIGTERM, then SIGKILL. |
+| `COMPOSE_KILL_GRACE_MS` | `10000`       | Grace period after SIGTERM before SIGKILL                             |
 | `CORS_ORIGINS`       | _(empty)_        | Comma-separated origin allow-list. Empty means same-origin only — no CORS headers emitted. Set to e.g. `https://ops.example.com` to enable cross-origin browser access. |
 | `HELMET_DISABLED`    | `false`          | Disable [Helmet](https://helmetjs.github.io/) entirely. NOT recommended. |
 | `CSP_DISABLED`       | `false`          | Keep all other Helmet headers but drop the Content-Security-Policy header (useful if you proxy through a CDN that injects its own CSP). |

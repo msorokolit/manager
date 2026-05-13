@@ -25,6 +25,35 @@ export function sendError(res, err) {
   res.status(mapped.status).json({ detail: mapped.detail });
 }
 
+/**
+ * Write a chunk to `res`, applying back-pressure: if the kernel send buffer
+ * is full, pause every source in `sources` until 'drain' fires. This
+ * prevents the Node process from buffering an unbounded amount of data when
+ * a client reads slower than the server can produce.
+ *
+ * Returns true if the chunk was accepted synchronously, false if a pause
+ * was needed (callers can use this to bail early on closed connections).
+ */
+export function writeWithBackpressure(res, chunk, sources = []) {
+  if (res.writableEnded || res.destroyed) return false;
+  const ok = res.write(chunk);
+  if (!ok) {
+    for (const s of sources) {
+      try {
+        s.pause && s.pause();
+      } catch {}
+    }
+    res.once('drain', () => {
+      for (const s of sources) {
+        try {
+          s.resume && s.resume();
+        } catch {}
+      }
+    });
+  }
+  return ok;
+}
+
 /** Stream NDJSON lines from a Readable that emits raw bytes. */
 export function pipeNdjson(stream, res) {
   res.set('Content-Type', 'application/x-ndjson; charset=utf-8');
@@ -36,11 +65,11 @@ export function pipeNdjson(stream, res) {
     while ((nl = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
-      if (line.length) res.write(line + '\n');
+      if (line.length) writeWithBackpressure(res, line + '\n', [stream]);
     }
   });
   stream.on('end', () => {
-    if (buf.length) res.write(buf + '\n');
+    if (buf.length) writeWithBackpressure(res, buf + '\n', [stream]);
     res.end();
   });
   stream.on('error', (err) => {
@@ -60,7 +89,7 @@ export function pipeNdjson(stream, res) {
 export function pipeRaw(stream, res, contentType = 'text/plain; charset=utf-8') {
   res.set('Content-Type', contentType);
   res.set('Cache-Control', 'no-store');
-  stream.on('data', (chunk) => res.write(chunk));
+  stream.on('data', (chunk) => writeWithBackpressure(res, chunk, [stream]));
   stream.on('end', () => res.end());
   stream.on('error', () => res.end());
   res.on('close', () => {

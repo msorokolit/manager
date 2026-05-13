@@ -6,7 +6,12 @@ import path from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, HttpError, intQuery } from '../util.js';
+import {
+  asyncHandler,
+  HttpError,
+  intQuery,
+  writeWithBackpressure,
+} from '../util.js';
 import { createApiRouter, streamResponse } from '../route-builder.js';
 import {
   CreateStackRequest,
@@ -119,15 +124,60 @@ function streamCompose(res, name, ...args) {
   let proc;
   try { proc = spawn(settings.composeBin, argv, { cwd }); }
   catch (err) { res.write(`ERROR: ${err.message}\n`); return res.end(); }
-  proc.stdout.on('data', (c) => res.write(c));
-  proc.stderr.on('data', (c) => res.write(c));
+
+  // ---- Termination handling ----
+  // We may need to kill `proc` either because the client closed the
+  // connection or because the wall-clock deadline expired. SIGTERM first,
+  // SIGKILL after a grace period if the process hasn't exited.
+  let killTimer = null;
+  let deadlineTimer = null;
+  let killed = false;
+  function killProc(reason) {
+    if (killed) return;
+    killed = true;
+    if (reason) {
+      try { res.write(`\n[manager] ${reason}; sending SIGTERM\n`); } catch {}
+    }
+    try { proc.kill('SIGTERM'); } catch {}
+    killTimer = setTimeout(() => {
+      try {
+        if (proc.exitCode == null && proc.signalCode == null) {
+          try { res.write('[manager] SIGTERM grace expired; sending SIGKILL\n'); } catch {}
+          proc.kill('SIGKILL');
+        }
+      } catch {}
+    }, settings.composeKillGraceMs);
+    killTimer.unref && killTimer.unref();
+  }
+
+  if (settings.composeDeadlineMs > 0) {
+    deadlineTimer = setTimeout(
+      () => killProc(`compose deadline of ${settings.composeDeadlineMs}ms reached`),
+      settings.composeDeadlineMs,
+    );
+    deadlineTimer.unref && deadlineTimer.unref();
+  }
+
+  // ---- Output piping with back-pressure ----
+  // stdout and stderr are interleaved into the response. If the client
+  // can't keep up, both sources are paused until the response drains.
+  const sources = [proc.stdout, proc.stderr];
+  proc.stdout.on('data', (c) => writeWithBackpressure(res, c, sources));
+  proc.stderr.on('data', (c) => writeWithBackpressure(res, c, sources));
+
   proc.on('error', (err) => {
     if (err.code === 'ENOENT') res.write(`ERROR: ${settings.composeBin} not found.\n`);
     else res.write(`ERROR: ${err.message}\n`);
     res.end();
   });
-  proc.on('close', (code) => { res.write(`\n[exit ${code}]\n`); res.end(); });
-  res.on('close', () => { try { proc.kill('SIGTERM'); } catch {} });
+  proc.on('close', (code, signal) => {
+    if (killTimer) clearTimeout(killTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    const exitDesc = signal ? `${signal}` : String(code);
+    try { res.write(`\n[exit ${exitDesc}]\n`); } catch {}
+    res.end();
+  });
+  res.on('close', () => killProc('client disconnected'));
 }
 
 r.get(
@@ -170,6 +220,7 @@ r.post(
   {
     summary: 'Create a stack (streams compose stdout if deploy=true)',
     admin: true,
+    expensive: true,
     body: CreateStackRequest,
     responses: { 200: streamResponse('compose up -d stdout (or {name, deployed:false})', 'text/plain') },
   },
@@ -214,6 +265,9 @@ for (const verb of ['up', 'restart', 'pull']) {
     {
       summary: `compose ${verb} (streamed)`,
       admin: true,
+      // `up` and `pull` move bytes (image pulls); `restart` doesn't, but
+      // tagging it expensive is harmless and keeps the policy uniform.
+      expensive: true,
       params: StackNameParam,
       responses: { 200: StreamPlain },
     },
@@ -229,6 +283,7 @@ r.post(
   {
     summary: 'compose down (streamed)',
     admin: true,
+    expensive: true,
     params: StackNameParam,
     query: RemoveQuery,
     responses: { 200: StreamPlain },
