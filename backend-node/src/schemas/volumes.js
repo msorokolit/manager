@@ -77,6 +77,68 @@ export const VolumeBrowseChmodRequest = Type.Object(
 );
 
 /**
+ * chown: change owner / group on a path. Numeric IDs only — name lookup
+ * inside the sidecar would resolve against the sidecar's /etc/passwd
+ * which doesn't necessarily match the volume's actual user database.
+ * At least one of uid / gid must be provided; -1 means "leave unchanged"
+ * (matches the POSIX chown(2) semantics).
+ */
+export const VolumeBrowseChownRequest = Type.Object(
+  {
+    path: Type.String({ minLength: 1, maxLength: 4096 }),
+    uid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    gid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowseChownRequest', additionalProperties: false },
+);
+
+export const VolumeBrowseBulkChownRequest = Type.Object(
+  {
+    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+      minItems: 1, maxItems: 1000,
+    }),
+    uid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    gid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowseBulkChownRequest', additionalProperties: false },
+);
+
+/**
+ * Edit (overwrite) a regular file. `if_mtime` enables optimistic
+ * concurrency: clients send the mtime they read; server refuses with
+ * 409 if the file changed underneath them. `mode` is honoured only
+ * when creating a new file (otherwise the existing file's mode is
+ * preserved, so editing a 0600 secret won't accidentally widen it).
+ */
+export const VolumeBrowseSaveRequest = Type.Object(
+  {
+    content: Type.String({ description: 'UTF-8 text content' }),
+    if_mtime: Type.Optional(
+      Type.Number({ description: 'Mtime observed when reading; rejected if file changed since' }),
+    ),
+    mode: Type.Optional(
+      Type.String({
+        pattern: '^0?[0-7]{3,4}$',
+        description: 'Octal mode applied only on file creation',
+      }),
+    ),
+  },
+  { $id: 'VolumeBrowseSaveRequest', additionalProperties: false },
+);
+
+export const VolumeBrowseSaveResponse = Type.Object(
+  {
+    saved: Type.Boolean(),
+    path: Type.String(),
+    size: Type.Integer(),
+    mtime: Type.Number(),
+  },
+  { $id: 'VolumeBrowseSaveResponse', additionalProperties: false },
+);
+
+/**
  * Bulk chmod: apply one mode to many paths in a single round-trip. Saves
  * (N-1) container startups when the user multi-selects N items in the file
  * manager and changes their permissions.

@@ -45,11 +45,15 @@ import { createApiRouter, customResponse } from '../route-builder.js';
 import {
   PassThroughObject,
   VolumeBrowseBulkChmodRequest,
+  VolumeBrowseBulkChownRequest,
   VolumeBrowseBulkDeleteRequest,
   VolumeBrowseBulkResponse,
   VolumeBrowseChmodRequest,
+  VolumeBrowseChownRequest,
   VolumeBrowseListResponse,
   VolumeBrowseRenameRequest,
+  VolumeBrowseSaveRequest,
+  VolumeBrowseSaveResponse,
   VolumeBrowseViewResponse,
 } from '../schemas/index.js';
 
@@ -300,6 +304,119 @@ for p in spec["paths"]:
 print(json.dumps({"results": results}))
 `;
 
+// chown / chgrp. -1 for either uid or gid means "leave unchanged" (POSIX
+// chown(2) semantics). lchown is used at top so a symlink target isn't
+// followed; os.walk follows for the recursive case (matches GNU chown -R).
+const CHOWN_SCRIPT = `
+import os, sys, json
+p = sys.argv[1]
+uid = int(sys.argv[2])
+gid = int(sys.argv[3])
+recursive = sys.argv[4] == '1' if len(sys.argv) > 4 else False
+try:
+    rp = os.path.realpath(p) if os.path.lexists(p) else None
+    if rp is None:
+        print(json.dumps({"error": "Not found"})); sys.exit(0)
+    if not (rp == '/target' or rp.startswith('/target/')):
+        print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
+    os.lchown(p, uid, gid)
+    if recursive and os.path.isdir(p) and not os.path.islink(p):
+        for root, dirs, files in os.walk(p):
+            for name in dirs + files:
+                os.lchown(os.path.join(root, name), uid, gid)
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
+const BULK_CHOWN_SCRIPT = `
+import os, sys, json
+spec = json.loads(sys.argv[1])
+uid = int(spec["uid"])
+gid = int(spec["gid"])
+recursive = bool(spec.get("recursive"))
+results = []
+for p in spec["paths"]:
+    item = {"path": p}
+    try:
+        rp = os.path.realpath(p) if os.path.lexists(p) else None
+        if rp is None:
+            item["ok"] = False; item["error"] = "Not found"
+        elif not (rp == '/target' or rp.startswith('/target/')):
+            item["ok"] = False; item["error"] = "Path escapes the volume root"
+        else:
+            os.lchown(p, uid, gid)
+            if recursive and os.path.isdir(p) and not os.path.islink(p):
+                for root, dirs, files in os.walk(p):
+                    for name in dirs + files:
+                        os.lchown(os.path.join(root, name), uid, gid)
+            item["ok"] = True
+    except Exception as e:
+        item["ok"] = False; item["error"] = str(e)
+    results.append(item)
+print(json.dumps({"results": results}))
+`;
+
+// Atomic edit. Content arrives on stdin (no argv length limit). Sequence:
+//   1. safety check on realpath
+//   2. if_mtime check (optimistic concurrency)
+//   3. capture original perms/owner if file exists
+//   4. write to a sibling temp file in the same directory
+//   5. restore perms/owner on the temp before rename
+//   6. os.replace(tmp, path) — atomic on POSIX
+// On any exception after temp is created, the temp file is unlinked so
+// half-written turds don't accumulate in the volume.
+const EDIT_SCRIPT = `
+import os, sys, json, tempfile
+p = sys.argv[1]
+if_mtime = sys.argv[2] if len(sys.argv) > 2 else ''
+new_mode = sys.argv[3] if len(sys.argv) > 3 else ''
+content = sys.stdin.buffer.read()
+try:
+    if os.path.lexists(p):
+        rp = os.path.realpath(p)
+        if not (rp == '/target' or rp.startswith('/target/')):
+            print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
+        if os.path.islink(p):
+            print(json.dumps({"error": "Refusing to edit through a symlink"})); sys.exit(0)
+        if not os.path.isfile(p):
+            print(json.dumps({"error": "Not a regular file"})); sys.exit(0)
+        orig = os.stat(p)
+        if if_mtime:
+            if abs(orig.st_mtime - float(if_mtime)) > 0.001:
+                print(json.dumps({"conflict":
+                    "File changed on disk since you opened it",
+                    "server_mtime": orig.st_mtime})); sys.exit(0)
+    else:
+        # New file: parent must exist and be inside /target.
+        parent = os.path.realpath(os.path.dirname(p))
+        if not (parent == '/target' or parent.startswith('/target/')):
+            print(json.dumps({"error": "Parent escapes the volume root"})); sys.exit(0)
+        if not os.path.isdir(os.path.dirname(p)):
+            print(json.dumps({"error": "Parent directory does not exist"})); sys.exit(0)
+        orig = None
+    d = os.path.dirname(p)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.dm-edit-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(content)
+        if orig is not None:
+            os.chmod(tmp, orig.st_mode & 0o7777)
+            try: os.chown(tmp, orig.st_uid, orig.st_gid)
+            except PermissionError: pass
+        elif new_mode:
+            os.chmod(tmp, int(new_mode, 8))
+        os.replace(tmp, p)
+    except Exception:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+    st = os.stat(p)
+    print(json.dumps({"ok": True, "size": st.st_size, "mtime": st.st_mtime}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
 // ---------- Helpers ----------
 
 function safePath(rel) {
@@ -320,7 +437,16 @@ async function ensureVolumeExists(volume) {
   }
 }
 
-function browserHostConfig(volume, { readonly = false } = {}) {
+// Capability set used by operations that need to chown / chmod / read /
+// write files we don't own. The container is otherwise locked down
+// (NetworkMode:none, only /target mounted, AutoRemove, no other caps),
+// so the security loss from granting these three is minimal.
+//   CHOWN          — required for lchown(); even root can't chown without it
+//   FOWNER         — bypass DAC owner check for chmod/utime on files we don't own
+//   DAC_OVERRIDE   — bypass read/write/search DAC checks (mixed-ownership volumes)
+const WRITE_CAPS = ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'];
+
+function browserHostConfig(volume, { readonly = false, capAdd = [] } = {}) {
   const hc = {
     Binds: [`${volume}:/target:${readonly ? 'ro' : 'rw'}`],
     NetworkMode: 'none',
@@ -328,6 +454,7 @@ function browserHostConfig(volume, { readonly = false } = {}) {
     AutoRemove: true,
     PidsLimit: 64,
   };
+  if (capAdd.length) hc.CapAdd = [...capAdd];
   // Same caveat as before: skip cgroup-v2 controllers when the host's
   // root cgroup is in threaded mode (nested CI VMs). Production hosts
   // never need this.
@@ -342,22 +469,38 @@ function browserHostConfig(volume, { readonly = false } = {}) {
  * One-shot container that runs `cmd`, returns its demuxed stdout+stderr,
  * and is auto-removed by the daemon. Uses the attach-before-start
  * pattern so AutoRemove can't race our read of the output stream.
+ *
+ * If `stdin` is a Buffer it's piped into the container's stdin and the
+ * write side is closed (signalling EOF) once start() resolves. Useful
+ * for ops that need to ship arbitrary bytes without argv-length caps
+ * (file edits, in particular).
  */
-async function runOnce(volume, cmd, { readonly = false } = {}) {
+async function runOnce(volume, cmd, { readonly = false, stdin = null, capAdd = [] } = {}) {
   await ensureVolumeExists(volume);
   const docker = getClient();
-  const container = await docker.createContainer({
+  const createOpts = {
     Image: settings.browserImage,
     Cmd: cmd,
-    HostConfig: browserHostConfig(volume, { readonly }),
+    HostConfig: browserHostConfig(volume, { readonly, capAdd }),
     Labels: { [BROWSER_LABEL]: BROWSER_LABEL_VAL, [BROWSER_VOL_LABEL]: String(volume) },
-  });
+  };
+  if (stdin) {
+    // OpenStdin wires /dev/stdin inside the container so scripts can read
+    // it. StdinOnce closes stdin after the first reader's EOF (here, our
+    // stream.end() call below). AttachStdin is required so the daemon
+    // forwards our writes to the container instead of dropping them.
+    createOpts.OpenStdin = true;
+    createOpts.StdinOnce = true;
+    createOpts.AttachStdin = true;
+  }
+  const container = await docker.createContainer(createOpts);
 
   // Attach BEFORE start: the daemon now owns the stdout/stderr pipe for
   // us, so we cannot miss output that's emitted between exit and the
   // AutoRemove cleanup.
   const stream = await container.attach({
-    stream: true, stdout: true, stderr: true, hijack: true, stdin: false,
+    stream: true, stdout: true, stderr: true, hijack: true,
+    stdin: !!stdin,
   });
 
   const outChunks = []; const errChunks = [];
@@ -381,6 +524,20 @@ async function runOnce(volume, cmd, { readonly = false } = {}) {
     container.remove({ force: true }).catch(() => {});
     throw err;
   }
+
+  if (stdin) {
+    // Write content then half-close the writable side. The daemon
+    // detects the half-close, sends EOF to the container's stdin, and
+    // keeps the readable side (stdout/stderr) open until exit.
+    try {
+      stream.write(stdin);
+      stream.end();
+    } catch (err) {
+      container.remove({ force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
   return collected;
 }
 
@@ -720,7 +877,11 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Invalid directory');
-    const out = await runOnce(req.params.name, ['python3', '-c', MKDIR_SCRIPT, safe]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', MKDIR_SCRIPT, safe],
+      { capAdd: WRITE_CAPS },
+    );
     parseScriptResult(out, 'mkdir');
     res.json({ created: safe.slice('/target'.length) || '/' });
   }),
@@ -738,7 +899,11 @@ r.delete(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Refusing to delete root');
-    const out = await runOnce(req.params.name, ['python3', '-c', DELETE_SCRIPT, safe]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', DELETE_SCRIPT, safe],
+      { capAdd: WRITE_CAPS },
+    );
     parseScriptResult(out, 'delete');
     res.json({ removed: safe.slice('/target'.length) });
   }),
@@ -762,7 +927,11 @@ r.post(
     if (from === to) {
       return res.json({ moved: from.slice('/target'.length), to: to.slice('/target'.length) });
     }
-    const out = await runOnce(req.params.name, ['python3', '-c', RENAME_SCRIPT, from, to]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', RENAME_SCRIPT, from, to],
+      { capAdd: WRITE_CAPS },
+    );
     parseScriptResult(out, 'rename');
     res.json({
       moved: from.slice('/target'.length),
@@ -783,12 +952,95 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.body.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot chmod the volume root');
-    const out = await runOnce(req.params.name, [
-      'python3', '-c', CHMOD_SCRIPT,
-      req.body.mode, safe, req.body.recursive ? '1' : '0',
-    ]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', CHMOD_SCRIPT, req.body.mode, safe, req.body.recursive ? '1' : '0'],
+      { capAdd: WRITE_CAPS },
+    );
     parseScriptResult(out, 'chmod');
     res.json({ path: safe.slice('/target'.length) || '/', mode: req.body.mode });
+  }),
+);
+
+r.post(
+  '/:name/browse/chown',
+  {
+    summary: 'Change owner/group (numeric uid/gid) on a file or directory',
+    admin: true,
+    params: NameParam,
+    body: VolumeBrowseChownRequest,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (req, res) => {
+    if (req.body.uid == null && req.body.gid == null) {
+      throw new HttpError(400, 'At least one of uid / gid must be provided');
+    }
+    const safe = safePath(req.body.path);
+    if (safe === '/target') throw new HttpError(400, 'Cannot chown the volume root');
+    const uid = req.body.uid == null ? -1 : req.body.uid;
+    const gid = req.body.gid == null ? -1 : req.body.gid;
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', CHOWN_SCRIPT, safe, String(uid), String(gid), req.body.recursive ? '1' : '0'],
+      { capAdd: WRITE_CAPS },
+    );
+    parseScriptResult(out, 'chown');
+    res.json({
+      path: safe.slice('/target'.length) || '/',
+      uid: uid === -1 ? null : uid,
+      gid: gid === -1 ? null : gid,
+    });
+  }),
+);
+
+// Atomic in-place file edit with optimistic concurrency. The endpoint is
+// PUT (idempotent on identical content) and accepts the file body as a
+// JSON-encoded string + optional `if_mtime` for the concurrency check.
+// 409 on mtime mismatch lets the SPA prompt the user to reload / merge /
+// overwrite instead of silently clobbering a concurrent edit.
+r.put(
+  '/:name/browse/file',
+  {
+    summary: 'Overwrite a regular file (atomic; preserves perms/owner)',
+    admin: true,
+    params: NameParam,
+    query: RequiredPathQuery,
+    body: VolumeBrowseSaveRequest,
+    responses: { 200: VolumeBrowseSaveResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const safe = safePath(req.query.path);
+    if (safe === '/target') throw new HttpError(400, 'Cannot edit the volume root');
+    const content = Buffer.from(req.body.content || '', 'utf8');
+    const args = [
+      'python3', '-c', EDIT_SCRIPT,
+      safe,
+      req.body.if_mtime != null ? String(req.body.if_mtime) : '',
+      req.body.mode || '',
+    ];
+    const out = await runOnce(req.params.name, args, { stdin: content, capAdd: WRITE_CAPS });
+    const text = (out.stdout || '').trim();
+    if (!text) {
+      throw new HttpError(500, `edit produced no output${out.stderr ? ': ' + out.stderr.slice(0, 200) : ''}`);
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch { throw new HttpError(500, `edit returned malformed JSON: ${text.slice(0, 200)}`); }
+    // Optimistic-concurrency conflict: surface as 409 with the server's
+    // current mtime so the client can reconcile.
+    if (data.conflict) {
+      return res.status(409).json({
+        detail: data.conflict,
+        server_mtime: data.server_mtime,
+      });
+    }
+    if (data.error) throw new HttpError(400, data.error);
+    res.json({
+      saved: true,
+      path: safe.slice('/target'.length) || '/',
+      size: data.size,
+      mtime: data.mtime,
+    });
   }),
 );
 
@@ -811,8 +1063,52 @@ r.post(
   asyncHandler(async (req, res) => {
     const paths = req.body.paths.map((p) => safePath(p));
     const spec = JSON.stringify({ mode: req.body.mode, recursive: !!req.body.recursive, paths });
-    const out = await runOnce(req.params.name, ['python3', '-c', BULK_CHMOD_SCRIPT, spec]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', BULK_CHMOD_SCRIPT, spec],
+      { capAdd: WRITE_CAPS },
+    );
     const data = parseScriptResult(out, 'bulk chmod');
+    const results = (data.results || []).map((r) => ({
+      path: r.path.replace(/^\/target/, '') || '/',
+      ok: !!r.ok,
+      ...(r.error ? { error: r.error } : {}),
+    }));
+    res.json({
+      succeeded: results.filter((x) => x.ok).length,
+      failed: results.filter((x) => !x.ok).length,
+      results,
+    });
+  }),
+);
+
+r.post(
+  '/:name/browse/chown/bulk',
+  {
+    summary: 'chown many paths at once (multi-select)',
+    admin: true,
+    expensive: true,
+    params: NameParam,
+    body: VolumeBrowseBulkChownRequest,
+    responses: { 200: VolumeBrowseBulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    if (req.body.uid == null && req.body.gid == null) {
+      throw new HttpError(400, 'At least one of uid / gid must be provided');
+    }
+    const paths = req.body.paths.map((p) => safePath(p));
+    const spec = JSON.stringify({
+      uid: req.body.uid == null ? -1 : req.body.uid,
+      gid: req.body.gid == null ? -1 : req.body.gid,
+      recursive: !!req.body.recursive,
+      paths,
+    });
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', BULK_CHOWN_SCRIPT, spec],
+      { capAdd: WRITE_CAPS },
+    );
+    const data = parseScriptResult(out, 'bulk chown');
     const results = (data.results || []).map((r) => ({
       path: r.path.replace(/^\/target/, '') || '/',
       ok: !!r.ok,
@@ -839,7 +1135,11 @@ r.post(
   asyncHandler(async (req, res) => {
     const paths = req.body.paths.map((p) => safePath(p));
     const spec = JSON.stringify({ paths });
-    const out = await runOnce(req.params.name, ['python3', '-c', BULK_DELETE_SCRIPT, spec]);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', BULK_DELETE_SCRIPT, spec],
+      { capAdd: WRITE_CAPS },
+    );
     const data = parseScriptResult(out, 'bulk delete');
     const results = (data.results || []).map((r) => ({
       path: r.path.replace(/^\/target/, '') || '/',

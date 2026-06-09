@@ -204,6 +204,68 @@ describe('Volume browser schemas', () => {
       ],
     })).toBe(true);
   });
+
+  // ---------- Chown ----------
+
+  it('VolumeBrowseChownRequest accepts uid only / gid only / both', () => {
+    const v = (p) => valid(S.VolumeBrowseChownRequest, p);
+    expect(v({ path: '/a', uid: 0 })).toBe(true);
+    expect(v({ path: '/a', gid: 0 })).toBe(true);
+    expect(v({ path: '/a', uid: 1000, gid: 1000 })).toBe(true);
+    expect(v({ path: '/a', uid: 1000, gid: 1000, recursive: true })).toBe(true);
+    expect(v({ path: '/a', uid: -1, gid: 100 })).toBe(true);   // -1 = "leave unchanged"
+  });
+
+  it('VolumeBrowseChownRequest rejects negative ids other than -1', () => {
+    const v = (p) => valid(S.VolumeBrowseChownRequest, p);
+    expect(v({ path: '/a', uid: -2 })).toBe(false);
+    expect(v({ path: '/a', gid: -100 })).toBe(false);
+  });
+
+  it('VolumeBrowseChownRequest rejects unknown fields + missing path', () => {
+    const v = (p) => valid(S.VolumeBrowseChownRequest, p);
+    expect(v({ uid: 0 })).toBe(false);
+    expect(v({ path: '/a', uid: 0, sneaky: 1 })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkChownRequest accepts typical multi-select', () => {
+    const v = (p) => valid(S.VolumeBrowseBulkChownRequest, p);
+    expect(v({ paths: ['/a', '/b'], uid: 1000, gid: 1000 })).toBe(true);
+    expect(v({ paths: ['/a'], gid: 100, recursive: true })).toBe(true);
+  });
+
+  it('VolumeBrowseBulkChownRequest enforces minItems + maxItems', () => {
+    const v = (p) => valid(S.VolumeBrowseBulkChownRequest, p);
+    expect(v({ paths: [], uid: 0 })).toBe(false);
+    const tooMany = Array.from({ length: 1001 }, (_, i) => `/f${i}`);
+    expect(v({ paths: tooMany, uid: 0 })).toBe(false);
+  });
+
+  // ---------- Save (editor) ----------
+
+  it('VolumeBrowseSaveRequest accepts content alone', () => {
+    expect(valid(S.VolumeBrowseSaveRequest, { content: 'hello\nworld\n' })).toBe(true);
+  });
+
+  it('VolumeBrowseSaveRequest accepts if_mtime + mode', () => {
+    expect(valid(S.VolumeBrowseSaveRequest, {
+      content: '', if_mtime: 1700000000.123, mode: '0644',
+    })).toBe(true);
+  });
+
+  it('VolumeBrowseSaveRequest requires content', () => {
+    expect(valid(S.VolumeBrowseSaveRequest, { if_mtime: 1 })).toBe(false);
+  });
+
+  it('VolumeBrowseSaveRequest rejects garbage mode', () => {
+    expect(valid(S.VolumeBrowseSaveRequest, { content: '', mode: 'u+x' })).toBe(false);
+  });
+
+  it('VolumeBrowseSaveResponse has the expected shape', () => {
+    expect(valid(S.VolumeBrowseSaveResponse, {
+      saved: true, path: '/foo.txt', size: 42, mtime: 1781040000.5,
+    })).toBe(true);
+  });
 });
 
 describe('CreateContainerRequest mem fields (M4)', () => {

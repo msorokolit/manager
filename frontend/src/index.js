@@ -87,16 +87,17 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Modal ----------
-  function modal({ title, body, actions, size = 'lg' }) {
+  function modal({ title, body, actions, size = 'lg', onBeforeClose, ref }) {
     return new Promise((resolve) => {
       const host = document.getElementById('modal-host');
       const wrap = document.createElement('div');
       wrap.className = 'fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 p-4 fade-in';
-      const widths = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl', xl: 'max-w-5xl' };
+      const widths = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl', xl: 'max-w-5xl', full: 'max-w-[98vw]' };
+      const heights = { full: 'h-[96vh]' };
       wrap.innerHTML = `
-        <div class="w-full ${widths[size] || widths.lg} max-h-[90vh] overflow-hidden flex flex-col rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
+        <div class="w-full ${widths[size] || widths.lg} ${heights[size] || 'max-h-[90vh]'} overflow-hidden flex flex-col rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
           <div class="flex items-center justify-between border-b border-slate-800 px-5 py-3">
-            <h3 class="text-sm font-semibold">${title}</h3>
+            <h3 class="text-sm font-semibold" data-role="title">${title}</h3>
             <button class="text-slate-400 hover:text-white" data-act="close">✕</button>
           </div>
           <div class="flex-1 overflow-auto scroll-thin p-5" data-role="body"></div>
@@ -107,7 +108,20 @@ import { FitAddon } from '@xterm/addon-fit';
       else if (body instanceof Node) bodyEl.appendChild(body);
 
       const actionsEl = wrap.querySelector('[data-role="actions"]');
-      const close = (val) => { wrap.remove(); resolve(val); };
+      const tryClose = async (val) => {
+        // onBeforeClose returning false (or a Promise resolving to false)
+        // cancels the close. Used by the editor to prompt "discard unsaved
+        // changes?" before letting the user dismiss the modal.
+        if (onBeforeClose) {
+          try { if ((await onBeforeClose(val)) === false) return; } catch { /* ignore */ }
+        }
+        wrap.remove(); resolve(val);
+      };
+      // Forced close — skips the onBeforeClose hook. Used by action
+      // buttons whose own onClick already handled the dirty-state
+      // confirmation (e.g. Save → close on success).
+      const forceClose = (val) => { wrap.remove(); resolve(val); };
+
       (actions || [{ label: 'Close', value: null, kind: 'secondary' }]).forEach((a) => {
         const b = document.createElement('button');
         const kinds = {
@@ -121,12 +135,33 @@ import { FitAddon } from '@xterm/addon-fit';
           if (a.onClick) {
             try { const r = await a.onClick(); if (r === false) return; } catch (e) { toast(e.message, 'error'); return; }
           }
-          close(a.value);
+          // Action buttons skip the onBeforeClose hook by default — their
+          // onClick is expected to handle any save/discard logic itself.
+          // Cancel actions can opt in by setting `confirmBeforeClose: true`.
+          if (a.confirmBeforeClose) tryClose(a.value); else forceClose(a.value);
         };
         actionsEl.appendChild(b);
       });
-      wrap.querySelector('[data-act="close"]').onclick = () => close(null);
-      wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
+      wrap.querySelector('[data-act="close"]').onclick = () => tryClose(null);
+      wrap.addEventListener('click', (e) => { if (e.target === wrap) tryClose(null); });
+
+      // Optional handle for callers that need to mutate the modal after mount
+      // (the editor uses it to toggle title text + resize on full-screen).
+      if (ref) {
+        ref.titleEl = wrap.querySelector('[data-role="title"]');
+        ref.bodyEl = bodyEl;
+        ref.container = wrap.querySelector('.w-full');
+        ref.close = forceClose;
+        ref.resize = (newSize) => {
+          const w = widths[newSize] || widths.lg;
+          const h = heights[newSize] || 'max-h-[90vh]';
+          const c = ref.container;
+          // Remove any previous width/height utility, then add the new ones.
+          c.className = c.className
+            .replace(/max-w-\S+/g, '').replace(/max-h-\S+/g, '').replace(/\bh-\S+/g, '');
+          c.classList.add(...w.split(' '), ...h.split(' '));
+        };
+      }
       host.appendChild(wrap);
     });
   }
@@ -2156,7 +2191,7 @@ import { FitAddon } from '@xterm/addon-fit';
       <div id="vb-bulk" class="mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs">
         <span><span id="vb-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
         <div class="flex items-center gap-2">
-          <button id="vb-bulk-chmod" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-200">🔒 chmod…</button>
+          <button id="vb-bulk-chmod" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-200" title="Change mode and/or ownership">🔒 Permissions…</button>
           <button id="vb-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>
           <button id="vb-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
         </div>
@@ -2291,7 +2326,7 @@ import { FitAddon } from '@xterm/addon-fit';
             ${isText ? `<button data-act="view"   title="View"    class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
             <button data-act="dl"     title="Download"     class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
             <button data-act="rename" title="Rename"       class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
-            <button data-act="chmod"  title="Permissions"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">🔒</button>
+            <button data-act="chmod"  title="Permissions (mode + owner)" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">🔒</button>
             <button data-act="rm"     title="Delete"       class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
           </div>
         </div>`;
@@ -2403,40 +2438,215 @@ import { FitAddon } from '@xterm/addon-fit';
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     }
 
-    async function openViewer(name, p) {
+    /**
+     * Inline file editor backed by CodeMirror 6.
+     *
+     * Read pass:
+     *   GET /browse/view  →  JSON envelope (text + encoding + mtime/size)
+     *   We capture the mtime from the directory listing entry (lastEntries)
+     *   and send it back on save as `if_mtime` for optimistic concurrency.
+     *
+     * Save pass:
+     *   PUT /browse/file  →  body { content, if_mtime } → 200 / 409 / 400
+     *   On 409 the server returns the current mtime; we show a conflict
+     *   dialog with [Reload] / [Overwrite anyway] / [Cancel].
+     *
+     * Binary files and 1 MB-truncated files are read-only.
+     */
+    async function openEditor(name, p, entry) {
       let payload;
       try {
         payload = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/view?path=${encodeURIComponent(p)}`);
       } catch (e) { toast(e.message, 'error'); return; }
-      const view = document.createElement('div');
+
+      // Binary preview — unchanged from the old viewer.
       if (payload.is_binary) {
-        view.innerHTML = `
+        const v = document.createElement('div');
+        v.innerHTML = `
           <div class="rounded border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">
-            <p>This file looks binary (contains null bytes in the first 8 KB) — preview unavailable.</p>
+            <p>This file looks binary (contains null bytes in the first 8 KB) — inline editing unavailable.</p>
             <p class="mt-2">Size: <span class="font-mono">${fmtBytes(payload.size)}</span></p>
           </div>`;
-      } else {
-        view.innerHTML = `
-          <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
-            <span>${fmtBytes(payload.size)} · encoding: ${escapeHtml(payload.encoding || 'utf-8')}${payload.truncated ? ' · <span class="text-amber-400">truncated to 1 MB</span>' : ''}</span>
-          </div>
-          <pre class="log-pane h-[60vh] overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-200"></pre>`;
-        view.querySelector('pre').textContent = payload.content || '';
-      }
-      await modal({
-        title: `View: ${name}`,
-        body: view, size: 'xl',
-        actions: [
-          { label: 'Download', kind: 'secondary', value: 'dl' },
-          { label: 'Close', value: null, kind: 'secondary' },
-        ],
-      }).then(async (action) => {
+        const action = await modal({
+          title: `View: ${name}`, body: v, size: 'md',
+          actions: [
+            { label: 'Download', kind: 'secondary', value: 'dl' },
+            { label: 'Close', value: null, kind: 'secondary' },
+          ],
+        });
         if (action === 'dl') {
           try { triggerDownload(await downloadUrl(p), name); }
           catch (e) { toast(e.message, 'error'); }
         }
+        return;
+      }
+
+      const canEdit = !payload.truncated;
+      const original = payload.content || '';
+      let mtimeCursor = entry ? entry.mtime : null;
+      let dirty = false;
+      let isFullScreen = false;
+      let editor = null;
+
+      const view = document.createElement('div');
+      view.className = 'flex flex-col gap-2';
+      view.innerHTML = `
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+          <span id="ed-meta">${fmtBytes(payload.size)} · ${escapeHtml(payload.encoding || 'utf-8')}${
+            payload.truncated ? ' · <span class="text-amber-400">truncated to 1 MB — read-only</span>' : ''
+          }</span>
+          <div class="flex items-center gap-1">
+            <button id="ed-reload" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700" title="Reload from disk (discards unsaved changes)">⟳ Reload</button>
+            <button id="ed-diff"   class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 ${canEdit?'':'hidden'}" title="Preview the diff between original and current buffer">≷ Diff</button>
+            <button id="ed-fs"     class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700" title="Toggle full-screen">⛶ Full-screen</button>
+          </div>
+        </div>
+        <div id="ed-host" class="rounded border border-slate-800 bg-slate-950/70 overflow-hidden" style="height:60vh"></div>`;
+
+      const ref = {};
+      const modalRef = ref;
+
+      function updateTitle() {
+        if (!ref.titleEl) return;
+        ref.titleEl.innerHTML = `${dirty ? '<span class="text-amber-400">●</span> ' : ''}Edit: ${escapeHtml(name)}`;
+      }
+
+      async function reload() {
+        if (dirty && !(await confirmModal('Discard unsaved changes and reload from disk?', { danger: true, confirmLabel: 'Reload' }))) return;
+        let fresh;
+        try {
+          fresh = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/view?path=${encodeURIComponent(p)}`);
+        } catch (e) { toast(e.message, 'error'); return; }
+        editor.dispatch({
+          changes: { from: 0, to: editor.state.doc.length, insert: fresh.content || '' },
+        });
+        // Capture the new mtime so subsequent saves use it.
+        const newEntry = (lastEntries.find((x) => x.name === name)) || entry;
+        mtimeCursor = newEntry ? newEntry.mtime : mtimeCursor;
+        dirty = false; updateTitle();
+        toast('Reloaded from disk', 'success');
+      }
+
+      async function showDiff() {
+        const current = editor.state.doc.toString();
+        if (current === original) { toast('No changes yet', 'info'); return; }
+        const cmModule = await import(/* webpackChunkName: "editor" */ './editor.js');
+        const host = document.createElement('div');
+        host.style.height = '70vh';
+        host.className = 'overflow-hidden rounded border border-slate-800';
+        const mv = cmModule.mountDiff(host, original, current, { filename: name });
+        await modal({
+          title: `Diff: ${name}`, body: host, size: 'xl',
+          actions: [{ label: 'Close', value: null, kind: 'secondary' }],
+        });
+        mv.destroy();
+      }
+
+      // The actual save call. Returns true if we should close the modal.
+      async function save({ overrideConflict = false } = {}) {
+        if (!canEdit) return false;
+        const content = editor.state.doc.toString();
+        const body = { content };
+        if (mtimeCursor != null && !overrideConflict) body.if_mtime = mtimeCursor;
+        try {
+          const res = await fetch(
+            `/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(p)}`,
+            {
+              method: 'PUT',
+              headers: { Authorization: authHeader(), 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            },
+          );
+          if (res.status === 409) {
+            const det = await res.json();
+            // Conflict — server changed underneath us. Offer three paths.
+            const action = await modal({
+              title: 'File changed on disk', size: 'md',
+              body: `<p class="text-sm text-slate-300">${escapeHtml(det.detail || 'Conflict')}</p>
+                <p class="mt-2 text-xs text-slate-500">Server mtime: <code>${det.server_mtime}</code> — your edit was based on <code>${mtimeCursor}</code>.</p>
+                <p class="mt-2 text-xs text-slate-400">Reload discards your edits and re-reads the file. Overwrite forces your version onto the new one.</p>`,
+              actions: [
+                { label: 'Reload',   kind: 'secondary', value: 'reload' },
+                { label: 'Overwrite anyway', kind: 'danger', value: 'force' },
+                { label: 'Cancel',   kind: 'secondary', value: null },
+              ],
+            });
+            if (action === 'reload') { await reload(); return false; }
+            if (action === 'force')  { return save({ overrideConflict: true }); }
+            return false;
+          }
+          if (!res.ok) {
+            let msg = res.statusText; try { msg = (await res.json()).detail || msg; } catch {}
+            throw new Error(msg);
+          }
+          const out = await res.json();
+          mtimeCursor = out.mtime;
+          dirty = false; updateTitle();
+          toast('Saved', 'success');
+          load(cur); // refresh the listing so size/mtime update
+          return true;
+        } catch (e) {
+          toast(e.message, 'error');
+          return false;
+        }
+      }
+
+      // ---- Wire up controls ----
+      view.querySelector('#ed-reload').onclick = reload;
+      view.querySelector('#ed-diff').onclick = showDiff;
+      view.querySelector('#ed-fs').onclick = () => {
+        isFullScreen = !isFullScreen;
+        if (modalRef.resize) modalRef.resize(isFullScreen ? 'full' : 'xl');
+        view.querySelector('#ed-host').style.height = isFullScreen ? 'calc(96vh - 12rem)' : '60vh';
+      };
+
+      // Lazy-load CodeMirror — webpack splits this into its own chunk
+      // so the editor cost is paid only when a user opens a file.
+      const cmModule = await import(/* webpackChunkName: "editor" */ './editor.js');
+      editor = cmModule.mountEditor(view.querySelector('#ed-host'), original, {
+        filename: name,
+        readOnly: !canEdit,
+        onChange: (text) => {
+          const wasDirty = dirty;
+          dirty = text !== original;
+          if (wasDirty !== dirty) updateTitle();
+        },
+        onSave: () => { if (canEdit) save(); },
       });
+
+      // Save and Download stay in the modal (return false from onClick) —
+      // matches every desktop editor: Ctrl+S / clicking Save updates the
+      // file on disk but leaves the editor open. Closing is its own action.
+      const actions = canEdit
+        ? [
+            { label: 'Save', kind: 'primary', value: 'save',
+              onClick: async () => { await save(); return false; } },
+            { label: 'Download', kind: 'secondary', value: 'dl',
+              onClick: async () => { try { triggerDownload(await downloadUrl(p), name); } catch (e) { toast(e.message, 'error'); } return false; } },
+            { label: 'Close', value: null, kind: 'secondary', confirmBeforeClose: true },
+          ]
+        : [
+            { label: 'Download', kind: 'secondary', value: 'dl',
+              onClick: async () => { try { triggerDownload(await downloadUrl(p), name); } catch (e) { toast(e.message, 'error'); } return false; } },
+            { label: 'Close', value: null, kind: 'secondary' },
+          ];
+
+      const opening = modal({
+        title: `Edit: ${name}`, body: view, size: 'xl',
+        actions, ref,
+        onBeforeClose: async () => {
+          if (!dirty) return true;
+          return await confirmModal(
+            'Discard unsaved changes? Your edits to <code>' + escapeHtml(name) + '</code> will be lost.',
+            { danger: true, confirmLabel: 'Discard' },
+          );
+        },
+      });
+      updateTitle();
+      await opening;
+      try { editor.destroy(); } catch {}
     }
+
 
     async function renameAt(oldName) {
       const next = window.prompt(`Rename "${oldName}" to:`, oldName);
@@ -2453,46 +2663,94 @@ import { FitAddon } from '@xterm/addon-fit';
       } catch (e) { toast(e.message, 'error'); }
     }
 
-    // ---------- Chmod modal ----------
-    // Octal mode editor with three rwx triplet check-rows. Either side can be
-    // edited; both stay in sync.
-    async function openChmodEditor(names, { hasDir = false } = {}) {
+    // ---------- Permissions modal (chmod + chown) ----------
+    // Combined editor: octal mode kept in sync with rwx triplets, plus an
+    // optional owner section that sets numeric UID / GID. Either piece can
+    // be edited independently; on Apply we issue /chmod and/or /chown
+    // depending on which side actually changed.
+    async function openPermissionsEditor(names, { hasDir = false, entries = [] } = {}) {
+      // Pre-populate from the first entry's existing mode/uid/gid when we
+      // know them (single-row case, or bulk-select where all entries
+      // happen to match). Falls back to 0644 / 0:0 if we don't.
+      const seed = entries.find(Boolean);
+      const seedModeOctal = seed && seed.mode != null
+        ? '0' + ((seed.mode & 0o777).toString(8)).padStart(3, '0')
+        : '0644';
+      const seedUid = seed && seed.uid != null ? seed.uid : 0;
+      const seedGid = seed && seed.gid != null ? seed.gid : 0;
+      const seedUser = seed ? seed.user : '';
+      const seedGroup = seed ? seed.group : '';
+
       const view = document.createElement('div');
       const targetsLabel = names.length === 1
         ? `<code class="text-slate-200">${escapeHtml(names[0])}</code>`
         : `${names.length} items`;
       view.innerHTML = `
-        <div class="space-y-3 text-xs text-slate-300">
+        <div class="space-y-4 text-xs text-slate-300">
           <div>Target: ${targetsLabel}</div>
-          <div class="flex items-center gap-2">
-            <label>Octal mode</label>
-            <input id="chmod-mode" type="text" value="0644" maxlength="4"
-                   class="w-24 rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-sm uppercase tracking-wider"/>
-            <span class="text-slate-500" id="chmod-symbol">-rw-r--r--</span>
-          </div>
-          <table class="text-[11px]">
-            <thead><tr class="text-slate-500"><th></th><th class="px-2">read</th><th class="px-2">write</th><th class="px-2">exec</th></tr></thead>
-            <tbody>
-              ${['Owner','Group','Other'].map((label, i) => `
-                <tr><td class="pr-2 text-slate-400">${label}</td>
-                  ${['r','w','x'].map((perm) => `
-                    <td class="px-2 text-center"><input type="checkbox" class="chmod-bit h-3.5 w-3.5" data-who="${i}" data-perm="${perm}"/></td>
-                  `).join('')}
-                </tr>`).join('')}
-            </tbody>
-          </table>
+
+          <!-- Mode -->
+          <fieldset class="rounded border border-slate-800 p-3 space-y-2">
+            <legend class="px-1 text-[10px] uppercase tracking-wider text-slate-500">Mode (chmod)</legend>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1">
+                <input id="perm-mode-enabled" type="checkbox" class="h-3.5 w-3.5" checked/>
+                Change mode
+              </label>
+              <input id="perm-mode" type="text" value="${seedModeOctal}" maxlength="4"
+                     class="ml-2 w-24 rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-sm uppercase tracking-wider"/>
+              <span class="text-slate-500" id="perm-symbol">-rw-r--r--</span>
+            </div>
+            <table class="text-[11px]">
+              <thead><tr class="text-slate-500"><th></th><th class="px-2">read</th><th class="px-2">write</th><th class="px-2">exec</th></tr></thead>
+              <tbody>
+                ${['Owner','Group','Other'].map((label, i) => `
+                  <tr><td class="pr-2 text-slate-400">${label}</td>
+                    ${['r','w','x'].map((perm) => `
+                      <td class="px-2 text-center"><input type="checkbox" class="perm-bit h-3.5 w-3.5" data-who="${i}" data-perm="${perm}"/></td>
+                    `).join('')}
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </fieldset>
+
+          <!-- Owner -->
+          <fieldset class="rounded border border-slate-800 p-3 space-y-2">
+            <legend class="px-1 text-[10px] uppercase tracking-wider text-slate-500">Owner (chown)</legend>
+            <label class="flex items-center gap-1">
+              <input id="perm-own-enabled" type="checkbox" class="h-3.5 w-3.5"/>
+              Change ownership
+            </label>
+            <div class="grid grid-cols-2 gap-3 mt-1">
+              <label class="block">
+                <span class="text-slate-400">UID${seedUser ? ` <span class="text-slate-500">(was: ${escapeHtml(String(seedUid))} / ${escapeHtml(seedUser)})</span>` : ''}</span>
+                <input id="perm-uid" type="number" min="-1" value="${seedUid}" disabled
+                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono"/>
+              </label>
+              <label class="block">
+                <span class="text-slate-400">GID${seedGroup ? ` <span class="text-slate-500">(was: ${escapeHtml(String(seedGid))} / ${escapeHtml(seedGroup)})</span>` : ''}</span>
+                <input id="perm-gid" type="number" min="-1" value="${seedGid}" disabled
+                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono"/>
+              </label>
+            </div>
+            <p class="text-[11px] text-slate-500">Use <code>-1</code> in a field to leave that side unchanged. Numeric IDs only — name lookup inside the helper container doesn't match the volume's user database.</p>
+          </fieldset>
+
           ${hasDir ? `
             <label class="flex items-center gap-2 text-slate-300">
-              <input id="chmod-recursive" type="checkbox" class="h-3.5 w-3.5"/>
-              Apply recursively (chmod -R) — required to descend into folders.
+              <input id="perm-recursive" type="checkbox" class="h-3.5 w-3.5"/>
+              Apply recursively (<code>-R</code>) — required to descend into folders.
             </label>` : ''}
         </div>`;
 
-      // Mode <-> checkboxes sync.
       const PERM_BIT = { r: 4, w: 2, x: 1 };
-      const modeInput = view.querySelector('#chmod-mode');
-      const symbol = view.querySelector('#chmod-symbol');
-      const bits = view.querySelectorAll('.chmod-bit');
+      const modeInput = view.querySelector('#perm-mode');
+      const symbol = view.querySelector('#perm-symbol');
+      const bits = view.querySelectorAll('.perm-bit');
+      const modeEnabled = view.querySelector('#perm-mode-enabled');
+      const ownEnabled = view.querySelector('#perm-own-enabled');
+      const uidInput = view.querySelector('#perm-uid');
+      const gidInput = view.querySelector('#perm-gid');
 
       function modeToTriplets(octal) {
         const digits = octal.padStart(4, '0').slice(-3);
@@ -2526,50 +2784,94 @@ import { FitAddon } from '@xterm/addon-fit';
       for (const cb of bits) cb.addEventListener('change', syncFromBits);
       syncFromMode();
 
+      // Enable/disable the input groups based on the checkboxes.
+      function refreshEnabled() {
+        modeInput.disabled = !modeEnabled.checked;
+        for (const b of bits) b.disabled = !modeEnabled.checked;
+        uidInput.disabled = !ownEnabled.checked;
+        gidInput.disabled = !ownEnabled.checked;
+      }
+      modeEnabled.addEventListener('change', refreshEnabled);
+      ownEnabled.addEventListener('change', refreshEnabled);
+      refreshEnabled();
+
       const action = await modal({
-        title: names.length === 1 ? `chmod ${names[0]}` : `chmod (${names.length} items)`,
-        body: view, size: 'sm',
+        title: names.length === 1 ? `Permissions: ${names[0]}` : `Permissions (${names.length} items)`,
+        body: view, size: 'md',
         actions: [
           { label: 'Apply', kind: 'primary', value: 'ok' },
           { label: 'Cancel', kind: 'secondary', value: null },
         ],
       });
       if (action !== 'ok') return false;
-      const mode = modeInput.value.trim();
-      if (!/^0?[0-7]{3,4}$/.test(mode)) { toast('Invalid mode', 'warn'); return false; }
-      const recursive = !!(view.querySelector('#chmod-recursive') && view.querySelector('#chmod-recursive').checked);
 
-      // Single-item path stays on /browse/chmod (smaller payload, clearer
-      // error if it fails). Multi-item path uses /browse/chmod/bulk so
-      // N selections cost one container round-trip instead of N.
-      let succeeded = 0; let failed = 0;
-      try {
-        if (names.length === 1) {
-          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod`, {
-            method: 'POST',
-            body: JSON.stringify({ path: childPath(names[0]), mode, recursive }),
-          });
-          succeeded = 1;
-        } else {
-          const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod/bulk`, {
-            method: 'POST',
-            body: JSON.stringify({ paths: names.map(childPath), mode, recursive }),
-          });
-          succeeded = out.succeeded || 0;
-          failed = out.failed || 0;
-          for (const r of out.results || []) {
-            if (!r.ok) toast(`chmod ${r.path}: ${r.error || 'failed'}`, 'error');
-          }
-        }
-      } catch (e) {
-        toast(`chmod failed: ${e.message}`, 'error');
+      const doMode = modeEnabled.checked;
+      const doOwn = ownEnabled.checked;
+      if (!doMode && !doOwn) { toast('Nothing to apply', 'info'); return false; }
+
+      const mode = modeInput.value.trim();
+      if (doMode && !/^0?[0-7]{3,4}$/.test(mode)) { toast('Invalid mode', 'warn'); return false; }
+      const uid = parseInt(uidInput.value, 10);
+      const gid = parseInt(gidInput.value, 10);
+      if (doOwn && (Number.isNaN(uid) || Number.isNaN(gid))) {
+        toast('UID/GID must be numeric (use -1 to leave unchanged)', 'warn');
         return false;
       }
-      if (succeeded) {
-        toast(`chmod applied to ${succeeded} item${succeeded === 1 ? '' : 's'}${failed ? ` (${failed} failed)` : ''}`, failed ? 'warn' : 'success');
-        await load(cur);
+      if (doOwn && uid === -1 && gid === -1) {
+        toast('chown: at least one of UID / GID must be set (use -1 only for the side you want unchanged)', 'warn');
+        return false;
       }
-      return succeeded > 0 && failed === 0;
+
+      const recursive = !!(view.querySelector('#perm-recursive') && view.querySelector('#perm-recursive').checked);
+      const paths = names.map(childPath);
+      const single = names.length === 1;
+      let chmodOk = !doMode;
+      let chownOk = !doOwn;
+
+      // -- chmod --
+      if (doMode) {
+        try {
+          if (single) {
+            await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod`, {
+              method: 'POST', body: JSON.stringify({ path: paths[0], mode, recursive }),
+            });
+            chmodOk = true;
+          } else {
+            const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod/bulk`, {
+              method: 'POST', body: JSON.stringify({ paths, mode, recursive }),
+            });
+            chmodOk = (out.failed === 0);
+            for (const r of out.results || []) if (!r.ok) toast(`chmod ${r.path}: ${r.error || 'failed'}`, 'error');
+          }
+        } catch (e) { toast(`chmod failed: ${e.message}`, 'error'); }
+      }
+
+      // -- chown --
+      if (doOwn) {
+        try {
+          if (single) {
+            await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chown`, {
+              method: 'POST', body: JSON.stringify({ path: paths[0], uid, gid, recursive }),
+            });
+            chownOk = true;
+          } else {
+            const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chown/bulk`, {
+              method: 'POST', body: JSON.stringify({ paths, uid, gid, recursive }),
+            });
+            chownOk = (out.failed === 0);
+            for (const r of out.results || []) if (!r.ok) toast(`chown ${r.path}: ${r.error || 'failed'}`, 'error');
+          }
+        } catch (e) { toast(`chown failed: ${e.message}`, 'error'); }
+      }
+
+      const what = [doMode && 'mode', doOwn && 'owner'].filter(Boolean).join(' + ');
+      const okAll = chmodOk && chownOk;
+      toast(
+        `${what} applied to ${names.length} item${names.length === 1 ? '' : 's'}${okAll ? '' : ' (partial)'}`,
+        okAll ? 'success' : 'warn',
+      );
+      await load(cur);
+      return okAll;
     }
 
     // ---------- Upload ----------
@@ -2623,12 +2925,13 @@ import { FitAddon } from '@xterm/addon-fit';
           triggerDownload(blob, kind === 'dir' ? `${name}.tar` : name);
           return;
         }
-        if (act === 'view') return openViewer(name, child);
+        const entry = lastEntries.find((x) => x.name === name);
+        if (act === 'view') return openEditor(name, child, entry);
         if (act === 'rename') return renameAt(name);
-        if (act === 'chmod') return openChmodEditor([name], { hasDir: kind === 'dir' });
+        if (act === 'chmod') return openPermissionsEditor([name], { hasDir: kind === 'dir', entries: [entry].filter(Boolean) });
         if (act === 'navigate' || !act) {
           if (kind === 'dir') { offset = 0; selected.clear(); return load(child); }
-          if (kind === 'file') return openViewer(name, child);
+          if (kind === 'file') return openEditor(name, child, entry);
           // Symlinks: stay put; user has to click an action explicitly.
         }
       } catch (ex) { toast(ex.message, 'error'); }
@@ -2692,7 +2995,8 @@ import { FitAddon } from '@xterm/addon-fit';
       const names = [...selected];
       if (!names.length) return;
       const hasDir = lastEntries.some((e) => names.includes(e.name) && e.is_dir);
-      await openChmodEditor(names, { hasDir });
+      const entries = names.map((n) => lastEntries.find((x) => x.name === n)).filter(Boolean);
+      await openPermissionsEditor(names, { hasDir, entries });
     };
 
     // ---------- Toolbar / sort / refresh ----------

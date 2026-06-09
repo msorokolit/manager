@@ -53,14 +53,26 @@ The stack is intentionally small and easy to audit:
   - **Volume browser** (Portainer-style file manager): each operation
     runs a short-lived container (`docker run --rm` with `AutoRemove`)
     that has the volume mounted at `/target`. Stateless on the manager
-    side — nothing to leak, nothing to clean up on restart. Lets you
-    navigate via breadcrumbs, view text files inline, download single
-    files or whole folders as `tar`, upload (button or drag-and-drop,
-    multi-file), rename, edit permissions (`chmod` with octal + rwx
-    editor, optional `-R`), multi-select with **single-round-trip** bulk
-    delete / bulk chmod, mkdir, sort, and paginate through large
-    directories. The browser image is pre-pulled at startup so the first
-    browse is snappy.
+    side — nothing to leak, nothing to clean up on restart. Features:
+    - Breadcrumb navigation, sort, pagination through large directories
+    - **In-browser editor (CodeMirror 6)** with line numbers, syntax
+      highlighting for ~15 languages (YAML, JSON, Python, JS/TS, HTML,
+      CSS, Markdown, shell, nginx, Dockerfile, ini, toml, xml, lua,
+      ruby, perl), Ctrl+S to save, dirty indicator, full-screen toggle,
+      reload from disk, side-by-side **diff** of pending changes, and
+      **optimistic concurrency** (saves include the mtime you read; the
+      server rejects with 409 if the file changed underneath you)
+    - **Atomic writes** (temp + `os.replace`) that preserve the file's
+      original mode/uid/gid — editing a `0600 root:root` secret can't
+      accidentally widen its perms
+    - **Permissions editor** combining mode (octal + rwx triplets) and
+      ownership (numeric uid/gid, `-1` to leave unchanged), with an
+      optional recursive (`-R`) toggle for directories
+    - Download single files / whole folders as `tar`, upload (button or
+      drag-and-drop, multi-file), rename, mkdir
+    - Multi-select with **single-round-trip** bulk delete / bulk chmod
+      / bulk chown
+    - Browser image pre-pulled at startup so the first browse is snappy
 - **Registries** — store per-registry credentials (Docker Hub, ghcr.io, ECR,
   GitLab Registry, private registries…), test login, then select them from the
   image-pull dialog. Stored at `REGISTRIES_FILE` with file mode `0600`.
@@ -304,7 +316,7 @@ backend-node/
       images.js                 list/inspect/pull (streaming)/remove/prune
       networks.js               list/inspect/create/connect/disconnect/remove/prune
       volumes.js                list/inspect/create/remove/prune
-      volume-browser.js         list/get/view/upload/mkdir/rename/chmod/delete/archive + bulk chmod/delete (one-shot container per op, AutoRemove)
+      volume-browser.js         list/get/view/edit/upload/mkdir/rename/chmod/chown/delete/archive + bulk chmod/chown/delete (one-shot container per op, AutoRemove)
       stacks.js                 CRUD + up/down/restart/pull/logs/validate + per-service actions
       registries.js             list/upsert/delete/test (file-backed credential store)
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
@@ -341,7 +353,7 @@ unless an endpoint is admin-only). Mutating endpoints are gated by
 | images       | list / inspect / pull (NDJSON progress) / remove / prune               |
 | networks     | list / inspect / create / connect / disconnect / remove / prune        |
 | volumes      | list / inspect / create / remove / prune                               |
-| volume-browser | list (paginated) / get / view / archive / upload / mkdir / rename / chmod / delete + bulk chmod / bulk delete |
+| volume-browser | list (paginated) / get / view / edit (PUT, atomic + mtime check) / archive / upload / mkdir / rename / chmod / chown / delete + bulk chmod / bulk chown / bulk delete |
 | stacks       | list / get / create / update / up / down / restart / pull / logs / validate / delete + per-service `{up,start,stop,restart,pull,rm,logs}` |
 | registries   | list / upsert (POST or PUT) / delete / test                            |
 | exec         | `POST /api/exec/ticket` + `WS /api/containers/:id/exec?ticket=&cmd=&cols=&rows=` |
