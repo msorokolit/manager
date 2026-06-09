@@ -76,6 +76,59 @@ export const VolumeBrowseChmodRequest = Type.Object(
   { $id: 'VolumeBrowseChmodRequest', additionalProperties: false },
 );
 
+/**
+ * Bulk chmod: apply one mode to many paths in a single round-trip. Saves
+ * (N-1) container startups when the user multi-selects N items in the file
+ * manager and changes their permissions.
+ */
+export const VolumeBrowseBulkChmodRequest = Type.Object(
+  {
+    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+      minItems: 1, maxItems: 1000,
+    }),
+    mode: Type.String({
+      pattern: '^0?[0-7]{3,4}$',
+      description: 'Octal mode (e.g. "0644", "755")',
+    }),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowseBulkChmodRequest', additionalProperties: false },
+);
+
+/**
+ * Bulk delete: same idea — N path removals in one container run.
+ */
+export const VolumeBrowseBulkDeleteRequest = Type.Object(
+  {
+    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+      minItems: 1, maxItems: 1000,
+    }),
+  },
+  { $id: 'VolumeBrowseBulkDeleteRequest', additionalProperties: false },
+);
+
+/**
+ * Bulk-op result: one entry per requested path. Partial failures are
+ * surfaced per-entry, not as a 4xx — clients render a row-by-row report.
+ */
+export const VolumeBrowseBulkResult = Type.Object(
+  {
+    path: Type.String(),
+    ok: Type.Boolean(),
+    error: Opt(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const VolumeBrowseBulkResponse = Type.Object(
+  {
+    succeeded: Type.Integer(),
+    failed: Type.Integer(),
+    results: Type.Array(VolumeBrowseBulkResult),
+  },
+  { $id: 'VolumeBrowseBulkResponse', additionalProperties: false },
+);
+
 export const VolumeBrowseRenameRequest = Type.Object(
   {
     // Both paths are relative to the volume root; the server validates them.

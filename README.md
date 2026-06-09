@@ -50,14 +50,17 @@ The stack is intentionally small and easy to audit:
 - **Networks** — list, inspect, create (bridge/overlay/macvlan/ipvlan/host), remove, prune
   - **Connect / disconnect** containers from the network inspect modal
 - **Volumes** — list, inspect, create, remove, prune
-  - **Volume browser** (Portainer-style file manager): spins up a small
-    sidecar with the volume mounted at `/target` and lets you navigate via
-    breadcrumbs, view text files inline, download single files or whole
-    folders as `tar`, upload (button or drag-and-drop, multi-file),
-    rename, edit permissions (`chmod` with octal + rwx editor, optional
-    `-R`), multi-select with bulk delete / bulk chmod, mkdir, sort, and
-    paginate through large directories. Idle sidecars are automatically
-    reaped after `VOLUME_BROWSER_TTL_MS` (default 10 min) of inactivity.
+  - **Volume browser** (Portainer-style file manager): each operation
+    runs a short-lived container (`docker run --rm` with `AutoRemove`)
+    that has the volume mounted at `/target`. Stateless on the manager
+    side — nothing to leak, nothing to clean up on restart. Lets you
+    navigate via breadcrumbs, view text files inline, download single
+    files or whole folders as `tar`, upload (button or drag-and-drop,
+    multi-file), rename, edit permissions (`chmod` with octal + rwx
+    editor, optional `-R`), multi-select with **single-round-trip** bulk
+    delete / bulk chmod, mkdir, sort, and paginate through large
+    directories. The browser image is pre-pulled at startup so the first
+    browse is snappy.
 - **Registries** — store per-registry credentials (Docker Hub, ghcr.io, ECR,
   GitLab Registry, private registries…), test login, then select them from the
   image-pull dialog. Stored at `REGISTRIES_FILE` with file mode `0600`.
@@ -132,9 +135,8 @@ All configuration is via environment variables.
 | `EXEC_DEFAULT_SHELL` | `/bin/sh`        | Pre-filled command in the in-browser terminal                         |
 | `DATA_DIR`           | `/data`          | Base directory for the registries file                                |
 | `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
-| `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
-| `VOLUME_BROWSER_TTL_MS` | `600000`      | Idle TTL (ms) for volume-browser sidecars before the reaper removes them. `0` disables the reaper. |
-| `VOLUME_BROWSER_REAP_INTERVAL_MS` | `60000` | How often the reaper sweeps. Min 1000.                          |
+| `BROWSER_IMAGE`      | `python:3-alpine`| Image used for the per-operation volume-browser container (must include `python3`). Pre-pulled at startup. |
+| `VOLUME_BROWSER_NO_LIMITS` | _(unset)_   | Set `true` only on nested-VM / sandboxed runners whose root cgroup is in "domain threaded" mode; skips `Memory`/`NanoCpus`/`PidsLimit` on the per-op container. `CapDrop:ALL` stays applied. |
 | `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
 | `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds. Floor 60s, ceiling 30 days.                |
 | `RATE_LIMIT_DISABLED`| `false`          | Turn off the rate limiters entirely (dev only)                        |
@@ -302,7 +304,7 @@ backend-node/
       images.js                 list/inspect/pull (streaming)/remove/prune
       networks.js               list/inspect/create/connect/disconnect/remove/prune
       volumes.js                list/inspect/create/remove/prune
-      volume-browser.js         list/get/view/upload/mkdir/rename/chmod/delete/archive/stop (sidecar-backed, TTL-reaped)
+      volume-browser.js         list/get/view/upload/mkdir/rename/chmod/delete/archive + bulk chmod/delete (one-shot container per op, AutoRemove)
       stacks.js                 CRUD + up/down/restart/pull/logs/validate + per-service actions
       registries.js             list/upsert/delete/test (file-backed credential store)
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
@@ -339,7 +341,7 @@ unless an endpoint is admin-only). Mutating endpoints are gated by
 | images       | list / inspect / pull (NDJSON progress) / remove / prune               |
 | networks     | list / inspect / create / connect / disconnect / remove / prune        |
 | volumes      | list / inspect / create / remove / prune                               |
-| volume-browser | list (paginated) / get / view / archive / upload / mkdir / rename / chmod / delete / stop |
+| volume-browser | list (paginated) / get / view / archive / upload / mkdir / rename / chmod / delete + bulk chmod / bulk delete |
 | stacks       | list / get / create / update / up / down / restart / pull / logs / validate / delete + per-service `{up,start,stop,restart,pull,rm,logs}` |
 | registries   | list / upsert (POST or PUT) / delete / test                            |
 | exec         | `POST /api/exec/ticket` + `WS /api/containers/:id/exec?ticket=&cmd=&cols=&rows=` |

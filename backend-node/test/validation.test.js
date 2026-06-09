@@ -156,6 +156,54 @@ describe('Volume browser schemas', () => {
     const isValidChmod = (p) => valid(S.VolumeBrowseChmodRequest, p);
     expect(isValidChmod({ path: '/foo', mode: '0644', sneaky: 1 })).toBe(false);
   });
+
+  it('VolumeBrowseBulkChmodRequest accepts a typical multi-select payload', () => {
+    expect(valid(S.VolumeBrowseBulkChmodRequest, {
+      paths: ['/a.txt', '/b.txt', '/sub/c.txt'],
+      mode: '0644',
+    })).toBe(true);
+    expect(valid(S.VolumeBrowseBulkChmodRequest, {
+      paths: ['/a'], mode: '0755', recursive: true,
+    })).toBe(true);
+  });
+
+  it('VolumeBrowseBulkChmodRequest rejects empty paths array', () => {
+    expect(valid(S.VolumeBrowseBulkChmodRequest, { paths: [], mode: '0644' })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkChmodRequest enforces maxItems', () => {
+    const tooMany = Array.from({ length: 1001 }, (_, i) => `/f${i}`);
+    expect(valid(S.VolumeBrowseBulkChmodRequest, { paths: tooMany, mode: '0644' })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkChmodRequest rejects garbage mode', () => {
+    expect(valid(S.VolumeBrowseBulkChmodRequest, {
+      paths: ['/a'], mode: 'u+x',
+    })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkDeleteRequest accepts a typical payload', () => {
+    expect(valid(S.VolumeBrowseBulkDeleteRequest, {
+      paths: ['/a.txt', '/b.txt'],
+    })).toBe(true);
+  });
+
+  it('VolumeBrowseBulkDeleteRequest rejects empty and over-large lists', () => {
+    expect(valid(S.VolumeBrowseBulkDeleteRequest, { paths: [] })).toBe(false);
+    const tooMany = Array.from({ length: 1001 }, (_, i) => `/f${i}`);
+    expect(valid(S.VolumeBrowseBulkDeleteRequest, { paths: tooMany })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkResponse has the expected shape', () => {
+    expect(valid(S.VolumeBrowseBulkResponse, {
+      succeeded: 2, failed: 1,
+      results: [
+        { path: '/a', ok: true },
+        { path: '/b', ok: true },
+        { path: '/c', ok: false, error: 'nope' },
+      ],
+    })).toBe(true);
+  });
 });
 
 describe('CreateContainerRequest mem fields (M4)', () => {

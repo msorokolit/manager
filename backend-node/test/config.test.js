@@ -51,34 +51,7 @@ describe('Compose deadlines (H1)', () => {
   });
 });
 
-describe('Volume browser reaper settings', () => {
-  it('default TTL is 10 minutes', () => {
-    expect(settingsFromEnv({}).volumeBrowserTtlMs).toBe(10 * 60 * 1000);
-  });
-
-  it('VOLUME_BROWSER_TTL_MS=0 disables the reaper', () => {
-    expect(settingsFromEnv({ VOLUME_BROWSER_TTL_MS: '0' }).volumeBrowserTtlMs).toBe(0);
-  });
-
-  it('honours TTL and reap-interval overrides', () => {
-    const s = settingsFromEnv({
-      VOLUME_BROWSER_TTL_MS: '90000',
-      VOLUME_BROWSER_REAP_INTERVAL_MS: '15000',
-    });
-    expect(s.volumeBrowserTtlMs).toBe(90_000);
-    expect(s.volumeBrowserReapIntervalMs).toBe(15_000);
-  });
-
-  it('reap-interval has a 1s floor', () => {
-    expect(
-      settingsFromEnv({ VOLUME_BROWSER_REAP_INTERVAL_MS: '100' }).volumeBrowserReapIntervalMs,
-    ).toBe(1000);
-  });
-
-  it('TTL rejects negatives and clamps to 0', () => {
-    expect(settingsFromEnv({ VOLUME_BROWSER_TTL_MS: '-9999' }).volumeBrowserTtlMs).toBe(0);
-  });
-
+describe('Volume browser settings', () => {
   it('VOLUME_BROWSER_NO_LIMITS defaults to false', () => {
     expect(settingsFromEnv({}).volumeBrowserNoLimits).toBe(false);
   });

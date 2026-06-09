@@ -1,31 +1,39 @@
-// In-browser file manager for docker volumes (sidecar pattern).
+// In-browser file manager for docker volumes (one-shot container pattern).
 //
-// Why a sidecar?
-// --------------
-// Docker volumes are a container-scoped abstraction. The supported way to
-// touch their contents from outside the daemon is to mount them into a
-// container; that container is our "sidecar". One sidecar per volume,
-// reused across requests, started lazily on first browse. The sidecar:
+// Why no persistent sidecar?
+// --------------------------
+// Earlier revisions kept one long-lived `docker-manager-browser-<vol>`
+// container per browsed volume, plus a TTL reaper to remove idle ones.
+// That was an O(volumes-browsed) source of leakable state and required:
+// ensureBrowser, per-volume mutex, lastAccess map, periodic sweep,
+// orphan-adoption on restart, a Stop-sidecar UI button, three env vars.
 //
-//   - runs from `BROWSER_IMAGE` (default python:3-alpine; chosen for its
-//     tiny size + `python3` for inline scripts + standard POSIX tools)
-//   - has the volume mounted read-write at /target
-//   - has no network attached (NetworkMode: 'none')
-//   - has bounded resources (Memory, NanoCpus, PidsLimit) so a pathological
-//     volume can't OOM the host
-//   - is labelled `com.docker.manager.role=volume-browser` so an operator
-//     can find/kill them all with `docker ps -f label=...`
+// This version trades that complexity for per-operation latency: every
+// request creates one short-lived container with the volume mounted at
+// /target, runs a single command, and lets `AutoRemove: true` clean up.
+// No persistent state on the manager side; nothing to leak; nothing
+// for a restart to lose.
+//
+// AutoRemove safety
+// -----------------
+// The classic foot-gun with AutoRemove is the wait/logs race: the daemon
+// removes the container the instant it exits, so a subsequent `.logs()`
+// or `.wait()` call sees 404 and the operation looks like it failed.
+// We avoid it by **attaching to the container's stdout/stderr stream
+// BEFORE calling `start()`**. The attach stream owns the pipe; we consume
+// it to completion (which only happens after the container exits) and
+// only then return. We never call `.wait()` or `.logs()` post-exit, so
+// the AutoRemove race can't trigger.
 //
 // Path safety
 // -----------
 // User-supplied paths are first normalised against `/target` (rejects
-// URL-level traversal like `..`). Then, before every filesystem-touching
-// operation, we run `assertSafe()` inside the sidecar — a tiny Python
-// exec that calls `os.path.realpath()` and refuses to proceed if the
-// resolved path escapes `/target`. This defends against symlink escape
-// (an admin or a previous user putting `escape -> /etc` inside the
-// volume).
+// URL-level traversal like `..`) by `safePath`. Every operation script
+// then re-validates inside the container with `os.path.realpath()` so
+// a symlink stored inside the volume (e.g. `escape -> /etc`) can't be
+// used to escape /target.
 import { Buffer } from 'node:buffer';
+import { Writable } from 'node:stream';
 import path from 'node:path';
 import multer from 'multer';
 import { Type } from '@sinclair/typebox';
@@ -33,9 +41,12 @@ import tar from 'tar-stream';
 import { getClient } from '../docker-client.js';
 import { settings } from '../config.js';
 import { asyncHandler, HttpError, intQuery } from '../util.js';
-import { createApiRouter, customResponse, streamResponse } from '../route-builder.js';
+import { createApiRouter, customResponse } from '../route-builder.js';
 import {
   PassThroughObject,
+  VolumeBrowseBulkChmodRequest,
+  VolumeBrowseBulkDeleteRequest,
+  VolumeBrowseBulkResponse,
   VolumeBrowseChmodRequest,
   VolumeBrowseListResponse,
   VolumeBrowseRenameRequest,
@@ -53,11 +64,17 @@ const BROWSER_LABEL = 'com.docker.manager.role';
 const BROWSER_LABEL_VAL = 'volume-browser';
 const BROWSER_VOL_LABEL = 'com.docker.manager.volume';
 
-// ---------- Sidecar inline scripts ----------
+// ---------- Inline scripts ----------
+//
+// Every script:
+//   - takes its args via argv (no stdin to avoid attach-write races)
+//   - validates `realpath(path).startswith('/target')` before any fs op
+//   - ALWAYS exits 0 and ALWAYS prints a single JSON object to stdout
+//   - signals errors with `{"error": "..."}` instead of non-zero exit
+//
+// Uniform "exit 0 + JSON stdout" means the route handler never has to
+// distinguish container failure from operation failure from parse failure.
 
-// Listing: rich metadata + cheap pagination + realpath escape check on the
-// directory itself. Sorts entries by name; the UI re-sorts client-side for
-// other columns so we don't have to round-trip.
 const LIST_SCRIPT = `
 import os, stat, sys, json
 try:
@@ -72,23 +89,18 @@ offset = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 try:
     real_p = os.path.realpath(p)
     if not (real_p == '/target' or real_p.startswith('/target/')):
-        print(json.dumps({"error": "Path escapes the volume root"}))
-        sys.exit(0)
+        print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
     entries = sorted(os.listdir(p))
 except Exception as e:
-    print(json.dumps({"error": str(e)}))
-    sys.exit(0)
+    print(json.dumps({"error": str(e)})); sys.exit(0)
 
 total = len(entries)
 page = entries[offset:offset + limit]
-
 out = []
 for n in page:
     f = os.path.join(p, n)
-    try:
-        st = os.lstat(f)
-    except OSError:
-        continue
+    try: st = os.lstat(f)
+    except OSError: continue
     item = {
         "name": n,
         "is_dir": stat.S_ISDIR(st.st_mode),
@@ -103,48 +115,21 @@ for n in page:
     if pwd is not None:
         try: item["user"] = pwd.getpwuid(st.st_uid).pw_name
         except KeyError: item["user"] = str(st.st_uid)
-    else:
-        item["user"] = str(st.st_uid)
+    else: item["user"] = str(st.st_uid)
     if grp is not None:
         try: item["group"] = grp.getgrgid(st.st_gid).gr_name
         except KeyError: item["group"] = str(st.st_gid)
-    else:
-        item["group"] = str(st.st_gid)
+    else: item["group"] = str(st.st_gid)
     if item["is_link"]:
         try: item["link_target"] = os.readlink(f)
         except OSError: item["link_target"] = None
     out.append(item)
-
 print(json.dumps({"total": total, "entries": out}))
 `;
 
-// Symlink-escape guard: takes a path, exits 0 if its realpath is inside
-// /target, 2 if it escapes, 3 on other error. Run before any operation
-// that resolves symlinks (get_archive, put_archive, rm, mkdir, rename).
-const ASSERT_SAFE_SCRIPT = `
-import os, sys
-try:
-    p = sys.argv[1]
-    rp = os.path.realpath(p)
-    # For ops on a not-yet-existing path (mkdir, rename target), the path
-    # itself won't exist; resolve its parent and re-attach the leaf.
-    if not os.path.exists(p):
-        parent = os.path.realpath(os.path.dirname(p))
-        rp = os.path.join(parent, os.path.basename(p))
-    if rp == '/target' or rp.startswith('/target/'):
-        sys.exit(0)
-    sys.exit(2)
-except Exception as e:
-    print(str(e), file=sys.stderr)
-    sys.exit(3)
-`;
-
-// Inline file view: text content with a hard size cap, binary detection,
-// utf-8/latin-1 fallback, realpath check.
 const VIEW_SCRIPT = `
 import os, stat, sys, json
-MAX = 1024 * 1024  # 1 MB
-
+MAX = 1024 * 1024
 p = sys.argv[1]
 try:
     rp = os.path.realpath(p)
@@ -156,30 +141,166 @@ try:
     with open(p, 'rb') as f:
         data = f.read(MAX + 1)
     truncated = len(data) > MAX
-    if truncated:
-        data = data[:MAX]
+    if truncated: data = data[:MAX]
     is_binary = b'\\x00' in data[:8192]
     if is_binary:
         print(json.dumps({"size": st.st_size, "is_binary": True, "truncated": truncated}))
     else:
-        try:
-            content = data.decode('utf-8'); encoding = 'utf-8'
-        except UnicodeDecodeError:
-            content = data.decode('latin-1'); encoding = 'latin-1'
-        print(json.dumps({
-            "size": st.st_size, "is_binary": False, "truncated": truncated,
-            "encoding": encoding, "content": content,
-        }))
+        try: content = data.decode('utf-8'); encoding = 'utf-8'
+        except UnicodeDecodeError: content = data.decode('latin-1'); encoding = 'latin-1'
+        print(json.dumps({"size": st.st_size, "is_binary": False, "truncated": truncated, "encoding": encoding, "content": content}))
 except Exception as e:
     print(json.dumps({"error": str(e)}))
 `;
 
-// ---------- Helpers ----------
+// Standalone realpath check used by the byte-transfer paths
+// (file download, archive download, file upload) before we hand off to
+// the Engine's archive API. That API follows symlinks inside the
+// container's namespace, so we have to refuse the operation if the
+// requested path resolves outside /target.
+const ASSERT_SAFE_SCRIPT = `
+import os, sys, json
+p = sys.argv[1]
+try:
+    if os.path.lexists(p):
+        rp = os.path.realpath(p)
+    else:
+        parent = os.path.realpath(os.path.dirname(p))
+        rp = os.path.join(parent, os.path.basename(p))
+    if rp == '/target' or rp.startswith('/target/'):
+        print(json.dumps({"ok": True}))
+    else:
+        print(json.dumps({"error": "Path escapes the volume root"}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
 
-function browserName(volume) {
-  const safe = String(volume).replace(/[^a-zA-Z0-9_-]/g, '') || 'vol';
-  return `docker-manager-browser-${safe}`;
-}
+const CHMOD_SCRIPT = `
+import os, sys, json
+mode = int(sys.argv[1], 8)
+p = sys.argv[2]
+recursive = sys.argv[3] == '1' if len(sys.argv) > 3 else False
+try:
+    rp = os.path.realpath(p)
+    if not (rp == '/target' or rp.startswith('/target/')):
+        print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
+    if recursive and os.path.isdir(p):
+        os.chmod(p, mode)
+        for root, dirs, files in os.walk(p):
+            for d in dirs: os.chmod(os.path.join(root, d), mode)
+            for f in files: os.chmod(os.path.join(root, f), mode)
+    else:
+        os.chmod(p, mode)
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
+const MKDIR_SCRIPT = `
+import os, sys, json
+p = sys.argv[1]
+try:
+    parent = os.path.realpath(os.path.dirname(p))
+    final = os.path.join(parent, os.path.basename(p))
+    if not (final == '/target' or final.startswith('/target/')):
+        print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
+    os.makedirs(p, exist_ok=True)
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
+const DELETE_SCRIPT = `
+import os, sys, json, shutil
+p = sys.argv[1]
+try:
+    rp = os.path.realpath(p) if os.path.lexists(p) else None
+    if rp is None:
+        print(json.dumps({"error": "Not found"})); sys.exit(0)
+    if rp == '/target' or not rp.startswith('/target/'):
+        print(json.dumps({"error": "Refusing to delete the volume root"})); sys.exit(0)
+    if os.path.islink(p) or os.path.isfile(p):
+        os.unlink(p)
+    else:
+        shutil.rmtree(p)
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
+const RENAME_SCRIPT = `
+import os, sys, json
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    rs = os.path.realpath(src)
+    if not (rs == '/target' or rs.startswith('/target/')):
+        print(json.dumps({"error": "Source escapes the volume root"})); sys.exit(0)
+    parent = os.path.realpath(os.path.dirname(dst))
+    final = os.path.join(parent, os.path.basename(dst))
+    if not (final == '/target' or final.startswith('/target/')):
+        print(json.dumps({"error": "Destination escapes the volume root"})); sys.exit(0)
+    if os.path.lexists(dst):
+        print(json.dumps({"error": "Destination already exists"})); sys.exit(0)
+    os.rename(src, dst)
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`;
+
+// Bulk ops: accept one JSON spec (passed as argv[1]) instead of stdin so
+// we don't have to write to the attach pipe. argv on Linux supports
+// 128 KB by default; well above any sane multi-select.
+const BULK_CHMOD_SCRIPT = `
+import os, sys, json
+spec = json.loads(sys.argv[1])
+mode = int(spec["mode"], 8)
+recursive = bool(spec.get("recursive"))
+paths = spec["paths"]
+results = []
+for p in paths:
+    item = {"path": p}
+    try:
+        rp = os.path.realpath(p)
+        if not (rp == '/target' or rp.startswith('/target/')):
+            item["ok"] = False; item["error"] = "Path escapes the volume root"
+        else:
+            if recursive and os.path.isdir(p):
+                os.chmod(p, mode)
+                for root, dirs, files in os.walk(p):
+                    for d in dirs: os.chmod(os.path.join(root, d), mode)
+                    for f in files: os.chmod(os.path.join(root, f), mode)
+            else:
+                os.chmod(p, mode)
+            item["ok"] = True
+    except Exception as e:
+        item["ok"] = False; item["error"] = str(e)
+    results.append(item)
+print(json.dumps({"results": results}))
+`;
+
+const BULK_DELETE_SCRIPT = `
+import os, sys, json, shutil
+spec = json.loads(sys.argv[1])
+results = []
+for p in spec["paths"]:
+    item = {"path": p}
+    try:
+        rp = os.path.realpath(p) if os.path.lexists(p) else None
+        if rp is None:
+            item["ok"] = False; item["error"] = "Not found"
+        elif rp == '/target' or not rp.startswith('/target/'):
+            item["ok"] = False; item["error"] = "Refusing to delete the volume root"
+        else:
+            if os.path.islink(p) or os.path.isfile(p): os.unlink(p)
+            else: shutil.rmtree(p)
+            item["ok"] = True
+    except Exception as e:
+        item["ok"] = False; item["error"] = str(e)
+    results.append(item)
+print(json.dumps({"results": results}))
+`;
+
+// ---------- Helpers ----------
 
 function safePath(rel) {
   const cleaned = path.posix.normalize(
@@ -191,135 +312,162 @@ function safePath(rel) {
   return cleaned;
 }
 
-// Per-volume mutex for sidecar bring-up. Two concurrent first-time browses
-// for the same volume would otherwise both try to createContainer({name})
-// and the second would 409. Each volume's lock entry is deleted as soon as
-// the in-flight ensureBrowser settles, so the map stays small.
-const ensureLocks = new Map();
-
-// Last-touch timestamp per active sidecar (volume name -> epoch ms). Used
-// by the reaper to identify sidecars that have been idle for longer than
-// settings.volumeBrowserTtlMs.
-const lastAccess = new Map();
-
-async function ensureBrowser(volume) {
-  lastAccess.set(volume, Date.now());
-  let pending = ensureLocks.get(volume);
-  if (pending) return pending;
-  pending = (async () => {
-    const docker = getClient();
-    // Confirm volume exists
-    try {
-      await docker.getVolume(volume).inspect();
-    } catch (err) {
-      if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
-      throw err;
-    }
-
-    const name = browserName(volume);
-    const c = docker.getContainer(name);
-    try {
-      const info = await c.inspect();
-      if (!info.State || !info.State.Running) {
-        try { await c.start(); } catch (e) { if (e.statusCode !== 304) throw e; }
-      }
-      return c;
-    } catch (err) {
-      if (err.statusCode !== 404) throw err;
-    }
-
-    // Pull the image if missing.
-    try {
-      await docker.getImage(settings.browserImage).inspect();
-    } catch (err) {
-      if (err.statusCode === 404) {
-        await new Promise((resolve, reject) => {
-          docker.pull(settings.browserImage, (e, stream) => {
-            if (e) return reject(e);
-            docker.modem.followProgress(stream, (err2) =>
-              err2 ? reject(err2) : resolve(),
-            );
-          });
-        });
-      } else {
-        throw err;
-      }
-    }
-
-    const created = await docker.createContainer({
-      Image: settings.browserImage,
-      name,
-      Cmd: ['sleep', 'infinity'],
-      HostConfig: (() => {
-        const hc = {
-          Binds: [`${volume}:/target:rw`],
-          NetworkMode: 'none',
-          AutoRemove: false,
-          // Drop dangerous capabilities even though the only mount is /target.
-          CapDrop: ['ALL'],
-        };
-        // Skip the resource caps when the host's root cgroup is in threaded
-        // mode (nested CI VMs): runc refuses to enter cgroup v2 with domain
-        // controllers attached in that case. Production hosts are always
-        // 'domain' so the limits still apply where they matter.
-        if (!settings.volumeBrowserNoLimits) {
-          hc.Memory = 256 * 1024 * 1024; // 256 MB
-          hc.NanoCpus = 1_000_000_000;   // 1 vCPU
-          hc.PidsLimit = 256;
-        }
-        return hc;
-      })(),
-      Labels: { [BROWSER_LABEL]: BROWSER_LABEL_VAL, [BROWSER_VOL_LABEL]: String(volume) },
-    });
-    await created.start();
-    return created;
-  })().finally(() => {
-    ensureLocks.delete(volume);
-  });
-  ensureLocks.set(volume, pending);
-  return pending;
+async function ensureVolumeExists(volume) {
+  try { await getClient().getVolume(volume).inspect(); }
+  catch (err) {
+    if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
+    throw err;
+  }
 }
 
-async function execAndCapture(container, cmd, opts = {}) {
-  const exec = await container.exec({
-    Cmd: cmd,
-    AttachStdout: true,
-    AttachStderr: true,
-    Tty: false,
-    ...(opts.user ? { User: opts.user } : {}),
-  });
-  const stream = await exec.start({ hijack: true, stdin: false });
-  return await new Promise((resolve, reject) => {
-    const stdout = []; const stderr = [];
-    container.modem.demuxStream(stream, { write: (c) => stdout.push(c) }, { write: (c) => stderr.push(c) });
-    stream.on('end', async () => {
-      try {
-        const inspect = await exec.inspect();
-        resolve({
-          exitCode: inspect.ExitCode,
-          stdout: Buffer.concat(stdout).toString('utf8'),
-          stderr: Buffer.concat(stderr).toString('utf8'),
-        });
-      } catch (e) { reject(e); }
-    });
-    stream.on('error', reject);
-  });
+function browserHostConfig(volume, { readonly = false } = {}) {
+  const hc = {
+    Binds: [`${volume}:/target:${readonly ? 'ro' : 'rw'}`],
+    NetworkMode: 'none',
+    CapDrop: ['ALL'],
+    AutoRemove: true,
+    PidsLimit: 64,
+  };
+  // Same caveat as before: skip cgroup-v2 controllers when the host's
+  // root cgroup is in threaded mode (nested CI VMs). Production hosts
+  // never need this.
+  if (!settings.volumeBrowserNoLimits) {
+    hc.Memory = 256 * 1024 * 1024;
+    hc.NanoCpus = 1_000_000_000;
+  }
+  return hc;
 }
 
 /**
- * Refuse to proceed if `absPath` resolves outside /target (symlink escape).
- * Run before every filesystem-touching dockerode call.
+ * One-shot container that runs `cmd`, returns its demuxed stdout+stderr,
+ * and is auto-removed by the daemon. Uses the attach-before-start
+ * pattern so AutoRemove can't race our read of the output stream.
  */
-async function assertSafe(container, absPath) {
-  const r = await execAndCapture(container, ['python3', '-c', ASSERT_SAFE_SCRIPT, absPath]);
-  if (r.exitCode === 0) return;
-  if (r.exitCode === 2) {
-    throw new HttpError(400, 'Path resolves outside the volume root (symlink escape)');
+async function runOnce(volume, cmd, { readonly = false } = {}) {
+  await ensureVolumeExists(volume);
+  const docker = getClient();
+  const container = await docker.createContainer({
+    Image: settings.browserImage,
+    Cmd: cmd,
+    HostConfig: browserHostConfig(volume, { readonly }),
+    Labels: { [BROWSER_LABEL]: BROWSER_LABEL_VAL, [BROWSER_VOL_LABEL]: String(volume) },
+  });
+
+  // Attach BEFORE start: the daemon now owns the stdout/stderr pipe for
+  // us, so we cannot miss output that's emitted between exit and the
+  // AutoRemove cleanup.
+  const stream = await container.attach({
+    stream: true, stdout: true, stderr: true, hijack: true, stdin: false,
+  });
+
+  const outChunks = []; const errChunks = [];
+  const stdoutSink = new Writable({ write(c, _e, cb) { outChunks.push(c); cb(); } });
+  const stderrSink = new Writable({ write(c, _e, cb) { errChunks.push(c); cb(); } });
+  docker.modem.demuxStream(stream, stdoutSink, stderrSink);
+
+  const collected = new Promise((resolve, reject) => {
+    stream.on('end', () => resolve({
+      stdout: Buffer.concat(outChunks).toString('utf8'),
+      stderr: Buffer.concat(errChunks).toString('utf8'),
+    }));
+    stream.on('error', reject);
+  });
+
+  try {
+    await container.start();
+  } catch (err) {
+    // If start() fails the daemon won't AutoRemove (the container never
+    // ran), so we have to clean up by hand.
+    container.remove({ force: true }).catch(() => {});
+    throw err;
   }
-  throw new HttpError(500, r.stderr.trim() || 'Path safety check failed');
+  return collected;
 }
 
-// ---------- Schemas (route-builder picks these up) ----------
+/**
+ * Parse the deterministic JSON envelope every script emits on stdout.
+ * Maps an `{"error":...}` payload to an HttpError(400). Container
+ * crashes / pipe failures show up as a JSON parse error here.
+ */
+function parseScriptResult(out, opName) {
+  const text = (out.stdout || '').trim();
+  if (!text) {
+    const stderr = (out.stderr || '').trim();
+    throw new HttpError(500, `${opName} produced no output${stderr ? ': ' + stderr.slice(0, 200) : ''}`);
+  }
+  let data;
+  try { data = JSON.parse(text); }
+  catch {
+    throw new HttpError(500, `${opName} returned malformed JSON: ${text.slice(0, 200)}`);
+  }
+  if (data && typeof data === 'object' && data.error) {
+    throw new HttpError(400, data.error);
+  }
+  return data;
+}
+
+/**
+ * Create a never-started container with the volume mounted, hand it to
+ * `fn`, then remove it. Used for `getArchive` / `putArchive` because
+ * the Engine's archive endpoints don't require the container to be
+ * running and skipping `start()` saves ~80 ms per request.
+ */
+async function withScratchContainer(volume, fn, { readonly = false } = {}) {
+  await ensureVolumeExists(volume);
+  const docker = getClient();
+  const container = await docker.createContainer({
+    Image: settings.browserImage,
+    // Never started, so Cmd is a placeholder. The image is required to
+    // exist (we pre-pull at boot, see ensureBrowserImage).
+    Cmd: ['true'],
+    HostConfig: {
+      Binds: [`${volume}:/target:${readonly ? 'ro' : 'rw'}`],
+      NetworkMode: 'none',
+      CapDrop: ['ALL'],
+      // AutoRemove only fires on container EXIT. Since we never start
+      // this container, we must remove it ourselves in finally.
+    },
+    Labels: { [BROWSER_LABEL]: BROWSER_LABEL_VAL, [BROWSER_VOL_LABEL]: String(volume) },
+  });
+  try {
+    return await fn(container);
+  } finally {
+    container.remove({ force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Pre-pull `settings.browserImage` so the first browse on a fresh host
+ * doesn't pay a multi-second `docker pull` cost on the user's request.
+ * Best-effort: failure is logged but never blocks startup, because a
+ * later op will retry the pull (via createContainer's implicit pull).
+ */
+export async function ensureBrowserImage(logger = console) {
+  const docker = getClient();
+  try {
+    await docker.getImage(settings.browserImage).inspect();
+    return;
+  } catch (err) {
+    if (err.statusCode !== 404) {
+      logger.warn && logger.warn(`[volume-browser] image inspect failed: ${err.message}`);
+      return;
+    }
+  }
+  logger.log && logger.log(`[volume-browser] pre-pulling ${settings.browserImage}…`);
+  try {
+    await new Promise((resolve, reject) => {
+      docker.pull(settings.browserImage, (e, stream) => {
+        if (e) return reject(e);
+        docker.modem.followProgress(stream, (e2) => (e2 ? reject(e2) : resolve()));
+      });
+    });
+    logger.log && logger.log('[volume-browser] image ready');
+  } catch (err) {
+    logger.warn && logger.warn(`[volume-browser] pre-pull failed (will retry on first browse): ${err.message}`);
+  }
+}
+
+// ---------- Schemas ----------
 
 const NameParam = Type.Object({ name: Type.String() }, { additionalProperties: false });
 const PathQuery = Type.Object(
@@ -344,7 +492,7 @@ const ListQuery = Type.Object(
 r.get(
   '/:name/browse/list',
   {
-    summary: 'List a directory inside a volume',
+    summary: 'List a directory inside a volume (paginated)',
     params: NameParam,
     query: ListQuery,
     responses: { 200: VolumeBrowseListResponse },
@@ -353,15 +501,12 @@ r.get(
     const safe = safePath(req.query.path || '');
     const limit = intQuery(req.query.limit, 5000, { min: 1, max: 50000 });
     const offset = intQuery(req.query.offset, 0, { min: 0 });
-    const c = await ensureBrowser(req.params.name);
-    const out = await execAndCapture(c, [
-      'python3', '-c', LIST_SCRIPT, safe, String(limit), String(offset),
-    ]);
-    if (out.exitCode !== 0) throw new HttpError(500, out.stdout || out.stderr || 'exec failed');
-    let data;
-    try { data = JSON.parse(out.stdout.trim()); }
-    catch { throw new HttpError(500, `Bad list output: ${out.stdout.slice(0, 200)}`); }
-    if (data && typeof data === 'object' && data.error) throw new HttpError(400, data.error);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', LIST_SCRIPT, safe, String(limit), String(offset)],
+      { readonly: true },
+    );
+    const data = parseScriptResult(out, 'list');
     res.json({
       path: safe.slice('/target'.length) || '/',
       total: data.total,
@@ -381,13 +526,12 @@ r.get(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot view the volume root');
-    const c = await ensureBrowser(req.params.name);
-    const out = await execAndCapture(c, ['python3', '-c', VIEW_SCRIPT, safe]);
-    if (out.exitCode !== 0) throw new HttpError(500, out.stderr || 'view failed');
-    let data;
-    try { data = JSON.parse(out.stdout.trim()); }
-    catch { throw new HttpError(500, `Bad view output: ${out.stdout.slice(0, 200)}`); }
-    if (data && data.error) throw new HttpError(400, data.error);
+    const out = await runOnce(
+      req.params.name,
+      ['python3', '-c', VIEW_SCRIPT, safe],
+      { readonly: true },
+    );
+    const data = parseScriptResult(out, 'view');
     res.json({
       path: safe.slice('/target'.length) || '/',
       size: data.size,
@@ -398,6 +542,25 @@ r.get(
     });
   }),
 );
+
+// ---------- Byte transfers (Engine archive API + scratch container) ----------
+//
+// File / archive download and file upload go through `getArchive` /
+// `putArchive` on a never-started container — the Engine streams the
+// tar natively, which is cheaper than running an extra `python3 tarfile`
+// inside the container. A separate fast `runOnce(ASSERT_SAFE_SCRIPT)`
+// runs first because the archive endpoints follow symlinks in the
+// container's view and would otherwise let an in-volume `escape -> /etc`
+// link escape /target.
+
+async function assertSafeOnce(volume, safe) {
+  const out = await runOnce(
+    volume,
+    ['python3', '-c', ASSERT_SAFE_SCRIPT, safe],
+    { readonly: true },
+  );
+  parseScriptResult(out, 'safety check'); // throws 400 on escape
+}
 
 r.get(
   '/:name/browse/file',
@@ -414,34 +577,44 @@ r.get(
   },
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
-    if (safe === '/target') throw new HttpError(400, 'Cannot download root');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
-    let archive;
-    try { archive = await c.getArchive({ path: safe }); }
-    catch (err) { if (err.statusCode === 404) throw new HttpError(404, 'File not found'); throw err; }
-    const extract = tar.extract();
-    let payload = null; let filename = null; let isFile = false; let done;
-    const finished = new Promise((rOk) => (done = rOk));
-    extract.on('entry', (header, stream, next) => {
-      if (header.type === 'file' && payload == null) {
-        isFile = true; filename = path.posix.basename(header.name);
-        const chunks = [];
-        stream.on('data', (c) => chunks.push(c));
-        stream.on('end', () => { payload = Buffer.concat(chunks); next(); });
-      } else { stream.on('end', next); stream.resume(); }
-    });
-    extract.on('finish', done); extract.on('error', () => done());
-    archive.pipe(extract); await finished;
-    if (!isFile || payload == null) {
-      throw new HttpError(400, 'Not a regular file (use /archive to download directories)');
-    }
-    res.set({
-      'Content-Type': 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      'Content-Length': payload.length,
-    });
-    res.end(payload);
+    if (safe === '/target') throw new HttpError(400, 'Cannot download the volume root');
+    await assertSafeOnce(req.params.name, safe);
+
+    await withScratchContainer(req.params.name, async (container) => {
+      let archive;
+      try { archive = await container.getArchive({ path: safe }); }
+      catch (err) {
+        if (err.statusCode === 404) throw new HttpError(404, 'File not found');
+        throw err;
+      }
+      const extract = tar.extract();
+      let payload = null; let filename = null; let isFile = false;
+      const finished = new Promise((resolve) => {
+        extract.on('entry', (header, stream, next) => {
+          if (header.type === 'file' && payload == null) {
+            isFile = true; filename = path.posix.basename(header.name);
+            const chunks = [];
+            stream.on('data', (c) => chunks.push(c));
+            stream.on('end', () => { payload = Buffer.concat(chunks); next(); });
+          } else {
+            stream.on('end', next); stream.resume();
+          }
+        });
+        extract.on('finish', resolve);
+        extract.on('error', () => resolve());
+      });
+      archive.pipe(extract);
+      await finished;
+      if (!isFile || payload == null) {
+        throw new HttpError(400, 'Not a regular file (use /archive to download directories)');
+      }
+      res.set({
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': payload.length,
+      });
+      res.end(payload);
+    }, { readonly: true });
   }),
 );
 
@@ -461,26 +634,34 @@ r.get(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot archive the volume root');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
-    let archive;
-    try { archive = await c.getArchive({ path: safe }); }
-    catch (err) { if (err.statusCode === 404) throw new HttpError(404, 'Path not found'); throw err; }
-    const base = path.posix.basename(safe) || 'archive';
-    res.set({
-      'Content-Type': 'application/x-tar',
-      'Content-Disposition': `attachment; filename="${base}.tar"`,
-      'Cache-Control': 'no-store',
-    });
-    archive.on('data', (chunk) => {
-      if (!res.write(chunk)) {
-        archive.pause();
-        res.once('drain', () => archive.resume());
+    await assertSafeOnce(req.params.name, safe);
+
+    await withScratchContainer(req.params.name, async (container) => {
+      let archive;
+      try { archive = await container.getArchive({ path: safe }); }
+      catch (err) {
+        if (err.statusCode === 404) throw new HttpError(404, 'Path not found');
+        throw err;
       }
-    });
-    archive.on('end', () => res.end());
-    archive.on('error', () => res.end());
-    res.on('close', () => { try { archive.destroy(); } catch {} });
+      const base = path.posix.basename(safe) || 'archive';
+      res.set({
+        'Content-Type': 'application/x-tar',
+        'Content-Disposition': `attachment; filename="${base}.tar"`,
+        'Cache-Control': 'no-store',
+      });
+      await new Promise((resolve) => {
+        archive.on('data', (chunk) => {
+          if (!res.write(chunk)) {
+            archive.pause();
+            res.once('drain', () => archive.resume());
+          }
+        });
+        archive.on('end', resolve);
+        archive.on('error', resolve);
+        res.on('close', () => { try { archive.destroy(); } catch {} resolve(); });
+      });
+      res.end();
+    }, { readonly: true });
   }),
 );
 
@@ -508,8 +689,8 @@ r.post(
   asyncHandler(async (req, res) => {
     if (!req.file) throw new HttpError(400, 'file is required');
     const safe = safePath(req.query.path || '');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
+    await assertSafeOnce(req.params.name, safe);
+
     const fname = path.posix.basename(req.file.originalname || 'uploaded');
     const pack = tar.pack();
     pack.entry({ name: fname, mode: 0o644 }, req.file.buffer);
@@ -517,10 +698,15 @@ r.post(
     const chunks = [];
     for await (const chunk of pack) chunks.push(chunk);
     const tarBuf = Buffer.concat(chunks);
-    await c.putArchive(tarBuf, { path: safe });
+
+    await withScratchContainer(req.params.name, async (container) => {
+      await container.putArchive(tarBuf, { path: safe });
+    });
     res.json({ uploaded: fname, size: req.file.buffer.length, path: safe.slice('/target'.length) || '/' });
   }),
 );
+
+// ---------- Metadata ops (one container per request) ----------
 
 r.post(
   '/:name/browse/mkdir',
@@ -534,10 +720,8 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Invalid directory');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
-    const out = await execAndCapture(c, ['mkdir', '-p', safe]);
-    if (out.exitCode !== 0) throw new HttpError(400, out.stderr || 'mkdir failed');
+    const out = await runOnce(req.params.name, ['python3', '-c', MKDIR_SCRIPT, safe]);
+    parseScriptResult(out, 'mkdir');
     res.json({ created: safe.slice('/target'.length) || '/' });
   }),
 );
@@ -554,10 +738,8 @@ r.delete(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Refusing to delete root');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
-    const out = await execAndCapture(c, ['rm', '-rf', safe]);
-    if (out.exitCode !== 0) throw new HttpError(400, out.stderr || 'rm failed');
+    const out = await runOnce(req.params.name, ['python3', '-c', DELETE_SCRIPT, safe]);
+    parseScriptResult(out, 'delete');
     res.json({ removed: safe.slice('/target'.length) });
   }),
 );
@@ -580,17 +762,8 @@ r.post(
     if (from === to) {
       return res.json({ moved: from.slice('/target'.length), to: to.slice('/target'.length) });
     }
-    const c = await ensureBrowser(req.params.name);
-    // Check both ends: the source must exist inside /target, the destination
-    // must end up inside /target (we resolve the parent for the dest).
-    await assertSafe(c, from);
-    await assertSafe(c, to);
-    // mv -n refuses to overwrite an existing file; surface as 409.
-    const out = await execAndCapture(c, ['mv', '-n', from, to]);
-    if (out.exitCode !== 0) {
-      // Try to disambiguate "target exists" vs other failures.
-      throw new HttpError(409, out.stderr.trim() || 'rename failed (target may exist)');
-    }
+    const out = await runOnce(req.params.name, ['python3', '-c', RENAME_SCRIPT, from, to]);
+    parseScriptResult(out, 'rename');
     res.json({
       moved: from.slice('/target'.length),
       to: to.slice('/target'.length),
@@ -610,87 +783,78 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.body.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot chmod the volume root');
-    const c = await ensureBrowser(req.params.name);
-    await assertSafe(c, safe);
-    const args = ['chmod'];
-    if (req.body.recursive) args.push('-R');
-    args.push(req.body.mode, safe);
-    const out = await execAndCapture(c, args);
-    if (out.exitCode !== 0) throw new HttpError(400, out.stderr.trim() || 'chmod failed');
+    const out = await runOnce(req.params.name, [
+      'python3', '-c', CHMOD_SCRIPT,
+      req.body.mode, safe, req.body.recursive ? '1' : '0',
+    ]);
+    parseScriptResult(out, 'chmod');
     res.json({ path: safe.slice('/target'.length) || '/', mode: req.body.mode });
   }),
 );
 
+// ---------- Bulk ops (multi-select fast path) ----------
+//
+// Without these, the SPA's multi-select toolbar would issue N separate
+// HTTP calls, each ~200 ms of container start cost. With them, N items
+// = 1 container = ~200 ms total.
+
 r.post(
-  '/:name/browse/stop',
+  '/:name/browse/chmod/bulk',
   {
-    summary: 'Stop the volume-browser sidecar',
+    summary: 'chmod many paths at once (multi-select)',
     admin: true,
+    expensive: true,
     params: NameParam,
-    responses: { 200: PassThroughObject },
+    body: VolumeBrowseBulkChmodRequest,
+    responses: { 200: VolumeBrowseBulkResponse },
   },
   asyncHandler(async (req, res) => {
-    const docker = getClient();
-    const name = browserName(req.params.name);
-    try {
-      await docker.getContainer(name).remove({ force: true });
-      lastAccess.delete(req.params.name);
-      res.json({ stopped: true });
-    } catch (err) {
-      if (err.statusCode === 404) {
-        lastAccess.delete(req.params.name);
-        return res.json({ stopped: false, reason: 'not running' });
-      }
-      throw err;
-    }
+    const paths = req.body.paths.map((p) => safePath(p));
+    const spec = JSON.stringify({ mode: req.body.mode, recursive: !!req.body.recursive, paths });
+    const out = await runOnce(req.params.name, ['python3', '-c', BULK_CHMOD_SCRIPT, spec]);
+    const data = parseScriptResult(out, 'bulk chmod');
+    const results = (data.results || []).map((r) => ({
+      path: r.path.replace(/^\/target/, '') || '/',
+      ok: !!r.ok,
+      ...(r.error ? { error: r.error } : {}),
+    }));
+    res.json({
+      succeeded: results.filter((x) => x.ok).length,
+      failed: results.filter((x) => !x.ok).length,
+      results,
+    });
   }),
 );
 
-// ---------- Idle sidecar reaper ----------
-//
-// A sidecar that hasn't received a request in `volumeBrowserTtlMs` is removed
-// by the periodic reaper. Disabled when TTL is 0. Uses .unref() so the
-// interval doesn't keep the Node process alive on its own.
+r.post(
+  '/:name/browse/delete/bulk',
+  {
+    summary: 'Delete many paths at once (multi-select)',
+    admin: true,
+    expensive: true,
+    params: NameParam,
+    body: VolumeBrowseBulkDeleteRequest,
+    responses: { 200: VolumeBrowseBulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const paths = req.body.paths.map((p) => safePath(p));
+    const spec = JSON.stringify({ paths });
+    const out = await runOnce(req.params.name, ['python3', '-c', BULK_DELETE_SCRIPT, spec]);
+    const data = parseScriptResult(out, 'bulk delete');
+    const results = (data.results || []).map((r) => ({
+      path: r.path.replace(/^\/target/, '') || '/',
+      ok: !!r.ok,
+      ...(r.error ? { error: r.error } : {}),
+    }));
+    res.json({
+      succeeded: results.filter((x) => x.ok).length,
+      failed: results.filter((x) => !x.ok).length,
+      results,
+    });
+  }),
+);
 
-let reaperHandle = null;
-
-async function reapOnce(now = Date.now(), log = () => {}) {
-  if (settings.volumeBrowserTtlMs <= 0) return 0;
-  const docker = getClient();
-  let removed = 0;
-  for (const [vol, ts] of [...lastAccess.entries()]) {
-    if (now - ts <= settings.volumeBrowserTtlMs) continue;
-    try {
-      await docker.getContainer(browserName(vol)).remove({ force: true });
-      log(`reaped idle volume-browser sidecar for "${vol}"`);
-      removed += 1;
-    } catch (err) {
-      if (err.statusCode !== 404) {
-        log(`reaper: failed to remove sidecar for "${vol}": ${err.message}`);
-      }
-    }
-    lastAccess.delete(vol);
-  }
-  return removed;
-}
-
-export function startReaper(logger = console) {
-  if (reaperHandle || settings.volumeBrowserTtlMs <= 0) return;
-  reaperHandle = setInterval(
-    () => reapOnce(Date.now(), (m) => logger.log && logger.log(`[volume-browser] ${m}`)),
-    settings.volumeBrowserReapIntervalMs,
-  );
-  reaperHandle.unref && reaperHandle.unref();
-}
-
-export function stopReaper() {
-  if (reaperHandle) {
-    clearInterval(reaperHandle);
-    reaperHandle = null;
-  }
-}
-
-// Visible-for-testing.
-export const _internals = { lastAccess, reapOnce, browserName };
+// Visible-for-testing only.
+export const _internals = { safePath, parseScriptResult };
 
 export default r;

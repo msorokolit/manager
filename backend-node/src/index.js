@@ -22,8 +22,7 @@ import imagesApi from './routes/images.js';
 import networksApi from './routes/networks.js';
 import volumesApi from './routes/volumes.js';
 import volumeBrowserApi, {
-  startReaper as startVolumeBrowserReaper,
-  stopReaper as stopVolumeBrowserReaper,
+  ensureBrowserImage,
 } from './routes/volume-browser.js';
 import stacksApi from './routes/stacks.js';
 import registriesApi from './routes/registries.js';
@@ -255,14 +254,16 @@ server.listen(settings.port, settings.host, () => {
   console.log(
     `[docker-manager] listening on http://${settings.host}:${settings.port} (backend=node, version=${VERSION})`,
   );
-  startVolumeBrowserReaper(console);
+  // Pre-pull the volume-browser image in the background so the first
+  // browse request doesn't pay the docker-pull cost. Best-effort; if
+  // it fails, the first per-op container will retry the pull.
+  ensureBrowserImage(console).catch(() => {});
 });
 
 // Graceful shutdown
 function shutdown() {
   // eslint-disable-next-line no-console
   console.log('[docker-manager] shutting down');
-  stopVolumeBrowserReaper();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 }

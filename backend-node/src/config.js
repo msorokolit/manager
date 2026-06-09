@@ -85,24 +85,14 @@ export function settingsFromEnv(env = process.env) {
       100,
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
-    // ---- Volume-browser sidecar reaper ----
-    // Idle TTL: a sidecar with no requests for this many ms is removed.
-    // Set to 0 to disable the reaper entirely (sidecars live forever).
-    volumeBrowserTtlMs: Math.max(
-      0,
-      parseInt(env.VOLUME_BROWSER_TTL_MS || String(10 * 60 * 1000), 10),
-    ),
-    // How often the reaper wakes up to look for idle sidecars.
-    volumeBrowserReapIntervalMs: Math.max(
-      1000,
-      parseInt(env.VOLUME_BROWSER_REAP_INTERVAL_MS || '60000', 10),
-    ),
-    // Escape hatch: skip Memory / NanoCpus / PidsLimit on the sidecar.
-    // Only useful on hosts where the root cgroup is in "domain threaded"
-    // mode (nested CI VMs, some sandboxed runners), which makes runc
-    // refuse to enter cgroup v2 with domain controllers attached. The
-    // CapDrop: ALL is still applied so the sidecar's surface stays
-    // minimal even with this flag on. Keep this OFF in production.
+    // ---- Volume-browser one-shot containers ----
+    // Escape hatch: skip Memory / NanoCpus / PidsLimit on the per-op
+    // container. Only useful on hosts where the root cgroup is in
+    // "domain threaded" mode (nested CI VMs, some sandboxed runners),
+    // which makes runc refuse to enter cgroup v2 with domain controllers
+    // attached. The CapDrop: ALL stays applied so the container's
+    // capability surface remains minimal even with this flag on.
+    // Keep this OFF in production.
     volumeBrowserNoLimits: (env.VOLUME_BROWSER_NO_LIMITS || '').toLowerCase() === 'true',
     // ---- Security headers (helmet) ----
     helmetDisabled: bool(env, 'HELMET_DISABLED', false),

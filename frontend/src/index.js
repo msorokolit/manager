@@ -2151,7 +2151,6 @@ import { FitAddon } from '@xterm/addon-fit';
           <option value="mtime">Sort: Modified</option>
         </select>
         <button id="vb-refresh" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Reload current directory">⟳</button>
-        <button id="vb-stop" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Stop the sidecar container">Stop sidecar</button>
       </div>
 
       <div id="vb-bulk" class="mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs">
@@ -2539,19 +2538,38 @@ import { FitAddon } from '@xterm/addon-fit';
       const mode = modeInput.value.trim();
       if (!/^0?[0-7]{3,4}$/.test(mode)) { toast('Invalid mode', 'warn'); return false; }
       const recursive = !!(view.querySelector('#chmod-recursive') && view.querySelector('#chmod-recursive').checked);
-      let ok = 0, fail = 0;
-      for (const n of names) {
-        try {
+
+      // Single-item path stays on /browse/chmod (smaller payload, clearer
+      // error if it fails). Multi-item path uses /browse/chmod/bulk so
+      // N selections cost one container round-trip instead of N.
+      let succeeded = 0; let failed = 0;
+      try {
+        if (names.length === 1) {
           await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod`, {
             method: 'POST',
-            body: JSON.stringify({ path: childPath(n), mode, recursive }),
+            body: JSON.stringify({ path: childPath(names[0]), mode, recursive }),
           });
-          ok += 1;
-        } catch (e) { fail += 1; toast(`chmod ${n}: ${e.message}`, 'error'); }
+          succeeded = 1;
+        } else {
+          const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod/bulk`, {
+            method: 'POST',
+            body: JSON.stringify({ paths: names.map(childPath), mode, recursive }),
+          });
+          succeeded = out.succeeded || 0;
+          failed = out.failed || 0;
+          for (const r of out.results || []) {
+            if (!r.ok) toast(`chmod ${r.path}: ${r.error || 'failed'}`, 'error');
+          }
+        }
+      } catch (e) {
+        toast(`chmod failed: ${e.message}`, 'error');
+        return false;
       }
-      if (ok) toast(`chmod applied to ${ok} item${ok === 1 ? '' : 's'}`, 'success');
-      if (ok) await load(cur);
-      return ok > 0 && fail === 0;
+      if (succeeded) {
+        toast(`chmod applied to ${succeeded} item${succeeded === 1 ? '' : 's'}${failed ? ` (${failed} failed)` : ''}`, failed ? 'warn' : 'success');
+        await load(cur);
+      }
+      return succeeded > 0 && failed === 0;
     }
 
     // ---------- Upload ----------
@@ -2649,14 +2667,23 @@ import { FitAddon } from '@xterm/addon-fit';
         { danger: true, confirmLabel: 'Delete all' },
       );
       if (!ok) return;
-      let success = 0, fail = 0;
-      for (const n of names) {
-        try {
-          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(childPath(n))}`, { method: 'DELETE' });
-          success += 1;
-        } catch (e) { fail += 1; toast(`${n}: ${e.message}`, 'error'); }
+      // One bulk request = one container round-trip on the server, instead
+      // of N. Per-entry failures come back in `results` and are surfaced
+      // as individual toasts so the user knows which ones didn't go.
+      try {
+        const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/delete/bulk`, {
+          method: 'POST',
+          body: JSON.stringify({ paths: names.map(childPath) }),
+        });
+        for (const r of out.results || []) {
+          if (!r.ok) toast(`${r.path}: ${r.error || 'delete failed'}`, 'error');
+        }
+        if (out.succeeded) {
+          toast(`Deleted ${out.succeeded}${out.failed ? ` of ${names.length}` : ''}`, out.failed ? 'warn' : 'success');
+        }
+      } catch (e) {
+        toast(`Bulk delete failed: ${e.message}`, 'error');
       }
-      if (success) toast(`Deleted ${success}${fail ? ` of ${names.length}` : ''}`, fail ? 'warn' : 'success');
       selected.clear();
       load(cur);
     };
@@ -2668,7 +2695,7 @@ import { FitAddon } from '@xterm/addon-fit';
       await openChmodEditor(names, { hasDir });
     };
 
-    // ---------- Toolbar / sort / refresh / stop ----------
+    // ---------- Toolbar / sort / refresh ----------
     wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
       sortMode = e.target.value; render();
     });
@@ -2697,13 +2724,6 @@ import { FitAddon } from '@xterm/addon-fit';
         const fname = (cur === '/' ? volumeName : (cur.split('/').pop() || volumeName));
         triggerDownload(blob, `${fname}.tar`);
       } catch (e) { toast(e.message, 'error'); }
-    };
-
-    wrap.querySelector('#vb-stop').onclick = async () => {
-      try {
-        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/stop`, { method: 'POST' });
-        toast('Sidecar stopped', 'success');
-      } catch (ex) { toast(ex.message, 'error'); }
     };
 
     // ---------- Pagination ----------
@@ -2776,7 +2796,7 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     // ---------- Boot ----------
-    setStatus(`A small "${state.config.browser_image}" sidecar will be started with this volume mounted at /target. Click "Stop sidecar" when done.`, 'info');
+    setStatus(`Each operation runs in a short-lived "${state.config.browser_image}" container with this volume mounted read-only / read-write at /target.`, 'info');
     load('/');
 
     await modal({ title: `Browse: ${volumeName}`, body: wrap, size: 'xl' });
