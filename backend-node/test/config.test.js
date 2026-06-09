@@ -78,6 +78,17 @@ describe('Volume browser reaper settings', () => {
   it('TTL rejects negatives and clamps to 0', () => {
     expect(settingsFromEnv({ VOLUME_BROWSER_TTL_MS: '-9999' }).volumeBrowserTtlMs).toBe(0);
   });
+
+  it('VOLUME_BROWSER_NO_LIMITS defaults to false', () => {
+    expect(settingsFromEnv({}).volumeBrowserNoLimits).toBe(false);
+  });
+
+  it('VOLUME_BROWSER_NO_LIMITS=true is honored case-insensitively', () => {
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'true' }).volumeBrowserNoLimits).toBe(true);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'TRUE' }).volumeBrowserNoLimits).toBe(true);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'yes' }).volumeBrowserNoLimits).toBe(false);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: '1' }).volumeBrowserNoLimits).toBe(false);
+  });
 });
 
 describe('Rate-limit settings', () => {

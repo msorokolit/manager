@@ -97,6 +97,13 @@ export function settingsFromEnv(env = process.env) {
       1000,
       parseInt(env.VOLUME_BROWSER_REAP_INTERVAL_MS || '60000', 10),
     ),
+    // Escape hatch: skip Memory / NanoCpus / PidsLimit on the sidecar.
+    // Only useful on hosts where the root cgroup is in "domain threaded"
+    // mode (nested CI VMs, some sandboxed runners), which makes runc
+    // refuse to enter cgroup v2 with domain controllers attached. The
+    // CapDrop: ALL is still applied so the sidecar's surface stays
+    // minimal even with this flag on. Keep this OFF in production.
+    volumeBrowserNoLimits: (env.VOLUME_BROWSER_NO_LIMITS || '').toLowerCase() === 'true',
     // ---- Security headers (helmet) ----
     helmetDisabled: bool(env, 'HELMET_DISABLED', false),
     cspDisabled: bool(env, 'CSP_DISABLED', false),

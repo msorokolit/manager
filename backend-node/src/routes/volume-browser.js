@@ -250,17 +250,25 @@ async function ensureBrowser(volume) {
       Image: settings.browserImage,
       name,
       Cmd: ['sleep', 'infinity'],
-      HostConfig: {
-        Binds: [`${volume}:/target:rw`],
-        NetworkMode: 'none',
-        AutoRemove: false,
-        // Bound the blast radius of a pathological listing or upload.
-        Memory: 256 * 1024 * 1024, // 256 MB
-        NanoCpus: 1_000_000_000,   // 1 vCPU
-        PidsLimit: 256,
-        // Drop dangerous capabilities even though the only mount is /target.
-        CapDrop: ['ALL'],
-      },
+      HostConfig: (() => {
+        const hc = {
+          Binds: [`${volume}:/target:rw`],
+          NetworkMode: 'none',
+          AutoRemove: false,
+          // Drop dangerous capabilities even though the only mount is /target.
+          CapDrop: ['ALL'],
+        };
+        // Skip the resource caps when the host's root cgroup is in threaded
+        // mode (nested CI VMs): runc refuses to enter cgroup v2 with domain
+        // controllers attached in that case. Production hosts are always
+        // 'domain' so the limits still apply where they matter.
+        if (!settings.volumeBrowserNoLimits) {
+          hc.Memory = 256 * 1024 * 1024; // 256 MB
+          hc.NanoCpus = 1_000_000_000;   // 1 vCPU
+          hc.PidsLimit = 256;
+        }
+        return hc;
+      })(),
       Labels: { [BROWSER_LABEL]: BROWSER_LABEL_VAL, [BROWSER_VOL_LABEL]: String(volume) },
     });
     await created.start();
