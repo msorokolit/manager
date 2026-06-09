@@ -21,7 +21,10 @@ import containersApi from './routes/containers.js';
 import imagesApi from './routes/images.js';
 import networksApi from './routes/networks.js';
 import volumesApi from './routes/volumes.js';
-import volumeBrowserApi from './routes/volume-browser.js';
+import volumeBrowserApi, {
+  startReaper as startVolumeBrowserReaper,
+  stopReaper as stopVolumeBrowserReaper,
+} from './routes/volume-browser.js';
 import stacksApi from './routes/stacks.js';
 import registriesApi from './routes/registries.js';
 import execApi, { handleExecWebSocket } from './routes/exec.js';
@@ -252,12 +255,14 @@ server.listen(settings.port, settings.host, () => {
   console.log(
     `[docker-manager] listening on http://${settings.host}:${settings.port} (backend=node, version=${VERSION})`,
   );
+  startVolumeBrowserReaper(console);
 });
 
 // Graceful shutdown
 function shutdown() {
   // eslint-disable-next-line no-console
   console.log('[docker-manager] shutting down');
+  stopVolumeBrowserReaper();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 }

@@ -127,6 +127,35 @@ describe('Volume browser schemas', () => {
       }),
     ).toBe(true);
   });
+
+  it('VolumeBrowseChmodRequest accepts canonical octal modes', () => {
+    const isValidChmod = (p) => valid(S.VolumeBrowseChmodRequest, p);
+    expect(isValidChmod({ path: '/foo', mode: '0644' })).toBe(true);
+    expect(isValidChmod({ path: '/foo', mode: '755' })).toBe(true);
+    expect(isValidChmod({ path: '/foo', mode: '0700' })).toBe(true);
+    expect(isValidChmod({ path: '/foo', mode: '644', recursive: true })).toBe(true);
+  });
+
+  it('VolumeBrowseChmodRequest rejects garbage modes', () => {
+    const isValidChmod = (p) => valid(S.VolumeBrowseChmodRequest, p);
+    expect(isValidChmod({ path: '/foo', mode: 'u+x' })).toBe(false);
+    expect(isValidChmod({ path: '/foo', mode: '988' })).toBe(false);
+    expect(isValidChmod({ path: '/foo', mode: '0xff' })).toBe(false);
+    expect(isValidChmod({ path: '/foo', mode: '' })).toBe(false);
+    expect(isValidChmod({ path: '/foo', mode: '1234567' })).toBe(false);
+  });
+
+  it('VolumeBrowseChmodRequest requires both path and mode', () => {
+    const isValidChmod = (p) => valid(S.VolumeBrowseChmodRequest, p);
+    expect(isValidChmod({ mode: '0644' })).toBe(false);
+    expect(isValidChmod({ path: '/foo' })).toBe(false);
+    expect(isValidChmod({ path: '', mode: '0644' })).toBe(false);
+  });
+
+  it('VolumeBrowseChmodRequest rejects unknown fields', () => {
+    const isValidChmod = (p) => valid(S.VolumeBrowseChmodRequest, p);
+    expect(isValidChmod({ path: '/foo', mode: '0644', sneaky: 1 })).toBe(false);
+  });
 });
 
 describe('CreateContainerRequest mem fields (M4)', () => {

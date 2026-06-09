@@ -63,6 +63,19 @@ export const VolumeBrowseListResponse = Type.Object(
   { $id: 'VolumeBrowseListResponse', additionalProperties: false },
 );
 
+export const VolumeBrowseChmodRequest = Type.Object(
+  {
+    path: Type.String({ minLength: 1, maxLength: 4096 }),
+    // chmod accepts both "0644" and "644"; the regex tolerates either.
+    mode: Type.String({
+      pattern: '^0?[0-7]{3,4}$',
+      description: 'Octal mode (e.g. "0644", "755")',
+    }),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowseChmodRequest', additionalProperties: false },
+);
+
 export const VolumeBrowseRenameRequest = Type.Object(
   {
     // Both paths are relative to the volume root; the server validates them.

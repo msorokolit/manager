@@ -85,6 +85,18 @@ export function settingsFromEnv(env = process.env) {
       100,
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
+    // ---- Volume-browser sidecar reaper ----
+    // Idle TTL: a sidecar with no requests for this many ms is removed.
+    // Set to 0 to disable the reaper entirely (sidecars live forever).
+    volumeBrowserTtlMs: Math.max(
+      0,
+      parseInt(env.VOLUME_BROWSER_TTL_MS || String(10 * 60 * 1000), 10),
+    ),
+    // How often the reaper wakes up to look for idle sidecars.
+    volumeBrowserReapIntervalMs: Math.max(
+      1000,
+      parseInt(env.VOLUME_BROWSER_REAP_INTERVAL_MS || '60000', 10),
+    ),
     // ---- Security headers (helmet) ----
     helmetDisabled: bool(env, 'HELMET_DISABLED', false),
     cspDisabled: bool(env, 'CSP_DISABLED', false),

@@ -36,6 +36,7 @@ import { asyncHandler, HttpError, intQuery } from '../util.js';
 import { createApiRouter, customResponse, streamResponse } from '../route-builder.js';
 import {
   PassThroughObject,
+  VolumeBrowseChmodRequest,
   VolumeBrowseListResponse,
   VolumeBrowseRenameRequest,
   VolumeBrowseViewResponse,
@@ -196,7 +197,13 @@ function safePath(rel) {
 // the in-flight ensureBrowser settles, so the map stays small.
 const ensureLocks = new Map();
 
+// Last-touch timestamp per active sidecar (volume name -> epoch ms). Used
+// by the reaper to identify sidecars that have been idle for longer than
+// settings.volumeBrowserTtlMs.
+const lastAccess = new Map();
+
 async function ensureBrowser(volume) {
+  lastAccess.set(volume, Date.now());
   let pending = ensureLocks.get(volume);
   if (pending) return pending;
   pending = (async () => {
@@ -584,6 +591,29 @@ r.post(
 );
 
 r.post(
+  '/:name/browse/chmod',
+  {
+    summary: 'Change permissions on a file or directory',
+    admin: true,
+    params: NameParam,
+    body: VolumeBrowseChmodRequest,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (req, res) => {
+    const safe = safePath(req.body.path);
+    if (safe === '/target') throw new HttpError(400, 'Cannot chmod the volume root');
+    const c = await ensureBrowser(req.params.name);
+    await assertSafe(c, safe);
+    const args = ['chmod'];
+    if (req.body.recursive) args.push('-R');
+    args.push(req.body.mode, safe);
+    const out = await execAndCapture(c, args);
+    if (out.exitCode !== 0) throw new HttpError(400, out.stderr.trim() || 'chmod failed');
+    res.json({ path: safe.slice('/target'.length) || '/', mode: req.body.mode });
+  }),
+);
+
+r.post(
   '/:name/browse/stop',
   {
     summary: 'Stop the volume-browser sidecar',
@@ -594,12 +624,65 @@ r.post(
   asyncHandler(async (req, res) => {
     const docker = getClient();
     const name = browserName(req.params.name);
-    try { await docker.getContainer(name).remove({ force: true }); res.json({ stopped: true }); }
-    catch (err) {
-      if (err.statusCode === 404) return res.json({ stopped: false, reason: 'not running' });
+    try {
+      await docker.getContainer(name).remove({ force: true });
+      lastAccess.delete(req.params.name);
+      res.json({ stopped: true });
+    } catch (err) {
+      if (err.statusCode === 404) {
+        lastAccess.delete(req.params.name);
+        return res.json({ stopped: false, reason: 'not running' });
+      }
       throw err;
     }
   }),
 );
+
+// ---------- Idle sidecar reaper ----------
+//
+// A sidecar that hasn't received a request in `volumeBrowserTtlMs` is removed
+// by the periodic reaper. Disabled when TTL is 0. Uses .unref() so the
+// interval doesn't keep the Node process alive on its own.
+
+let reaperHandle = null;
+
+async function reapOnce(now = Date.now(), log = () => {}) {
+  if (settings.volumeBrowserTtlMs <= 0) return 0;
+  const docker = getClient();
+  let removed = 0;
+  for (const [vol, ts] of [...lastAccess.entries()]) {
+    if (now - ts <= settings.volumeBrowserTtlMs) continue;
+    try {
+      await docker.getContainer(browserName(vol)).remove({ force: true });
+      log(`reaped idle volume-browser sidecar for "${vol}"`);
+      removed += 1;
+    } catch (err) {
+      if (err.statusCode !== 404) {
+        log(`reaper: failed to remove sidecar for "${vol}": ${err.message}`);
+      }
+    }
+    lastAccess.delete(vol);
+  }
+  return removed;
+}
+
+export function startReaper(logger = console) {
+  if (reaperHandle || settings.volumeBrowserTtlMs <= 0) return;
+  reaperHandle = setInterval(
+    () => reapOnce(Date.now(), (m) => logger.log && logger.log(`[volume-browser] ${m}`)),
+    settings.volumeBrowserReapIntervalMs,
+  );
+  reaperHandle.unref && reaperHandle.unref();
+}
+
+export function stopReaper() {
+  if (reaperHandle) {
+    clearInterval(reaperHandle);
+    reaperHandle = null;
+  }
+}
+
+// Visible-for-testing.
+export const _internals = { lastAccess, reapOnce, browserName };
 
 export default r;

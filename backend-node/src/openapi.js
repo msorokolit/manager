@@ -33,6 +33,7 @@ const COMPONENT_SCHEMAS = [
   S.VolumeBrowseEntry,
   S.VolumeBrowseListResponse,
   S.VolumeBrowseRenameRequest,
+  S.VolumeBrowseChmodRequest,
   S.VolumeBrowseViewResponse,
   S.CreateStackRequest,
   S.UpdateStackRequest,

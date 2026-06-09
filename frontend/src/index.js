@@ -2132,13 +2132,17 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   async function openVolumeBrowser(volumeName) {
+    // Grid template kept in one place so header + rows can't drift apart.
+    const GRID_COLS = 'grid-cols-[1.75rem_1fr_5.5rem_8rem_8rem_6.25rem_6.75rem]';
+    const PAGE_SIZES = [50, 100, 250, 500, 1000];
+
     const wrap = document.createElement('div');
     wrap.innerHTML = `
       <div class="mb-3 flex flex-wrap items-center gap-2">
         <div id="vb-crumbs" class="flex flex-1 min-w-[280px] flex-wrap items-center gap-1 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs"></div>
         <button id="vb-mkdir" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="New folder">+ Folder</button>
-        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer" title="Upload file">⤒ Upload
-          <input id="vb-upload" type="file" class="hidden"/>
+        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer" title="Upload file(s)">⤒ Upload
+          <input id="vb-upload" type="file" class="hidden" multiple/>
         </label>
         <button id="vb-dl-folder" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Download current folder as tar">⤓ tar</button>
         <select id="vb-sort" class="rounded border-slate-700 bg-slate-950 px-1 py-1 text-xs" title="Sort order">
@@ -2146,11 +2150,24 @@ import { FitAddon } from '@xterm/addon-fit';
           <option value="size">Sort: Size</option>
           <option value="mtime">Sort: Modified</option>
         </select>
+        <button id="vb-refresh" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Reload current directory">⟳</button>
         <button id="vb-stop" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Stop the sidecar container">Stop sidecar</button>
       </div>
+
+      <div id="vb-bulk" class="mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs">
+        <span><span id="vb-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
+        <div class="flex items-center gap-2">
+          <button id="vb-bulk-chmod" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-200">🔒 chmod…</button>
+          <button id="vb-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>
+          <button id="vb-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
+        </div>
+      </div>
+
       <div id="vb-status" class="mb-2 hidden rounded px-3 py-2 text-xs"></div>
-      <div class="rounded border border-slate-800 bg-slate-950/60 overflow-hidden">
-        <div class="grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-400">
+
+      <div id="vb-table" class="relative rounded border border-slate-800 bg-slate-950/60 overflow-hidden">
+        <div class="grid ${GRID_COLS} gap-2 border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-400">
+          <div><input id="vb-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all on this page"/></div>
           <div>Name</div>
           <div class="text-right">Size</div>
           <div>Owner</div>
@@ -2159,16 +2176,40 @@ import { FitAddon } from '@xterm/addon-fit';
           <div class="text-right">Actions</div>
         </div>
         <div id="vb-list" class="max-h-[55vh] overflow-auto scroll-thin"></div>
+        <div id="vb-drop" class="pointer-events-none absolute inset-0 hidden items-center justify-center bg-sky-500/15 backdrop-blur-sm">
+          <div class="rounded-lg border-2 border-dashed border-sky-300 bg-slate-950/70 px-6 py-4 text-sm text-sky-200">
+            Drop file(s) to upload to <code class="text-sky-100" id="vb-drop-path">/</code>
+          </div>
+        </div>
       </div>
-      <div id="vb-foot" class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+
+      <div id="vb-foot" class="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
         <span id="vb-count">0 items</span>
+        <div id="vb-pager" class="flex items-center gap-1">
+          <label class="text-slate-400">Per page
+            <select id="vb-pagesize" class="ml-1 rounded border-slate-700 bg-slate-950 px-1 py-0.5 text-[11px]">
+              ${PAGE_SIZES.map((n) => `<option value="${n}">${n}</option>`).join('')}
+            </select>
+          </label>
+          <button id="vb-first" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="First page">«</button>
+          <button id="vb-prev"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Previous page">‹</button>
+          <span id="vb-page-info" class="px-2 text-slate-400">—</span>
+          <button id="vb-next"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Next page">›</button>
+          <button id="vb-last"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Last page">»</button>
+        </div>
         <span>Volume: <code class="text-slate-400">${escapeHtml(volumeName)}</code></span>
       </div>`;
 
+    // ---------- State ----------
     let cur = '/';
-    let lastEntries = [];
+    let lastEntries = [];        // page entries from the latest /list call
+    let total = 0;               // server-reported full directory count
+    let offset = 0;              // current page offset (entries-aligned)
+    let pageSize = 100;          // entries-per-page, see PAGE_SIZES
     let sortMode = 'name';
+    const selected = new Set();  // names selected on the current page
 
+    // ---------- Helpers ----------
     function setStatus(msg, kind = 'info') {
       const el = wrap.querySelector('#vb-status');
       if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
@@ -2201,17 +2242,20 @@ import { FitAddon } from '@xterm/addon-fit';
       }
       host.onclick = (e) => {
         const b = e.target.closest('button[data-path]');
-        if (b) load(b.dataset.path);
+        if (b) { offset = 0; selected.clear(); load(b.dataset.path); }
       };
     }
 
     function sortEntries(entries) {
+      // Local sort within the current page only. The page itself is whatever
+      // the server returned at (offset, offset+limit); sorting across pages
+      // would require asking the API for a stable ordering, which it doesn't
+      // currently support.
       const cmp = {
         name: (a, b) => a.name.localeCompare(b.name),
         size: (a, b) => (a.size || 0) - (b.size || 0),
         mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
-      }[sortMode] || ((a, b) => 0);
-      // Directories first, then symlinks, then files; secondary by chosen column.
+      }[sortMode] || (() => 0);
       return entries.slice().sort((a, b) => {
         const w = (e) => e.is_dir ? 0 : (e.is_link ? 1 : 2);
         return (w(a) - w(b)) || cmp(a, b);
@@ -2231,9 +2275,11 @@ import { FitAddon } from '@xterm/addon-fit';
         : (entry.is_link ? 'text-violet-300' : 'text-slate-200');
 
       const isText = !entry.is_dir && !entry.is_link;
+      const isChecked = selected.has(entry.name) ? 'checked' : '';
       return `
         <div data-name="${escapeHtml(entry.name)}" data-kind="${entry.is_dir ? 'dir' : (entry.is_link ? 'link' : 'file')}"
-             class="vb-row grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 items-center border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+             class="vb-row grid ${GRID_COLS} gap-2 items-center border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+          <div><input type="checkbox" class="vb-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-act="select" ${isChecked}/></div>
           <div class="flex items-center gap-2 min-w-0">
             <span>${_fileIcon(entry)}</span>
             <span class="${nameCls} truncate" data-act="navigate">${nameCell}</span>
@@ -2242,13 +2288,50 @@ import { FitAddon } from '@xterm/addon-fit';
           <div class="text-slate-400 truncate" title="${escapeHtml(entry.user)}:${escapeHtml(entry.group)}">${owner}</div>
           <div class="text-slate-500">${date}</div>
           <div class="text-slate-400 font-mono text-[11px]">${escapeHtml(perms)}</div>
-          <div class="flex justify-end gap-1 opacity-60 group-hover:opacity-100">
-            ${isText ? `<button data-act="view" title="View" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
-            <button data-act="dl" title="Download" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
-            <button data-act="rename" title="Rename" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
-            <button data-act="rm" title="Delete" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
+          <div class="flex justify-end gap-1">
+            ${isText ? `<button data-act="view"   title="View"    class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
+            <button data-act="dl"     title="Download"     class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
+            <button data-act="rename" title="Rename"       class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
+            <button data-act="chmod"  title="Permissions"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">🔒</button>
+            <button data-act="rm"     title="Delete"       class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
           </div>
         </div>`;
+    }
+
+    function renderPager() {
+      const pages = Math.max(1, Math.ceil(total / pageSize));
+      const cur1 = Math.floor(offset / pageSize) + 1;
+      const start = total === 0 ? 0 : offset + 1;
+      const end = Math.min(offset + lastEntries.length, total);
+      wrap.querySelector('#vb-page-info').textContent =
+        `${start}–${end} of ${total} (page ${cur1}/${pages})`;
+      wrap.querySelector('#vb-first').disabled = offset === 0;
+      wrap.querySelector('#vb-prev').disabled  = offset === 0;
+      wrap.querySelector('#vb-next').disabled  = end >= total;
+      wrap.querySelector('#vb-last').disabled  = end >= total;
+      // Disabled state styling
+      for (const id of ['vb-first', 'vb-prev', 'vb-next', 'vb-last']) {
+        const b = wrap.querySelector('#' + id);
+        b.classList.toggle('opacity-40', b.disabled);
+        b.classList.toggle('cursor-not-allowed', b.disabled);
+      }
+      wrap.querySelector('#vb-pagesize').value = String(pageSize);
+    }
+
+    function renderBulkToolbar() {
+      const bar = wrap.querySelector('#vb-bulk');
+      if (selected.size === 0) { bar.classList.add('hidden'); bar.classList.remove('flex'); return; }
+      bar.classList.remove('hidden'); bar.classList.add('flex');
+      wrap.querySelector('#vb-bulk-count').textContent = String(selected.size);
+    }
+
+    function syncSelectAllCheckbox() {
+      const cb = wrap.querySelector('#vb-select-all');
+      const total = lastEntries.length;
+      if (total === 0) { cb.checked = false; cb.indeterminate = false; return; }
+      const onPage = lastEntries.filter((e) => selected.has(e.name)).length;
+      cb.checked = onPage === total;
+      cb.indeterminate = onPage > 0 && onPage < total;
     }
 
     function render() {
@@ -2259,24 +2342,39 @@ import { FitAddon } from '@xterm/addon-fit';
       } else {
         host.innerHTML = sorted.map(rowFor).join('');
       }
-      wrap.querySelector('#vb-count').textContent = `${sorted.length} item${sorted.length === 1 ? '' : 's'}`;
+      const itemWord = `${sorted.length} item${sorted.length === 1 ? '' : 's'}`;
+      wrap.querySelector('#vb-count').textContent =
+        total > sorted.length ? `${itemWord} (of ${total})` : itemWord;
+      renderPager();
+      syncSelectAllCheckbox();
+      renderBulkToolbar();
     }
 
     async function load(path) {
-      cur = path || '/';
+      cur = path || cur || '/';
       renderCrumbs(cur);
       const host = wrap.querySelector('#vb-list');
       host.innerHTML = '<div class="px-3 py-3 text-xs text-slate-400">Loading…</div>';
       setStatus('');
       try {
-        const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?path=${encodeURIComponent(cur)}`);
+        const qs = new URLSearchParams({ path: cur, limit: String(pageSize), offset: String(offset) });
+        const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?${qs.toString()}`);
         cur = data.path || cur;
         renderCrumbs(cur);
         lastEntries = data.entries || [];
-        render();
-        if (data.total > lastEntries.length) {
-          setStatus(`Showing first ${lastEntries.length} of ${data.total} entries.`, 'info');
+        total = typeof data.total === 'number' ? data.total : lastEntries.length;
+        // Server clamps an out-of-range offset (e.g. user changes pageSize on
+        // page 7 of a small dir). If we asked beyond the end, rewind and reload.
+        if (offset >= total && total > 0) {
+          offset = Math.floor((total - 1) / pageSize) * pageSize;
+          return load(cur);
         }
+        // Drop selections that aren't on this page anymore (we don't track
+        // selections across pages — each page selection is independent).
+        for (const n of [...selected]) {
+          if (!lastEntries.some((e) => e.name === n)) selected.delete(n);
+        }
+        render();
       } catch (e) {
         host.innerHTML = '';
         setStatus(e.message, 'err');
@@ -2288,7 +2386,6 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     async function downloadUrl(p, endpoint = 'file') {
-      // Use fetch + blob (Authorization header can't go on <a href=>).
       const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`, {
         headers: { Authorization: authHeader() },
       });
@@ -2357,7 +2454,130 @@ import { FitAddon } from '@xterm/addon-fit';
       } catch (e) { toast(e.message, 'error'); }
     }
 
-    // Row click delegation: navigate (folder click), or per-row action.
+    // ---------- Chmod modal ----------
+    // Octal mode editor with three rwx triplet check-rows. Either side can be
+    // edited; both stay in sync.
+    async function openChmodEditor(names, { hasDir = false } = {}) {
+      const view = document.createElement('div');
+      const targetsLabel = names.length === 1
+        ? `<code class="text-slate-200">${escapeHtml(names[0])}</code>`
+        : `${names.length} items`;
+      view.innerHTML = `
+        <div class="space-y-3 text-xs text-slate-300">
+          <div>Target: ${targetsLabel}</div>
+          <div class="flex items-center gap-2">
+            <label>Octal mode</label>
+            <input id="chmod-mode" type="text" value="0644" maxlength="4"
+                   class="w-24 rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-sm uppercase tracking-wider"/>
+            <span class="text-slate-500" id="chmod-symbol">-rw-r--r--</span>
+          </div>
+          <table class="text-[11px]">
+            <thead><tr class="text-slate-500"><th></th><th class="px-2">read</th><th class="px-2">write</th><th class="px-2">exec</th></tr></thead>
+            <tbody>
+              ${['Owner','Group','Other'].map((label, i) => `
+                <tr><td class="pr-2 text-slate-400">${label}</td>
+                  ${['r','w','x'].map((perm) => `
+                    <td class="px-2 text-center"><input type="checkbox" class="chmod-bit h-3.5 w-3.5" data-who="${i}" data-perm="${perm}"/></td>
+                  `).join('')}
+                </tr>`).join('')}
+            </tbody>
+          </table>
+          ${hasDir ? `
+            <label class="flex items-center gap-2 text-slate-300">
+              <input id="chmod-recursive" type="checkbox" class="h-3.5 w-3.5"/>
+              Apply recursively (chmod -R) — required to descend into folders.
+            </label>` : ''}
+        </div>`;
+
+      // Mode <-> checkboxes sync.
+      const PERM_BIT = { r: 4, w: 2, x: 1 };
+      const modeInput = view.querySelector('#chmod-mode');
+      const symbol = view.querySelector('#chmod-symbol');
+      const bits = view.querySelectorAll('.chmod-bit');
+
+      function modeToTriplets(octal) {
+        const digits = octal.padStart(4, '0').slice(-3);
+        return [...digits].map((d) => parseInt(d, 10) & 7);
+      }
+      function tripletsToSymbol(trips) {
+        const t = (d) => ((d & 4) ? 'r' : '-') + ((d & 2) ? 'w' : '-') + ((d & 1) ? 'x' : '-');
+        return '-' + trips.map(t).join('');
+      }
+      function syncFromMode() {
+        const raw = modeInput.value.trim();
+        if (!/^0?[0-7]{3,4}$/.test(raw)) { symbol.textContent = 'invalid'; symbol.className = 'text-rose-300'; return; }
+        symbol.className = 'text-slate-500';
+        const trips = modeToTriplets(raw);
+        for (const cb of bits) {
+          const w = +cb.dataset.who, p = cb.dataset.perm;
+          cb.checked = !!(trips[w] & PERM_BIT[p]);
+        }
+        symbol.textContent = tripletsToSymbol(trips);
+      }
+      function syncFromBits() {
+        const trips = [0, 0, 0];
+        for (const cb of bits) {
+          const w = +cb.dataset.who, p = cb.dataset.perm;
+          if (cb.checked) trips[w] |= PERM_BIT[p];
+        }
+        modeInput.value = '0' + trips.join('');
+        symbol.textContent = tripletsToSymbol(trips);
+      }
+      modeInput.addEventListener('input', syncFromMode);
+      for (const cb of bits) cb.addEventListener('change', syncFromBits);
+      syncFromMode();
+
+      const action = await modal({
+        title: names.length === 1 ? `chmod ${names[0]}` : `chmod (${names.length} items)`,
+        body: view, size: 'sm',
+        actions: [
+          { label: 'Apply', kind: 'primary', value: 'ok' },
+          { label: 'Cancel', kind: 'secondary', value: null },
+        ],
+      });
+      if (action !== 'ok') return false;
+      const mode = modeInput.value.trim();
+      if (!/^0?[0-7]{3,4}$/.test(mode)) { toast('Invalid mode', 'warn'); return false; }
+      const recursive = !!(view.querySelector('#chmod-recursive') && view.querySelector('#chmod-recursive').checked);
+      let ok = 0, fail = 0;
+      for (const n of names) {
+        try {
+          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod`, {
+            method: 'POST',
+            body: JSON.stringify({ path: childPath(n), mode, recursive }),
+          });
+          ok += 1;
+        } catch (e) { fail += 1; toast(`chmod ${n}: ${e.message}`, 'error'); }
+      }
+      if (ok) toast(`chmod applied to ${ok} item${ok === 1 ? '' : 's'}`, 'success');
+      if (ok) await load(cur);
+      return ok > 0 && fail === 0;
+    }
+
+    // ---------- Upload ----------
+    async function uploadFiles(files) {
+      if (!files || !files.length) return;
+      let ok = 0, fail = 0;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setStatus(`Uploading ${file.name} (${i + 1}/${files.length})…`);
+        const fd = new FormData(); fd.append('file', file);
+        try {
+          const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
+            method: 'POST',
+            headers: { Authorization: authHeader() },
+            body: fd,
+          });
+          if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
+          ok += 1;
+        } catch (ex) { fail += 1; toast(`${file.name}: ${ex.message}`, 'error'); }
+      }
+      setStatus('');
+      if (ok) toast(`Uploaded ${ok} file${ok === 1 ? '' : 's'}${fail ? ` (${fail} failed)` : ''}`, fail ? 'warn' : 'success');
+      await load(cur);
+    }
+
+    // ---------- Row interactions ----------
     wrap.querySelector('#vb-list').addEventListener('click', async (e) => {
       const row = e.target.closest('.vb-row');
       if (!row) return;
@@ -2367,6 +2587,12 @@ import { FitAddon } from '@xterm/addon-fit';
       const actEl = e.target.closest('[data-act]');
       const act = actEl?.dataset.act;
       try {
+        if (act === 'select') {
+          // Checkbox handles its own state via the change event; intercept the
+          // click so it doesn't bubble up and trigger navigate.
+          e.stopPropagation();
+          return;
+        }
         if (act === 'rm') {
           const ok = await confirmModal(`Delete <code>${escapeHtml(name)}</code>? This cannot be undone.`, { danger: true, confirmLabel: 'Delete' });
           if (!ok) return;
@@ -2379,25 +2605,75 @@ import { FitAddon } from '@xterm/addon-fit';
           triggerDownload(blob, kind === 'dir' ? `${name}.tar` : name);
           return;
         }
-        if (act === 'view') {
-          return openViewer(name, child);
-        }
-        if (act === 'rename') {
-          return renameAt(name);
-        }
+        if (act === 'view') return openViewer(name, child);
+        if (act === 'rename') return renameAt(name);
+        if (act === 'chmod') return openChmodEditor([name], { hasDir: kind === 'dir' });
         if (act === 'navigate' || !act) {
-          // Name-cell click: navigate into folders; preview text files.
-          if (kind === 'dir') return load(child);
+          if (kind === 'dir') { offset = 0; selected.clear(); return load(child); }
           if (kind === 'file') return openViewer(name, child);
           // Symlinks: stay put; user has to click an action explicitly.
         }
       } catch (ex) { toast(ex.message, 'error'); }
     });
 
-    wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
-      sortMode = e.target.value;
+    // Selection: per-row checkbox change updates the set + bulk toolbar.
+    wrap.querySelector('#vb-list').addEventListener('change', (e) => {
+      const cb = e.target.closest('input.vb-check');
+      if (!cb) return;
+      const row = cb.closest('.vb-row');
+      if (!row) return;
+      const name = row.dataset.name;
+      if (cb.checked) selected.add(name); else selected.delete(name);
+      syncSelectAllCheckbox();
+      renderBulkToolbar();
+    });
+
+    wrap.querySelector('#vb-select-all').addEventListener('change', (e) => {
+      if (e.target.checked) {
+        for (const ent of lastEntries) selected.add(ent.name);
+      } else {
+        for (const ent of lastEntries) selected.delete(ent.name);
+      }
+      // Re-render rows so their checkbox states match (cheaper than per-row).
       render();
     });
+
+    // ---------- Bulk actions ----------
+    wrap.querySelector('#vb-bulk-clear').onclick = () => { selected.clear(); render(); };
+
+    wrap.querySelector('#vb-bulk-rm').onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const ok = await confirmModal(
+        `Delete <strong>${names.length}</strong> selected item${names.length === 1 ? '' : 's'}? This cannot be undone.`,
+        { danger: true, confirmLabel: 'Delete all' },
+      );
+      if (!ok) return;
+      let success = 0, fail = 0;
+      for (const n of names) {
+        try {
+          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(childPath(n))}`, { method: 'DELETE' });
+          success += 1;
+        } catch (e) { fail += 1; toast(`${n}: ${e.message}`, 'error'); }
+      }
+      if (success) toast(`Deleted ${success}${fail ? ` of ${names.length}` : ''}`, fail ? 'warn' : 'success');
+      selected.clear();
+      load(cur);
+    };
+
+    wrap.querySelector('#vb-bulk-chmod').onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const hasDir = lastEntries.some((e) => names.includes(e.name) && e.is_dir);
+      await openChmodEditor(names, { hasDir });
+    };
+
+    // ---------- Toolbar / sort / refresh / stop ----------
+    wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
+      sortMode = e.target.value; render();
+    });
+
+    wrap.querySelector('#vb-refresh').onclick = () => load(cur);
 
     wrap.querySelector('#vb-mkdir').onclick = async () => {
       const name = window.prompt('New folder name:');
@@ -2410,20 +2686,8 @@ import { FitAddon } from '@xterm/addon-fit';
     };
 
     wrap.querySelector('#vb-upload').addEventListener('change', async (e) => {
-      const file = e.target.files[0]; if (!file) return;
-      setStatus(`Uploading ${file.name}…`);
-      const fd = new FormData();
-      fd.append('file', file);
-      try {
-        const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
-          method: 'POST',
-          headers: { Authorization: authHeader() },
-          body: fd,
-        });
-        if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
-        toast(`Uploaded ${file.name}`, 'success'); setStatus('');
-        load(cur);
-      } catch (ex) { setStatus(ex.message, 'err'); }
+      const files = [...(e.target.files || [])];
+      if (files.length) await uploadFiles(files);
       e.target.value = '';
     });
 
@@ -2442,6 +2706,76 @@ import { FitAddon } from '@xterm/addon-fit';
       } catch (ex) { toast(ex.message, 'error'); }
     };
 
+    // ---------- Pagination ----------
+    wrap.querySelector('#vb-pagesize').addEventListener('change', (e) => {
+      pageSize = parseInt(e.target.value, 10) || 100;
+      offset = 0;
+      selected.clear();
+      load(cur);
+    });
+    wrap.querySelector('#vb-first').onclick = () => {
+      if (offset === 0) return;
+      offset = 0; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-prev').onclick = () => {
+      const next = Math.max(0, offset - pageSize);
+      if (next === offset) return;
+      offset = next; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-next').onclick = () => {
+      const next = offset + pageSize;
+      if (next >= total) return;
+      offset = next; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-last').onclick = () => {
+      const lastPage = Math.max(0, Math.floor((total - 1) / pageSize)) * pageSize;
+      if (lastPage === offset) return;
+      offset = lastPage; selected.clear(); load(cur);
+    };
+
+    // ---------- Drag-and-drop upload ----------
+    // Highlights the table overlay during drag, and triggers a multi-file
+    // upload on drop. Uses a depth counter so child-element dragenter/leave
+    // pairs don't flicker the overlay.
+    {
+      const table = wrap.querySelector('#vb-table');
+      const drop  = wrap.querySelector('#vb-drop');
+      const dropPath = wrap.querySelector('#vb-drop-path');
+      let depth = 0;
+      const showOverlay = () => {
+        dropPath.textContent = cur;
+        drop.classList.remove('hidden');
+        drop.classList.add('flex');
+      };
+      const hideOverlay = () => {
+        drop.classList.add('hidden');
+        drop.classList.remove('flex');
+      };
+      table.addEventListener('dragenter', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+        depth += 1; if (depth === 1) showOverlay();
+      });
+      table.addEventListener('dragover', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      });
+      table.addEventListener('dragleave', () => {
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) hideOverlay();
+      });
+      table.addEventListener('drop', async (e) => {
+        if (!e.dataTransfer) return;
+        const files = [...(e.dataTransfer.files || [])];
+        if (!files.length) return;
+        e.preventDefault();
+        depth = 0; hideOverlay();
+        await uploadFiles(files);
+      });
+    }
+
+    // ---------- Boot ----------
     setStatus(`A small "${state.config.browser_image}" sidecar will be started with this volume mounted at /target. Click "Stop sidecar" when done.`, 'info');
     load('/');
 
