@@ -2096,24 +2096,78 @@ import { FitAddon } from '@xterm/addon-fit';
     return await modal({ title: `Stack: ${name}`, body: wrap, size: 'xl', actions }) === true;
   }
 
-  // ---------- Volume browser ----------
+  // ---------- Volume file manager (Portainer-style) ----------
+  //
+  // Layout:
+  //   [breadcrumb] [+ New folder] [⤒ Upload] [Stop sidecar]   [Sort: ▼]
+  //   ┌─────────────────────────────────────────────────────────────┐
+  //   │ NAME            SIZE   OWNER     MODIFIED       PERMS  ⋯  │
+  //   │ 📁 ..                                                       │
+  //   │ 📁 logs         —      root:root Apr 21 12:34   drwxr-xr-x  │
+  //   │ 📄 nginx.conf   2.1KB  root:root Apr 21 12:34   -rw-r--r--  │
+  //   │ 🔗 link → /etc  —      root:root Apr 21         lrwxrwxrwx  │
+  //   └─────────────────────────────────────────────────────────────┘
+  function _fileIcon(entry) {
+    if (entry.is_link) return '🔗';
+    if (entry.is_dir) return '📁';
+    // Cheap extension heuristic — purely cosmetic.
+    const ext = (entry.name.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase() || '';
+    if (['txt','md','log','yaml','yml','json','xml','toml','ini','conf'].includes(ext)) return '📝';
+    if (['png','jpg','jpeg','gif','svg','webp','ico','bmp'].includes(ext)) return '🖼️';
+    if (['zip','tar','gz','bz2','xz','7z','rar'].includes(ext)) return '📦';
+    if (['sh','bash','zsh','py','js','ts','rb','go','rs','c','h','cpp'].includes(ext)) return '⚙️';
+    if (['pdf'].includes(ext)) return '📕';
+    return '📄';
+  }
+
+  function _fmtDateShort(epoch) {
+    if (!epoch) return '';
+    const d = new Date(epoch * 1000);
+    if (isNaN(d.getTime())) return '';
+    const now = new Date();
+    const sameYear = d.getFullYear() === now.getFullYear();
+    return sameYear
+      ? d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: '2-digit' });
+  }
+
   async function openVolumeBrowser(volumeName) {
     const wrap = document.createElement('div');
     wrap.innerHTML = `
       <div class="mb-3 flex flex-wrap items-center gap-2">
-        <button id="vb-up" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">↑ Up</button>
-        <input id="vb-path" value="/" class="flex-1 min-w-[200px] rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
-        <button id="vb-go" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">Go</button>
-        <button id="vb-mkdir" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">+ New folder</button>
-        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer">⤒ Upload
+        <div id="vb-crumbs" class="flex flex-1 min-w-[280px] flex-wrap items-center gap-1 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs"></div>
+        <button id="vb-mkdir" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="New folder">+ Folder</button>
+        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer" title="Upload file">⤒ Upload
           <input id="vb-upload" type="file" class="hidden"/>
         </label>
-        <button id="vb-stop" class="ml-auto rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700">Stop sidecar</button>
+        <button id="vb-dl-folder" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Download current folder as tar">⤓ tar</button>
+        <select id="vb-sort" class="rounded border-slate-700 bg-slate-950 px-1 py-1 text-xs" title="Sort order">
+          <option value="name">Sort: Name</option>
+          <option value="size">Sort: Size</option>
+          <option value="mtime">Sort: Modified</option>
+        </select>
+        <button id="vb-stop" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Stop the sidecar container">Stop sidecar</button>
       </div>
-      <div id="vb-status" class="mb-2 hidden rounded bg-slate-800/60 px-3 py-2 text-xs text-slate-300"></div>
-      <div id="vb-list" class="rounded border border-slate-800 bg-slate-950/60 max-h-[55vh] overflow-auto scroll-thin"></div>`;
+      <div id="vb-status" class="mb-2 hidden rounded px-3 py-2 text-xs"></div>
+      <div class="rounded border border-slate-800 bg-slate-950/60 overflow-hidden">
+        <div class="grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-400">
+          <div>Name</div>
+          <div class="text-right">Size</div>
+          <div>Owner</div>
+          <div>Modified</div>
+          <div class="font-mono">Perms</div>
+          <div class="text-right">Actions</div>
+        </div>
+        <div id="vb-list" class="max-h-[55vh] overflow-auto scroll-thin"></div>
+      </div>
+      <div id="vb-foot" class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+        <span id="vb-count">0 items</span>
+        <span>Volume: <code class="text-slate-400">${escapeHtml(volumeName)}</code></span>
+      </div>`;
 
     let cur = '/';
+    let lastEntries = [];
+    let sortMode = 'name';
 
     function setStatus(msg, kind = 'info') {
       const el = wrap.querySelector('#vb-status');
@@ -2126,38 +2180,102 @@ import { FitAddon } from '@xterm/addon-fit';
         : 'bg-slate-800/60 text-slate-300');
     }
 
+    function renderCrumbs(path) {
+      const host = wrap.querySelector('#vb-crumbs');
+      host.innerHTML = '';
+      const segments = path.split('/').filter(Boolean);
+      const root = document.createElement('button');
+      root.textContent = '🏠 /';
+      root.dataset.path = '/';
+      root.className = 'rounded px-1.5 py-0.5 text-slate-300 hover:bg-slate-800';
+      host.appendChild(root);
+      let acc = '';
+      for (let i = 0; i < segments.length; i++) {
+        acc = acc + '/' + segments[i];
+        const sep = document.createElement('span'); sep.textContent = '›'; sep.className = 'text-slate-600'; host.appendChild(sep);
+        const b = document.createElement('button');
+        b.textContent = segments[i];
+        b.dataset.path = acc;
+        b.className = 'rounded px-1.5 py-0.5 text-slate-300 hover:bg-slate-800';
+        host.appendChild(b);
+      }
+      host.onclick = (e) => {
+        const b = e.target.closest('button[data-path]');
+        if (b) load(b.dataset.path);
+      };
+    }
+
+    function sortEntries(entries) {
+      const cmp = {
+        name: (a, b) => a.name.localeCompare(b.name),
+        size: (a, b) => (a.size || 0) - (b.size || 0),
+        mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
+      }[sortMode] || ((a, b) => 0);
+      // Directories first, then symlinks, then files; secondary by chosen column.
+      return entries.slice().sort((a, b) => {
+        const w = (e) => e.is_dir ? 0 : (e.is_link ? 1 : 2);
+        return (w(a) - w(b)) || cmp(a, b);
+      });
+    }
+
     function rowFor(entry) {
-      const icon = entry.is_dir ? '📁' : (entry.is_link ? '🔗' : '📄');
-      const sizeCol = entry.is_dir ? '' : fmtBytes(entry.size);
-      const date = entry.mtime ? new Date(entry.mtime * 1000).toLocaleString() : '';
+      const owner = `${escapeHtml(entry.user || entry.uid)}:${escapeHtml(entry.group || entry.gid)}`;
+      const sizeCol = entry.is_dir ? '—' : fmtBytes(entry.size);
+      const date = _fmtDateShort(entry.mtime);
+      const perms = entry.mode_str || '';
+      const nameCell = entry.is_link && entry.link_target
+        ? `${escapeHtml(entry.name)} <span class="text-slate-500">→ ${escapeHtml(entry.link_target)}</span>`
+        : escapeHtml(entry.name);
+      const nameCls = entry.is_dir
+        ? 'text-sky-300 cursor-pointer'
+        : (entry.is_link ? 'text-violet-300' : 'text-slate-200');
+
+      const isText = !entry.is_dir && !entry.is_link;
       return `
-        <div data-name="${escapeHtml(entry.name)}" data-dir="${entry.is_dir ? '1' : ''}" class="vb-row flex items-center gap-3 border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
-          <span>${icon}</span>
-          <span class="flex-1 ${entry.is_dir ? 'text-sky-300 cursor-pointer' : 'text-slate-200'} truncate">${escapeHtml(entry.name)}</span>
-          <span class="w-24 text-right text-slate-400 font-mono">${sizeCol}</span>
-          <span class="w-44 text-right text-slate-500">${date}</span>
-          <span class="flex gap-1">
-            ${entry.is_dir ? '' : `<button data-act="dl" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-0.5 border border-slate-700">Download</button>`}
-            <button data-act="rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-0.5">Delete</button>
-          </span>
+        <div data-name="${escapeHtml(entry.name)}" data-kind="${entry.is_dir ? 'dir' : (entry.is_link ? 'link' : 'file')}"
+             class="vb-row grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 items-center border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+          <div class="flex items-center gap-2 min-w-0">
+            <span>${_fileIcon(entry)}</span>
+            <span class="${nameCls} truncate" data-act="navigate">${nameCell}</span>
+          </div>
+          <div class="text-right text-slate-400 font-mono">${sizeCol}</div>
+          <div class="text-slate-400 truncate" title="${escapeHtml(entry.user)}:${escapeHtml(entry.group)}">${owner}</div>
+          <div class="text-slate-500">${date}</div>
+          <div class="text-slate-400 font-mono text-[11px]">${escapeHtml(perms)}</div>
+          <div class="flex justify-end gap-1 opacity-60 group-hover:opacity-100">
+            ${isText ? `<button data-act="view" title="View" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
+            <button data-act="dl" title="Download" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
+            <button data-act="rename" title="Rename" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
+            <button data-act="rm" title="Delete" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
+          </div>
         </div>`;
+    }
+
+    function render() {
+      const sorted = sortEntries(lastEntries);
+      const host = wrap.querySelector('#vb-list');
+      if (!sorted.length) {
+        host.innerHTML = '<div class="px-3 py-10 text-center text-xs text-slate-500">Empty directory</div>';
+      } else {
+        host.innerHTML = sorted.map(rowFor).join('');
+      }
+      wrap.querySelector('#vb-count').textContent = `${sorted.length} item${sorted.length === 1 ? '' : 's'}`;
     }
 
     async function load(path) {
       cur = path || '/';
-      wrap.querySelector('#vb-path').value = cur;
+      renderCrumbs(cur);
       const host = wrap.querySelector('#vb-list');
       host.innerHTML = '<div class="px-3 py-3 text-xs text-slate-400">Loading…</div>';
       setStatus('');
       try {
         const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?path=${encodeURIComponent(cur)}`);
         cur = data.path || cur;
-        wrap.querySelector('#vb-path').value = cur;
-        const entries = data.entries || [];
-        if (!entries.length) {
-          host.innerHTML = '<div class="px-3 py-6 text-center text-xs text-slate-500">Empty</div>';
-        } else {
-          host.innerHTML = entries.map(rowFor).join('');
+        renderCrumbs(cur);
+        lastEntries = data.entries || [];
+        render();
+        if (data.total > lastEntries.length) {
+          setStatus(`Showing first ${lastEntries.length} of ${data.total} entries.`, 'info');
         }
       } catch (e) {
         host.innerHTML = '';
@@ -2165,55 +2283,128 @@ import { FitAddon } from '@xterm/addon-fit';
       }
     }
 
+    function childPath(name) {
+      return (cur === '/' ? '/' : cur + '/') + name;
+    }
+
+    async function downloadUrl(p, endpoint = 'file') {
+      // Use fetch + blob (Authorization header can't go on <a href=>).
+      const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`, {
+        headers: { Authorization: authHeader() },
+      });
+      if (!res.ok) {
+        let det = res.statusText;
+        try { det = (await res.json()).detail || det; } catch {}
+        throw new Error(`Download failed: ${det}`);
+      }
+      return res.blob();
+    }
+
+    function triggerDownload(blob, filename) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    async function openViewer(name, p) {
+      let payload;
+      try {
+        payload = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/view?path=${encodeURIComponent(p)}`);
+      } catch (e) { toast(e.message, 'error'); return; }
+      const view = document.createElement('div');
+      if (payload.is_binary) {
+        view.innerHTML = `
+          <div class="rounded border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">
+            <p>This file looks binary (contains null bytes in the first 8 KB) — preview unavailable.</p>
+            <p class="mt-2">Size: <span class="font-mono">${fmtBytes(payload.size)}</span></p>
+          </div>`;
+      } else {
+        view.innerHTML = `
+          <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
+            <span>${fmtBytes(payload.size)} · encoding: ${escapeHtml(payload.encoding || 'utf-8')}${payload.truncated ? ' · <span class="text-amber-400">truncated to 1 MB</span>' : ''}</span>
+          </div>
+          <pre class="log-pane h-[60vh] overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-200"></pre>`;
+        view.querySelector('pre').textContent = payload.content || '';
+      }
+      await modal({
+        title: `View: ${name}`,
+        body: view, size: 'xl',
+        actions: [
+          { label: 'Download', kind: 'secondary', value: 'dl' },
+          { label: 'Close', value: null, kind: 'secondary' },
+        ],
+      }).then(async (action) => {
+        if (action === 'dl') {
+          try { triggerDownload(await downloadUrl(p), name); }
+          catch (e) { toast(e.message, 'error'); }
+        }
+      });
+    }
+
+    async function renameAt(oldName) {
+      const next = window.prompt(`Rename "${oldName}" to:`, oldName);
+      if (!next || next === oldName) return;
+      if (next.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
+      const from = childPath(oldName);
+      const to = childPath(next);
+      try {
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/rename`, {
+          method: 'POST',
+          body: JSON.stringify({ from, to }),
+        });
+        toast('Renamed', 'success'); load(cur);
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    // Row click delegation: navigate (folder click), or per-row action.
     wrap.querySelector('#vb-list').addEventListener('click', async (e) => {
       const row = e.target.closest('.vb-row');
       if (!row) return;
       const name = row.dataset.name;
-      const isDir = row.dataset.dir === '1';
-      const child = (cur === '/' ? '/' : cur + '/') + name;
-      const act = e.target.closest('[data-act]')?.dataset.act;
-      if (act === 'rm') {
-        const ok = await confirmModal(`Delete ${name}?`, { danger: true, confirmLabel: 'Delete' });
-        if (!ok) return;
-        try {
+      const kind = row.dataset.kind;
+      const child = childPath(name);
+      const actEl = e.target.closest('[data-act]');
+      const act = actEl?.dataset.act;
+      try {
+        if (act === 'rm') {
+          const ok = await confirmModal(`Delete <code>${escapeHtml(name)}</code>? This cannot be undone.`, { danger: true, confirmLabel: 'Delete' });
+          if (!ok) return;
           await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(child)}`, { method: 'DELETE' });
-          toast('Deleted', 'success'); load(cur);
-        } catch (ex) { toast(ex.message, 'error'); }
-        return;
-      }
-      if (act === 'dl') {
-        try {
-          const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(child)}`, {
-            headers: { Authorization: authHeader() },
-          });
-          if (!res.ok) throw new Error(`Download failed (${res.status})`);
-          const blob = await res.blob();
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob); a.download = name;
-          document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-        } catch (ex) { toast(ex.message, 'error'); }
-        return;
-      }
-      if (isDir) load(child);
+          toast('Deleted', 'success'); return load(cur);
+        }
+        if (act === 'dl') {
+          const endpoint = kind === 'dir' ? 'archive' : 'file';
+          const blob = await downloadUrl(child, endpoint);
+          triggerDownload(blob, kind === 'dir' ? `${name}.tar` : name);
+          return;
+        }
+        if (act === 'view') {
+          return openViewer(name, child);
+        }
+        if (act === 'rename') {
+          return renameAt(name);
+        }
+        if (act === 'navigate' || !act) {
+          // Name-cell click: navigate into folders; preview text files.
+          if (kind === 'dir') return load(child);
+          if (kind === 'file') return openViewer(name, child);
+          // Symlinks: stay put; user has to click an action explicitly.
+        }
+      } catch (ex) { toast(ex.message, 'error'); }
     });
 
-    wrap.querySelector('#vb-up').onclick = () => {
-      if (cur === '/' || cur === '') return;
-      const idx = cur.replace(/\/+$/, '').lastIndexOf('/');
-      load(idx <= 0 ? '/' : cur.slice(0, idx));
-    };
-    wrap.querySelector('#vb-go').onclick = () => load(wrap.querySelector('#vb-path').value || '/');
-    wrap.querySelector('#vb-path').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); load(wrap.querySelector('#vb-path').value || '/'); }
+    wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
+      sortMode = e.target.value;
+      render();
     });
 
     wrap.querySelector('#vb-mkdir').onclick = async () => {
-      const name = prompt('New folder name:');
+      const name = window.prompt('New folder name:');
       if (!name) return;
-      const child = (cur === '/' ? '/' : cur + '/') + name;
+      if (name.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
       try {
-        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(child)}`, { method: 'POST' });
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(childPath(name))}`, { method: 'POST' });
         toast('Folder created', 'success'); load(cur);
       } catch (ex) { toast(ex.message, 'error'); }
     };
@@ -2230,11 +2421,19 @@ import { FitAddon } from '@xterm/addon-fit';
           body: fd,
         });
         if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
-        toast('Uploaded', 'success'); setStatus('');
+        toast(`Uploaded ${file.name}`, 'success'); setStatus('');
         load(cur);
       } catch (ex) { setStatus(ex.message, 'err'); }
       e.target.value = '';
     });
+
+    wrap.querySelector('#vb-dl-folder').onclick = async () => {
+      try {
+        const blob = await downloadUrl(cur === '/' ? '/' : cur, 'archive');
+        const fname = (cur === '/' ? volumeName : (cur.split('/').pop() || volumeName));
+        triggerDownload(blob, `${fname}.tar`);
+      } catch (e) { toast(e.message, 'error'); }
+    };
 
     wrap.querySelector('#vb-stop').onclick = async () => {
       try {
