@@ -1965,13 +1965,50 @@ import { FitAddon } from '@xterm/addon-fit';
     };
     const createBtn = document.getElementById('create-vol');
     if (createBtn) createBtn.onclick = async () => {
+      // Discover the daemon's actually-installed volume drivers so we
+      // can render a useful dropdown instead of a free-text input.
+      // `docker info` always reports `Plugins.Volume = ["local", ...]`
+      // (built-in `local` plus any plugin-installed volume drivers).
+      // We deduplicate, sort, and fall back to `["local"]` if the
+      // call fails or the daemon returns an empty list — `local` is
+      // always available because it's compiled into the daemon.
+      let drivers = ['local'];
+      try {
+        const info = await api('/api/system/info');
+        const reported = (info && info.Plugins && Array.isArray(info.Plugins.Volume))
+          ? info.Plugins.Volume.filter(Boolean)
+          : [];
+        const merged = new Set(['local', ...reported]);
+        drivers = [...merged].sort((a, b) => {
+          // Always show the built-in `local` first; other plugins
+          // sorted alphabetically below.
+          if (a === 'local') return -1;
+          if (b === 'local') return 1;
+          return a.localeCompare(b);
+        });
+      } catch { /* fall back to ['local'] */ }
+
       const wrap = document.createElement('div');
+      const driverOptions = drivers.map((d) =>
+        `<option value="${escapeHtml(d)}">${escapeHtml(d)}${d === 'local' ? ' (built-in)' : ''}</option>`
+      ).join('');
       wrap.innerHTML = `
         <div class="grid gap-3 md:grid-cols-2">
           <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Name *</span>
             <input id="v-name" required class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
-          <label class="block"><span class="text-xs text-slate-400">Driver</span>
-            <input id="v-driver" value="local" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Driver</span>
+            <select id="v-driver" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+              ${driverOptions}
+              <option value="__custom__">Other (specify…)</option>
+            </select>
+            <input id="v-driver-custom" placeholder="my-custom-driver"
+                   class="mt-2 hidden w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+            <span class="block mt-1 text-[11px] text-slate-500">
+              Loaded from <code>docker info</code> · <code>Plugins.Volume</code>.
+              Install a volume plugin (<code>docker plugin install &lt;name&gt;</code>) to see it here.
+            </span>
+          </label>
           <label class="block"><span class="text-xs text-slate-400">Driver options (KEY=VALUE per line)</span>
             <textarea id="v-driveropts" rows="3" placeholder="type=nfs&#10;o=addr=1.2.3.4,rw&#10;device=:/exports/data"
                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
@@ -1979,6 +2016,17 @@ import { FitAddon } from '@xterm/addon-fit';
             <textarea id="v-labels" rows="3" placeholder="owner=team-a&#10;tier=prod"
                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
         </div>`;
+
+      // Toggle the custom-driver text field based on the dropdown:
+      // hidden whenever a known driver is picked, revealed and focused
+      // when the user picks "Other (specify…)".
+      const driverSelect = wrap.querySelector('#v-driver');
+      const driverCustom = wrap.querySelector('#v-driver-custom');
+      driverSelect.addEventListener('change', () => {
+        const custom = driverSelect.value === '__custom__';
+        driverCustom.classList.toggle('hidden', !custom);
+        if (custom) setTimeout(() => driverCustom.focus(), 0);
+      });
 
       function parseKv(text) {
         const out = {};
@@ -2000,9 +2048,12 @@ import { FitAddon } from '@xterm/addon-fit';
         actions: [
           { label: 'Cancel', value: false, kind: 'secondary' },
           { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+            const driverChoice = driverSelect.value === '__custom__'
+              ? driverCustom.value.trim()
+              : driverSelect.value;
             const payload = {
               name: wrap.querySelector('#v-name').value.trim(),
-              driver: wrap.querySelector('#v-driver').value.trim() || 'local',
+              driver: driverChoice || 'local',
               labels: parseKv(wrap.querySelector('#v-labels').value),
               driver_opts: parseKv(wrap.querySelector('#v-driveropts').value),
             };
@@ -2011,6 +2062,12 @@ import { FitAddon } from '@xterm/addon-fit';
             // review). Stays loose — server is the source of truth.
             if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(payload.name)) {
               toast('Invalid name: must start with a letter or digit and contain only [A-Za-z0-9_.-]', 'warn');
+              return false;
+            }
+            // If "Other" was picked but left blank, refuse with an
+            // inline error instead of silently falling back to `local`.
+            if (driverSelect.value === '__custom__' && !payload.driver) {
+              toast('Custom driver name is required when "Other" is selected', 'warn');
               return false;
             }
             try {
