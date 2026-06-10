@@ -109,6 +109,7 @@ describe('Volume browser schemas', () => {
       isValidView({
         path: '/foo.txt',
         size: 7,
+        mtime: 1781040000.5,
         is_binary: false,
         truncated: false,
         encoding: 'utf-8',
@@ -122,10 +123,20 @@ describe('Volume browser schemas', () => {
       isValidView({
         path: '/foo.bin',
         size: 12_000,
+        mtime: 1781040000.5,
         is_binary: true,
         truncated: false,
       }),
     ).toBe(true);
+  });
+
+  it('VolumeBrowseViewResponse: requires mtime (for optimistic-concurrency token)', () => {
+    expect(
+      isValidView({
+        path: '/foo.txt', size: 7, is_binary: false, truncated: false,
+        encoding: 'utf-8', content: 'hi',
+      }),
+    ).toBe(false);
   });
 
   it('VolumeBrowseChmodRequest accepts canonical octal modes', () => {
@@ -303,12 +314,82 @@ describe('Volume browser schemas', () => {
     })).toBe(false);
   });
 
+  // #10: VolumeDetail = VolumeSummary fields + raw payload.
+  it('VolumeDetail requires both the summary shape AND a raw field', () => {
+    const summary = {
+      name: 'v', driver: 'local', mountpoint: '/p', scope: 'local',
+      labels: {}, options: {}, in_use: false, used_by: [],
+    };
+    expect(valid(S.VolumeDetail, { ...summary, raw: { Name: 'v', Driver: 'local' } })).toBe(true);
+    expect(valid(S.VolumeDetail, summary)).toBe(false); // missing raw
+  });
+
+  // #19: list query schema accepts the new sort params with enum bounds.
+  it('VolumeBrowseListQuery accepts sort/order/dirs_first', () => {
+    const q = (p) => valid(S.VolumeBrowseListQuery, p);
+    expect(q({})).toBe(true);
+    expect(q({ path: '/', limit: 100, offset: 0, sort: 'name', order: 'asc' })).toBe(true);
+    expect(q({ sort: 'size', order: 'desc' })).toBe(true);
+    expect(q({ sort: 'mtime', order: 'asc', dirs_first: false })).toBe(true);
+    expect(q({ sort: 'bogus' })).toBe(false);
+    expect(q({ order: 'sideways' })).toBe(false);
+  });
+
   it('VolumeBulkDeleteRequest enforces min/max items', () => {
     expect(valid(S.VolumeBulkDeleteRequest, { names: ['a'] })).toBe(true);
     expect(valid(S.VolumeBulkDeleteRequest, { names: ['a', 'b'], force: true })).toBe(true);
     expect(valid(S.VolumeBulkDeleteRequest, { names: [] })).toBe(false);
     const tooMany = Array.from({ length: 1001 }, (_, i) => `v${i}`);
     expect(valid(S.VolumeBulkDeleteRequest, { names: tooMany })).toBe(false);
+  });
+
+  // #31: CreateVolumeRequest validation (was untested).
+  it('CreateVolumeRequest accepts a minimal payload', () => {
+    expect(valid(S.CreateVolumeRequest, { name: 'my-vol' })).toBe(true);
+  });
+
+  it('CreateVolumeRequest accepts all fields', () => {
+    expect(valid(S.CreateVolumeRequest, {
+      name: 'vol-1', driver: 'local',
+      labels: { 'com.example.tier': 'prod' },
+      driver_opts: { type: 'nfs', o: 'addr=1.2.3.4,rw', device: ':/exports/data' },
+    })).toBe(true);
+  });
+
+  it('CreateVolumeRequest rejects names that do not match the regex', () => {
+    expect(valid(S.CreateVolumeRequest, { name: '' })).toBe(false);
+    expect(valid(S.CreateVolumeRequest, { name: '-leading-dash' })).toBe(false);
+    expect(valid(S.CreateVolumeRequest, { name: 'has space' })).toBe(false);
+    expect(valid(S.CreateVolumeRequest, { name: 'has/slash' })).toBe(false);
+    expect(valid(S.CreateVolumeRequest, { name: 'has:colon' })).toBe(false);
+    expect(valid(S.CreateVolumeRequest, { name: 'has\\backslash' })).toBe(false);
+  });
+
+  it('CreateVolumeRequest accepts the underscore / hyphen / dot triplet', () => {
+    expect(valid(S.CreateVolumeRequest, { name: 'a_b-c.d' })).toBe(true);
+    expect(valid(S.CreateVolumeRequest, { name: '1starts-with-digit' })).toBe(true);
+  });
+
+  it('CreateVolumeRequest enforces 255-char name limit', () => {
+    expect(valid(S.CreateVolumeRequest, { name: 'a'.repeat(255) })).toBe(true);
+    expect(valid(S.CreateVolumeRequest, { name: 'a'.repeat(256) })).toBe(false);
+  });
+
+  it('CreateVolumeRequest enforces 64-char driver limit', () => {
+    expect(valid(S.CreateVolumeRequest, { name: 'v', driver: 'a'.repeat(64) })).toBe(true);
+    expect(valid(S.CreateVolumeRequest, { name: 'v', driver: 'a'.repeat(65) })).toBe(false);
+  });
+
+  it('CreateVolumeRequest rejects non-string label values', () => {
+    expect(valid(S.CreateVolumeRequest, {
+      name: 'v', labels: { ok: 'fine', bad: 42 },
+    })).toBe(false);
+  });
+
+  it('CreateVolumeRequest rejects unknown top-level fields', () => {
+    expect(valid(S.CreateVolumeRequest, {
+      name: 'v', sneaky: 'value',
+    })).toBe(false);
   });
 
   it('VolumeBulkResponse has the expected shape', () => {
@@ -320,6 +401,32 @@ describe('Volume browser schemas', () => {
         { name: 'v3', ok: false, error: 'in use' },
       ],
     })).toBe(true);
+  });
+
+  // #20: combined Permissions schemas.
+  it('VolumeBrowsePermissionsRequest accepts mode only, chown only, and both', () => {
+    const v = (p) => valid(S.VolumeBrowsePermissionsRequest, p);
+    expect(v({ path: '/a', mode: '0644' })).toBe(true);
+    expect(v({ path: '/a', uid: 1000 })).toBe(true);
+    expect(v({ path: '/a', gid: 1000 })).toBe(true);
+    expect(v({ path: '/a', uid: 1000, gid: 1000 })).toBe(true);
+    expect(v({ path: '/a', mode: '0755', uid: 0, gid: 0, recursive: true })).toBe(true);
+    expect(v({ path: '/a', uid: -1, gid: 100 })).toBe(true);
+  });
+
+  it('VolumeBrowsePermissionsRequest rejects unknown / malformed fields', () => {
+    const v = (p) => valid(S.VolumeBrowsePermissionsRequest, p);
+    expect(v({ path: '/a', mode: 'u+x' })).toBe(false);
+    expect(v({ path: '/a', uid: -2 })).toBe(false);
+    expect(v({ path: '/a', mode: '0644', sneaky: 1 })).toBe(false);
+  });
+
+  it('VolumeBrowseBulkPermissionsRequest enforces minItems + maxItems', () => {
+    const v = (p) => valid(S.VolumeBrowseBulkPermissionsRequest, p);
+    expect(v({ paths: ['/a'], mode: '0644' })).toBe(true);
+    expect(v({ paths: [], mode: '0644' })).toBe(false);
+    const tooMany = Array.from({ length: 501 }, (_, i) => `/f${i}`);
+    expect(v({ paths: tooMany, mode: '0644' })).toBe(false);
   });
 });
 

@@ -137,7 +137,7 @@ All configuration is via environment variables.
 | `ADMIN_PASSWORD`     | `admin`          | **Change this**                                                       |
 | `VIEWER_USER`        | _(unset)_        | Optional read-only account                                            |
 | `VIEWER_PASSWORD`    | _(unset)_        | Required if `VIEWER_USER` is set                                      |
-| `ALLOW_DESTRUCTIVE`  | `true`           | Set to `false` to deny every state-changing call (read-only mode)     |
+| `ALLOW_DESTRUCTIVE`  | `true`           | Set to `false` to deny **Docker-state-changing** calls (container kill/remove, volume remove, image/network/volume prune, stack down). Filesystem mutations inside a volume (chmod, chown, edit, mkdir) require admin role but are NOT gated by this flag. |
 | `DOCKER_HOST`        | _(auto)_         | E.g. `tcp://docker:2375` or `unix:///var/run/docker.sock`             |
 | `CORS_ORIGINS`       | _(empty)_        | Comma-separated origins to allow if the UI is hosted elsewhere        |
 | `STATIC_DIR`         | `./frontend`     | Path to the SPA assets                                                |
@@ -149,6 +149,7 @@ All configuration is via environment variables.
 | `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
 | `BROWSER_IMAGE`      | `python:3-alpine`| Image used for the per-operation volume-browser container (must include `python3`). Pre-pulled at startup. |
 | `VOLUME_BROWSER_NO_LIMITS` | _(unset)_   | Set `true` only on nested-VM / sandboxed runners whose root cgroup is in "domain threaded" mode; skips `Memory`/`NanoCpus`/`PidsLimit` on the per-op container. `CapDrop:ALL` stays applied. |
+| `VOLUME_BROWSER_OP_TIMEOUT_MS` | `90000`  | Wall-clock cap on a single volume-browser helper container. The container is force-removed and the request returns 504 if it exceeds this. Set `0` to disable (not recommended). |
 | `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
 | `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds. Floor 60s, ceiling 30 days.                |
 | `RATE_LIMIT_DISABLED`| `false`          | Turn off the rate limiters entirely (dev only)                        |
