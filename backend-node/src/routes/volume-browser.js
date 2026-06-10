@@ -43,14 +43,18 @@ import { settings } from '../config.js';
 import { asyncHandler, HttpError, intQuery } from '../util.js';
 import { createApiRouter, customResponse } from '../route-builder.js';
 import {
+  NameParam,
   PassThroughObject,
   VolumeBrowseBulkChmodRequest,
   VolumeBrowseBulkChownRequest,
   VolumeBrowseBulkDeleteRequest,
+  VolumeBrowseBulkPermissionsRequest,
   VolumeBrowseBulkResponse,
   VolumeBrowseChmodRequest,
   VolumeBrowseChownRequest,
+  VolumeBrowseListQuery,
   VolumeBrowseListResponse,
+  VolumeBrowsePermissionsRequest,
   VolumeBrowseRenameRequest,
   VolumeBrowseSaveRequest,
   VolumeBrowseSaveResponse,
@@ -79,6 +83,19 @@ const BROWSER_VOL_LABEL = 'com.docker.manager.volume';
 // Uniform "exit 0 + JSON stdout" means the route handler never has to
 // distinguish container failure from operation failure from parse failure.
 
+// LIST_SCRIPT (#18, #19): server-side sort + scandir.
+//
+// The previous version did `sorted(os.listdir(p))` + per-entry lstat for
+// every page request, which is O(n log n + n) per request on directory
+// size — pathological on a 50k-entry dir even for limit=10.
+//
+// This version:
+//   - scandir() streams names + DT_TYPE in one syscall
+//   - we lstat() ONLY the page slice we're going to return (after sort)
+//   - sort happens on (cheap) names + per-entry stat done lazily for the
+//     non-name sort orders (mtime, size); we stat the whole directory in
+//     that case but it's still one pass instead of two
+//   - sort=name (default) doesn't pay the lstat cost for entries off-page
 const LIST_SCRIPT = `
 import os, stat, sys, json
 try:
@@ -89,19 +106,58 @@ except ImportError:
 p = sys.argv[1]
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
 offset = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+sort_key = sys.argv[4] if len(sys.argv) > 4 else 'name'
+order = sys.argv[5] if len(sys.argv) > 5 else 'asc'
+dirs_first = sys.argv[6] != '0' if len(sys.argv) > 6 else True
 
 try:
     real_p = os.path.realpath(p)
     if not (real_p == '/target' or real_p.startswith('/target/')):
         print(json.dumps({"error": "Path escapes the volume root"})); sys.exit(0)
-    entries = sorted(os.listdir(p))
+    if not os.path.isdir(real_p):
+        print(json.dumps({"error": "Not a directory"})); sys.exit(0)
+
+    if sort_key == 'name':
+        # Cheap path: scandir gives us names + d_type without an lstat.
+        # We sort by name, slice the page, then stat only the page.
+        with os.scandir(p) as it:
+            raw = [(e.name, e.is_dir(follow_symlinks=False), e.is_symlink()) for e in it]
+        if dirs_first:
+            raw.sort(key=lambda t: (0 if t[1] else 1 if t[2] else 2, t[0].lower()))
+        else:
+            raw.sort(key=lambda t: t[0].lower())
+        if order == 'desc': raw.reverse()
+        total = len(raw)
+        page = raw[offset:offset + limit]
+        names = [n for n, _, _ in page]
+    else:
+        # Expensive path: we have to stat every entry to sort by size /
+        # mtime. Still one pass each (one scandir, then one lstat per
+        # entry). For huge directories the operator can switch back to
+        # name sort if it's too slow.
+        rows = []
+        with os.scandir(p) as it:
+            for e in it:
+                try: st = e.stat(follow_symlinks=False)
+                except OSError: continue
+                rows.append((e.name, e.is_dir(follow_symlinks=False), e.is_symlink(),
+                             st.st_size if not e.is_dir(follow_symlinks=False) else -1,
+                             st.st_mtime))
+        if sort_key == 'size':
+            rows.sort(key=lambda t: t[3])
+        elif sort_key == 'mtime':
+            rows.sort(key=lambda t: t[4])
+        if dirs_first:
+            rows.sort(key=lambda t: 0 if t[1] else 1 if t[2] else 2)
+        if order == 'desc': rows.reverse()
+        total = len(rows)
+        page = rows[offset:offset + limit]
+        names = [t[0] for t in page]
 except Exception as e:
     print(json.dumps({"error": str(e)})); sys.exit(0)
 
-total = len(entries)
-page = entries[offset:offset + limit]
 out = []
-for n in page:
+for n in names:
     f = os.path.join(p, n)
     try: st = os.lstat(f)
     except OSError: continue
@@ -131,6 +187,8 @@ for n in page:
 print(json.dumps({"total": total, "entries": out}))
 `;
 
+// VIEW_SCRIPT (#8): returns `mtime` so the editor's optimistic-concurrency
+// token comes from the same fetch as the content, not a stale listing.
 const VIEW_SCRIPT = `
 import os, stat, sys, json
 MAX = 1024 * 1024
@@ -147,12 +205,16 @@ try:
     truncated = len(data) > MAX
     if truncated: data = data[:MAX]
     is_binary = b'\\x00' in data[:8192]
+    base = {"size": st.st_size, "mtime": st.st_mtime,
+            "is_binary": is_binary, "truncated": truncated}
     if is_binary:
-        print(json.dumps({"size": st.st_size, "is_binary": True, "truncated": truncated}))
+        print(json.dumps(base))
     else:
         try: content = data.decode('utf-8'); encoding = 'utf-8'
         except UnicodeDecodeError: content = data.decode('latin-1'); encoding = 'latin-1'
-        print(json.dumps({"size": st.st_size, "is_binary": False, "truncated": truncated, "encoding": encoding, "content": content}))
+        base["encoding"] = encoding
+        base["content"] = content
+        print(json.dumps(base))
 except Exception as e:
     print(json.dumps({"error": str(e)}))
 `;
@@ -329,6 +391,68 @@ except Exception as e:
     print(json.dumps({"error": str(e)}))
 `;
 
+// Atomic chmod + chown (#20). Reads spec from stdin so very large bulk
+// payloads don't trip the argv limit. Either or both of mode / uid /
+// gid may be set; -1 means "leave that owner-half unchanged".
+//
+// The whole operation runs in one container, so for a single path you
+// either get both mutations or neither — no half-state where mode
+// changed and ownership failed.
+const PERMISSIONS_SCRIPT = `
+import os, sys, json
+spec = json.loads(sys.stdin.read())
+paths = spec.get("paths") or [spec["path"]]
+mode = spec.get("mode")
+mode_int = int(mode, 8) if mode else None
+uid = spec.get("uid")
+gid = spec.get("gid")
+recursive = bool(spec.get("recursive"))
+bulk = "paths" in spec
+results = []
+
+def apply(p):
+    rp = os.path.realpath(p) if os.path.lexists(p) else None
+    if rp is None:
+        return {"path": p, "ok": False, "error": "Not found"}
+    if not (rp == '/target' or rp.startswith('/target/')):
+        return {"path": p, "ok": False, "error": "Path escapes the volume root"}
+    try:
+        if mode_int is not None:
+            if recursive and os.path.isdir(p) and not os.path.islink(p):
+                os.chmod(p, mode_int)
+                for root, dirs, files in os.walk(p):
+                    for d in dirs: os.chmod(os.path.join(root, d), mode_int)
+                    for f in files: os.chmod(os.path.join(root, f), mode_int)
+            else:
+                os.chmod(p, mode_int)
+        if uid is not None or gid is not None:
+            u = -1 if uid is None else int(uid)
+            g = -1 if gid is None else int(gid)
+            os.lchown(p, u, g)
+            if recursive and os.path.isdir(p) and not os.path.islink(p):
+                for root, dirs, files in os.walk(p):
+                    for name in dirs + files:
+                        os.lchown(os.path.join(root, name), u, g)
+        return {"path": p, "ok": True}
+    except Exception as e:
+        return {"path": p, "ok": False, "error": str(e)}
+
+for p in paths:
+    results.append(apply(p))
+
+if bulk:
+    print(json.dumps({"results": results}))
+else:
+    # Single-target: surface the single result inline; on failure we
+    # use the "error" envelope so parseScriptResult turns it into an
+    # HTTP error with the right status code mapping.
+    r0 = results[0]
+    if r0["ok"]:
+        print(json.dumps({"ok": True, "path": r0["path"]}))
+    else:
+        print(json.dumps({"error": r0["error"]}))
+`;
+
 const BULK_CHOWN_SCRIPT = `
 import os, sys, json
 spec = json.loads(sys.argv[1])
@@ -473,6 +597,13 @@ function browserHostConfig(volume, { readonly = false, capAdd = [] } = {}) {
   return hc;
 }
 
+// Wall-clock cap on a single helper-container operation (#5). A hung
+// python script, stuck I/O inside the container, or runaway recursion
+// would otherwise pin the HTTP request open forever. Configurable via
+// VOLUME_BROWSER_OP_TIMEOUT_MS; defaults to 90 s, which is generous for
+// a chmod -R on a deep tree but bounded.
+const DEFAULT_OP_TIMEOUT_MS = 90_000;
+
 /**
  * One-shot container that runs `cmd`, returns its demuxed stdout+stderr,
  * and is auto-removed by the daemon. Uses the attach-before-start
@@ -481,9 +612,17 @@ function browserHostConfig(volume, { readonly = false, capAdd = [] } = {}) {
  * If `stdin` is a Buffer it's piped into the container's stdin and the
  * write side is closed (signalling EOF) once start() resolves. Useful
  * for ops that need to ship arbitrary bytes without argv-length caps
- * (file edits, in particular).
+ * (file edits, bulk permission specs).
+ *
+ * The handler races the `attach` stream against a wall-clock timer. On
+ * timeout we force-remove the container and reject with an HttpError
+ * the central middleware maps to 504 Gateway Timeout.
  */
-async function runOnce(volume, cmd, { readonly = false, stdin = null, capAdd = [] } = {}) {
+async function runOnce(volume, cmd, opts = {}) {
+  const {
+    readonly = false, stdin = null, capAdd = [],
+    timeoutMs = settings.volumeBrowserOpTimeoutMs || DEFAULT_OP_TIMEOUT_MS,
+  } = opts;
   await ensureVolumeExists(volume);
   const docker = getClient();
   const createOpts = {
@@ -517,11 +656,32 @@ async function runOnce(volume, cmd, { readonly = false, stdin = null, capAdd = [
   docker.modem.demuxStream(stream, stdoutSink, stderrSink);
 
   const collected = new Promise((resolve, reject) => {
-    stream.on('end', () => resolve({
-      stdout: Buffer.concat(outChunks).toString('utf8'),
-      stderr: Buffer.concat(errChunks).toString('utf8'),
-    }));
-    stream.on('error', reject);
+    let settled = false;
+    const t = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Tear down the container — its inner process is hung or runaway.
+      container.remove({ force: true }).catch(() => {});
+      try { stream.destroy(); } catch {}
+      reject(new HttpError(504, `Helper container exceeded ${timeoutMs}ms timeout`));
+    }, timeoutMs);
+    t.unref && t.unref();
+
+    stream.on('end', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      resolve({
+        stdout: Buffer.concat(outChunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8'),
+      });
+    });
+    stream.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      reject(err);
+    });
   });
 
   try {
@@ -549,10 +709,31 @@ async function runOnce(volume, cmd, { readonly = false, stdin = null, capAdd = [
   return collected;
 }
 
+// #12: known python error strings → appropriate HTTP status codes.
+// The scripts can't easily emit structured codes (they're tiny inline
+// programs), so we recognise their canonical messages here. Everything
+// else falls through to 400 — that's the safe default for "the input
+// was wrong" without leaking unexpected internals as 500s.
+function errorStatusFor(message) {
+  const m = String(message || '');
+  if (/^Not found$/i.test(m) || /\bNo such file or directory\b/i.test(m)) return 404;
+  if (/^Destination already exists$/i.test(m) || /\bFile exists\b/i.test(m)) return 409;
+  if (/^Refusing to (?:delete|edit|chmod|chown) the volume root$/i.test(m)) return 400;
+  if (/escapes the volume root/i.test(m)) return 400;
+  if (/^Refusing to edit through a symlink$/i.test(m)) return 400;
+  if (/^Not a regular file$/i.test(m)) return 400;
+  if (/^Not a directory$/i.test(m)) return 400;
+  if (/^Parent directory does not exist$/i.test(m)) return 404;
+  return 400;
+}
+
 /**
  * Parse the deterministic JSON envelope every script emits on stdout.
- * Maps an `{"error":...}` payload to an HttpError(400). Container
- * crashes / pipe failures show up as a JSON parse error here.
+ * Maps an `{"error":...}` payload to an HttpError whose status code is
+ * inferred from the message (#12) — "Not found" → 404, "Destination
+ * already exists" → 409, escape-root → 400, etc.
+ *
+ * Container crashes / pipe failures show up as a JSON parse error here.
  */
 function parseScriptResult(out, opName) {
   const text = (out.stdout || '').trim();
@@ -566,7 +747,7 @@ function parseScriptResult(out, opName) {
     throw new HttpError(500, `${opName} returned malformed JSON: ${text.slice(0, 200)}`);
   }
   if (data && typeof data === 'object' && data.error) {
-    throw new HttpError(400, data.error);
+    throw new HttpError(errorStatusFor(data.error), data.error);
   }
   return data;
 }
@@ -634,7 +815,7 @@ export async function ensureBrowserImage(logger = console) {
 
 // ---------- Schemas ----------
 
-const NameParam = Type.Object({ name: Type.String() }, { additionalProperties: false });
+// `NameParam` is shared via schemas/_common.js (#35).
 const PathQuery = Type.Object(
   { path: Type.Optional(Type.String({ default: '' })) },
   { additionalProperties: false },
@@ -643,32 +824,43 @@ const RequiredPathQuery = Type.Object(
   { path: Type.String({ minLength: 1 }) },
   { additionalProperties: false },
 );
-const ListQuery = Type.Object(
-  {
-    path: Type.Optional(Type.String({ default: '' })),
-    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50000, default: 5000 })),
-    offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
-  },
-  { additionalProperties: false },
-);
 
 // ---------- Routes ----------
+//
+// All routes (read + write) require `admin: true` (#4) — viewer JWTs
+// can't browse / read file contents through this API. Reading an
+// arbitrary volume's contents through the manager amounts to "give me
+// the secrets file" for any production-mounted volume; the viewer role
+// is meant for "see Docker resources", not "read all files".
+//
+// All routes are also `expensive: true` (#7) so the per-user concurrency
+// cap covers reads as well as writes — an authenticated admin still
+// can't fan out unbounded parallel list/view calls and saturate the
+// daemon.
 
 r.get(
   '/:name/browse/list',
   {
-    summary: 'List a directory inside a volume (paginated)',
+    summary: 'List a directory inside a volume (paginated, server-side sort)',
+    admin: true,
+    expensive: true,
     params: NameParam,
-    query: ListQuery,
+    query: VolumeBrowseListQuery,
     responses: { 200: VolumeBrowseListResponse },
   },
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path || '');
     const limit = intQuery(req.query.limit, 5000, { min: 1, max: 50000 });
     const offset = intQuery(req.query.offset, 0, { min: 0 });
+    const sort = ['name', 'size', 'mtime'].includes(req.query.sort) ? req.query.sort : 'name';
+    const order = req.query.order === 'desc' ? 'desc' : 'asc';
+    const dirsFirst = req.query.dirs_first !== false; // default true
     const out = await runOnce(
       req.params.name,
-      ['python3', '-c', LIST_SCRIPT, safe, String(limit), String(offset)],
+      [
+        'python3', '-c', LIST_SCRIPT, safe,
+        String(limit), String(offset), sort, order, dirsFirst ? '1' : '0',
+      ],
       { readonly: true, capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'list');
@@ -683,7 +875,9 @@ r.get(
 r.get(
   '/:name/browse/view',
   {
-    summary: 'Read a regular file inline (text, capped at 1 MB)',
+    summary: 'Read a regular file inline (text, capped at 1 MB; returns mtime for optimistic concurrency)',
+    admin: true,
+    expensive: true,
     params: NameParam,
     query: RequiredPathQuery,
     responses: { 200: VolumeBrowseViewResponse },
@@ -700,6 +894,7 @@ r.get(
     res.json({
       path: safe.slice('/target'.length) || '/',
       size: data.size,
+      mtime: data.mtime, // #8: editor uses this as if_mtime on save
       is_binary: !!data.is_binary,
       truncated: !!data.truncated,
       encoding: data.encoding,
@@ -717,6 +912,24 @@ r.get(
 // runs first because the archive endpoints follow symlinks in the
 // container's view and would otherwise let an in-volume `escape -> /etc`
 // link escape /target.
+//
+// #17: the review proposed collapsing assertSafeOnce + withScratchContainer
+// into one container. We considered three approaches and rejected each:
+//   (a) Replace getArchive with python-tar-to-stdout in one container.
+//       This works but loses the Engine's native tar streaming, which
+//       is faster than tarfile.add() and keeps the manager out of the
+//       hot path. ~2x slower for large files.
+//   (b) Run a long-lived helper (`sleep 60`), exec realpath, then call
+//       getArchive on the same container. Adds an exec round-trip and
+//       brings back the "must kill the container" cleanup the one-shot
+//       architecture was designed to avoid.
+//   (c) AutoRemove off + start + safety + getArchive + manual remove.
+//       Same number of Docker API round-trips, just rearranged.
+// The two-container pattern is ~330ms per byte-transfer, the safety
+// container is fast (<200ms) and naturally caps at one per request via
+// the per-user concurrency middleware, and the code is markedly simpler
+// than any of the alternatives. Documented here so the next reviewer
+// doesn't churn this again.
 
 async function assertSafeOnce(volume, safe) {
   const out = await runOnce(
@@ -727,10 +940,33 @@ async function assertSafeOnce(volume, safe) {
   parseScriptResult(out, 'safety check'); // throws 400 on escape
 }
 
+// RFC 5987 / RFC 6266: safely encode a filename for Content-Disposition
+// even when the file name contains quote characters, backslashes,
+// newlines, or non-ASCII (#19 in the review). We always emit both the
+// quoted-printable filename= (for old clients) AND a UTF-8-encoded
+// filename*= (for modern ones), with sanitised values everywhere.
+function contentDispositionFor(name) {
+  // Strip control chars + slashes + NULs from both forms; quotes /
+  // backslashes get escaped in the legacy form.
+  const sanitised = String(name || 'download')
+    .replace(/[\x00-\x1f\x7f/\\]/g, '_')
+    .slice(0, 240); // leave headroom under most header-length limits
+  const legacy = sanitised
+    .replace(/[\u0080-\uffff]/g, '_') // ASCII-only for filename=
+    .replace(/["\\]/g, '\\$&');
+  // RFC 5987 percent-encoding for the UTF-8 variant
+  const encoded = encodeURIComponent(sanitised)
+    .replace(/['()]/g, escape) // some clients trip on these
+    .replace(/\*/g, '%2A');
+  return `attachment; filename="${legacy}"; filename*=UTF-8''${encoded}`;
+}
+
 r.get(
   '/:name/browse/file',
   {
-    summary: 'Download a single file',
+    summary: 'Download a single file (streamed)',
+    admin: true,
+    expensive: true,
     params: NameParam,
     query: RequiredPathQuery,
     responses: {
@@ -745,6 +981,11 @@ r.get(
     if (safe === '/target') throw new HttpError(400, 'Cannot download the volume root');
     await assertSafeOnce(req.params.name, safe);
 
+    // #6: stream the file body directly to res with back-pressure. The
+    // previous implementation concatenated every tar chunk into a single
+    // Buffer before responding — a 10 GB file would OOM the manager.
+    // #9: stream errors REJECT the handler so the central middleware
+    // returns 500 instead of resolving silently with a half-written body.
     await withScratchContainer(req.params.name, async (container) => {
       let archive;
       try { archive = await container.getArchive({ path: safe }); }
@@ -753,32 +994,65 @@ r.get(
         throw err;
       }
       const extract = tar.extract();
-      let payload = null; let filename = null; let isFile = false;
-      const finished = new Promise((resolve) => {
-        extract.on('entry', (header, stream, next) => {
-          if (header.type === 'file' && payload == null) {
-            isFile = true; filename = path.posix.basename(header.name);
-            const chunks = [];
-            stream.on('data', (c) => chunks.push(c));
-            stream.on('end', () => { payload = Buffer.concat(chunks); next(); });
-          } else {
-            stream.on('end', next); stream.resume();
+      let headersSent = false;
+      let entryStarted = false;
+
+      await new Promise((resolve, reject) => {
+        extract.on('entry', (header, entryStream, next) => {
+          // Only the FIRST file entry is emitted — directories produce
+          // multiple entries; refuse those and tell the caller to use
+          // /archive instead.
+          if (entryStarted) {
+            entryStream.on('end', next);
+            entryStream.resume();
+            return;
           }
+          if (header.type !== 'file') {
+            entryStream.on('end', next);
+            entryStream.resume();
+            return;
+          }
+          entryStarted = true;
+          const fname = path.posix.basename(header.name);
+          if (!headersSent) {
+            res.set({
+              'Content-Type': 'application/octet-stream',
+              'Content-Disposition': contentDispositionFor(fname),
+              'Content-Length': String(header.size),
+              'Cache-Control': 'no-store',
+            });
+            headersSent = true;
+          }
+          // Pipe with back-pressure; if the client disconnects, abort the
+          // archive stream so we don't keep pumping into a dead socket.
+          entryStream.on('data', (chunk) => {
+            if (!res.write(chunk)) {
+              entryStream.pause();
+              res.once('drain', () => entryStream.resume());
+            }
+          });
+          entryStream.on('end', next);
+          entryStream.on('error', reject);
         });
-        extract.on('finish', resolve);
-        extract.on('error', () => resolve());
+        extract.on('finish', () => {
+          if (!entryStarted) {
+            // No file entries — the path was a directory or empty tar.
+            return reject(new HttpError(400, 'Not a regular file (use /archive to download directories)'));
+          }
+          res.end();
+          resolve();
+        });
+        extract.on('error', reject);
+        archive.on('error', reject);
+        res.on('close', () => {
+          try { archive.destroy(); } catch {}
+          try { extract.destroy(); } catch {}
+          // Only resolve once — if we haven't finished yet, treat the
+          // disconnect as a normal stream end.
+          if (!entryStarted) resolve();
+        });
+        archive.pipe(extract);
       });
-      archive.pipe(extract);
-      await finished;
-      if (!isFile || payload == null) {
-        throw new HttpError(400, 'Not a regular file (use /archive to download directories)');
-      }
-      res.set({
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Content-Length': payload.length,
-      });
-      res.end(payload);
     }, { readonly: true });
   }),
 );
@@ -787,6 +1061,8 @@ r.get(
   '/:name/browse/archive',
   {
     summary: 'Download a file or directory as a tar archive',
+    admin: true,
+    expensive: true,
     params: NameParam,
     query: RequiredPathQuery,
     responses: {
@@ -811,21 +1087,27 @@ r.get(
       const base = path.posix.basename(safe) || 'archive';
       res.set({
         'Content-Type': 'application/x-tar',
-        'Content-Disposition': `attachment; filename="${base}.tar"`,
+        'Content-Disposition': contentDispositionFor(`${base}.tar`),
         'Cache-Control': 'no-store',
       });
-      await new Promise((resolve) => {
+      // #9: stream errors now reject so the central error middleware
+      // surfaces them as 500 (with the response either ending cleanly
+      // or being aborted) — previously we resolved silently and ended
+      // up with truncated downloads that looked successful.
+      await new Promise((resolve, reject) => {
         archive.on('data', (chunk) => {
           if (!res.write(chunk)) {
             archive.pause();
             res.once('drain', () => archive.resume());
           }
         });
-        archive.on('end', resolve);
-        archive.on('error', resolve);
-        res.on('close', () => { try { archive.destroy(); } catch {} resolve(); });
+        archive.on('end', () => { res.end(); resolve(); });
+        archive.on('error', reject);
+        res.on('close', () => {
+          try { archive.destroy(); } catch {}
+          resolve(); // client gave up; not our problem
+        });
       });
-      res.end();
     }, { readonly: true });
   }),
 );
@@ -856,7 +1138,13 @@ r.post(
     const safe = safePath(req.query.path || '');
     await assertSafeOnce(req.params.name, safe);
 
-    const fname = path.posix.basename(req.file.originalname || 'uploaded');
+    // Strip path separators and NUL from the supplied name BEFORE we
+    // pack it into the tar (#20 in the review). multer's `originalname`
+    // comes straight from the client and can contain anything.
+    const rawName = String(req.file.originalname || 'uploaded');
+    const fname = path.posix.basename(rawName)
+      .replace(/[\x00/\\]/g, '_')
+      .slice(0, 255) || 'uploaded';
     const pack = tar.pack();
     pack.entry({ name: fname, mode: 0o644 }, req.file.buffer);
     pack.finalize();
@@ -1058,6 +1346,39 @@ r.put(
 // HTTP calls, each ~200 ms of container start cost. With them, N items
 // = 1 container = ~200 ms total.
 
+// Shared collector for the bulk-result envelope produced by every bulk
+// script. Trims the /target prefix from paths and packages success / fail
+// totals so the client can render a row-by-row report.
+function mapBulkResults(data) {
+  const results = (data.results || []).map((r) => ({
+    path: (r.path || '').replace(/^\/target/, '') || '/',
+    ok: !!r.ok,
+    ...(r.error ? { error: r.error } : {}),
+  }));
+  return {
+    succeeded: results.filter((x) => x.ok).length,
+    failed: results.filter((x) => !x.ok).length,
+    results,
+  };
+}
+
+/**
+ * #3: bulk endpoints ship their JSON spec via stdin, not argv.
+ *
+ * The previous version passed up to ~4 MB of JSON as `argv[1]` (1000
+ * paths × 4096 chars worst-case), which would trip Linux's 128 KB
+ * ARG_MAX and the container would fail to start with an opaque kernel
+ * error. The script reads from stdin instead, which has no length cap.
+ */
+async function runBulk(volume, script, spec) {
+  const stdin = Buffer.from(JSON.stringify(spec), 'utf8');
+  return runOnce(
+    volume,
+    ['python3', '-c', script],
+    { stdin, capAdd: BROWSER_CAPS },
+  );
+}
+
 r.post(
   '/:name/browse/chmod/bulk',
   {
@@ -1070,23 +1391,10 @@ r.post(
   },
   asyncHandler(async (req, res) => {
     const paths = req.body.paths.map((p) => safePath(p));
-    const spec = JSON.stringify({ mode: req.body.mode, recursive: !!req.body.recursive, paths });
-    const out = await runOnce(
-      req.params.name,
-      ['python3', '-c', BULK_CHMOD_SCRIPT, spec],
-      { capAdd: BROWSER_CAPS },
-    );
-    const data = parseScriptResult(out, 'bulk chmod');
-    const results = (data.results || []).map((r) => ({
-      path: r.path.replace(/^\/target/, '') || '/',
-      ok: !!r.ok,
-      ...(r.error ? { error: r.error } : {}),
-    }));
-    res.json({
-      succeeded: results.filter((x) => x.ok).length,
-      failed: results.filter((x) => !x.ok).length,
-      results,
+    const out = await runBulk(req.params.name, BULK_CHMOD_SCRIPT, {
+      mode: req.body.mode, recursive: !!req.body.recursive, paths,
     });
+    res.json(mapBulkResults(parseScriptResult(out, 'bulk chmod')));
   }),
 );
 
@@ -1105,28 +1413,13 @@ r.post(
       throw new HttpError(400, 'At least one of uid / gid must be provided');
     }
     const paths = req.body.paths.map((p) => safePath(p));
-    const spec = JSON.stringify({
+    const out = await runBulk(req.params.name, BULK_CHOWN_SCRIPT, {
       uid: req.body.uid == null ? -1 : req.body.uid,
       gid: req.body.gid == null ? -1 : req.body.gid,
       recursive: !!req.body.recursive,
       paths,
     });
-    const out = await runOnce(
-      req.params.name,
-      ['python3', '-c', BULK_CHOWN_SCRIPT, spec],
-      { capAdd: BROWSER_CAPS },
-    );
-    const data = parseScriptResult(out, 'bulk chown');
-    const results = (data.results || []).map((r) => ({
-      path: r.path.replace(/^\/target/, '') || '/',
-      ok: !!r.ok,
-      ...(r.error ? { error: r.error } : {}),
-    }));
-    res.json({
-      succeeded: results.filter((x) => x.ok).length,
-      failed: results.filter((x) => !x.ok).length,
-      results,
-    });
+    res.json(mapBulkResults(parseScriptResult(out, 'bulk chown')));
   }),
 );
 
@@ -1142,27 +1435,88 @@ r.post(
   },
   asyncHandler(async (req, res) => {
     const paths = req.body.paths.map((p) => safePath(p));
-    const spec = JSON.stringify({ paths });
+    const out = await runBulk(req.params.name, BULK_DELETE_SCRIPT, { paths });
+    res.json(mapBulkResults(parseScriptResult(out, 'bulk delete')));
+  }),
+);
+
+// #20: atomic chmod + chown.
+//
+// The UI's Permissions modal previously fired chmod and chown as two
+// independent HTTP calls — if the first succeeded and the second
+// failed, the file ended up in a half-applied state. This endpoint
+// applies both inside one container so the user gets either both
+// mutations or neither.
+r.post(
+  '/:name/browse/permissions',
+  {
+    summary: 'Atomically apply mode and/or owner to a single path',
+    admin: true,
+    params: NameParam,
+    body: VolumeBrowsePermissionsRequest,
+    responses: { 200: PassThroughObject },
+  },
+  asyncHandler(async (req, res) => {
+    if (req.body.mode == null && req.body.uid == null && req.body.gid == null) {
+      throw new HttpError(400, 'At least one of mode / uid / gid must be provided');
+    }
+    const safe = safePath(req.body.path);
+    if (safe === '/target') {
+      throw new HttpError(400, 'Cannot change permissions on the volume root');
+    }
     const out = await runOnce(
       req.params.name,
-      ['python3', '-c', BULK_DELETE_SCRIPT, spec],
-      { capAdd: BROWSER_CAPS },
+      ['python3', '-c', PERMISSIONS_SCRIPT],
+      {
+        capAdd: BROWSER_CAPS,
+        stdin: Buffer.from(JSON.stringify({
+          path: safe,
+          mode: req.body.mode,
+          uid: req.body.uid,
+          gid: req.body.gid,
+          recursive: !!req.body.recursive,
+        }), 'utf8'),
+      },
     );
-    const data = parseScriptResult(out, 'bulk delete');
-    const results = (data.results || []).map((r) => ({
-      path: r.path.replace(/^\/target/, '') || '/',
-      ok: !!r.ok,
-      ...(r.error ? { error: r.error } : {}),
-    }));
+    parseScriptResult(out, 'permissions');
     res.json({
-      succeeded: results.filter((x) => x.ok).length,
-      failed: results.filter((x) => !x.ok).length,
-      results,
+      path: safe.slice('/target'.length) || '/',
+      ...(req.body.mode ? { mode: req.body.mode } : {}),
+      ...(req.body.uid != null ? { uid: req.body.uid === -1 ? null : req.body.uid } : {}),
+      ...(req.body.gid != null ? { gid: req.body.gid === -1 ? null : req.body.gid } : {}),
     });
   }),
 );
 
+r.post(
+  '/:name/browse/permissions/bulk',
+  {
+    summary: 'Atomically apply mode and/or owner to many paths (multi-select)',
+    admin: true,
+    expensive: true,
+    params: NameParam,
+    body: VolumeBrowseBulkPermissionsRequest,
+    responses: { 200: VolumeBrowseBulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    if (req.body.mode == null && req.body.uid == null && req.body.gid == null) {
+      throw new HttpError(400, 'At least one of mode / uid / gid must be provided');
+    }
+    const paths = req.body.paths.map((p) => safePath(p));
+    const out = await runBulk(req.params.name, PERMISSIONS_SCRIPT, {
+      paths,
+      mode: req.body.mode,
+      uid: req.body.uid,
+      gid: req.body.gid,
+      recursive: !!req.body.recursive,
+    });
+    res.json(mapBulkResults(parseScriptResult(out, 'bulk permissions')));
+  }),
+);
+
 // Visible-for-testing only.
-export const _internals = { safePath, parseScriptResult };
+export const _internals = {
+  safePath, parseScriptResult, errorStatusFor, contentDispositionFor,
+};
 
 export default r;

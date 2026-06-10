@@ -26,6 +26,7 @@ r.post(
       'Returns a token that authorises a single connection to the WebSocket exec endpoint. ' +
       'Tickets cannot be replayed and expire after 60s. Admin only.',
     admin: true,
+    destructive: true,
     responses: { 200: TicketResponse },
   },
   asyncHandler(async (req, res) => {

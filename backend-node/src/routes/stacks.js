@@ -272,6 +272,7 @@ r.post(
   {
     summary: 'Create a stack (streams compose stdout if deploy=true)',
     admin: true,
+    destructive: true,
     expensive: true,
     body: CreateStackRequest,
     responses: { 200: streamResponse('compose up -d stdout (or {name, deployed:false})', 'text/plain') },
@@ -294,6 +295,7 @@ r.put(
   {
     summary: 'Replace compose / env files',
     admin: true,
+    destructive: true,
     params: StackNameParam,
     body: UpdateStackRequest,
     responses: { 200: PassThroughObject },
@@ -325,6 +327,7 @@ for (const verb of ['up', 'restart', 'pull']) {
     {
       summary: `compose ${verb} (streamed)`,
       admin: true,
+    destructive: true,
       // `up` and `pull` move bytes (image pulls); `restart` doesn't, but
       // tagging it expensive is harmless and keeps the policy uniform.
       expensive: true,
@@ -343,6 +346,7 @@ r.post(
   {
     summary: 'compose down (streamed)',
     admin: true,
+    destructive: true,
     expensive: true,
     params: StackNameParam,
     query: RemoveQuery,
@@ -402,6 +406,7 @@ r.post(
   {
     summary: 'Per-service compose action (admin, streamed)',
     admin: true,
+    destructive: true,
     params: StackServiceActionParam,
     responses: { 200: StreamPlain },
   },
@@ -432,6 +437,7 @@ r.delete(
   {
     summary: 'Tear down + remove a managed stack',
     admin: true,
+    destructive: true,
     params: StackNameParam,
     responses: { 200: PassThroughObject },
   },

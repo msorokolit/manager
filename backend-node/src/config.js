@@ -86,6 +86,14 @@ export function settingsFromEnv(env = process.env) {
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
     // ---- Volume-browser one-shot containers ----
+    // Wall-clock cap on any single helper-container operation. A hung
+    // python script or runaway recursive chmod would otherwise pin
+    // the HTTP request open forever. 90s is generous for chmod -R on
+    // a deep tree but bounded; 0 disables (not recommended).
+    volumeBrowserOpTimeoutMs: Math.max(
+      0,
+      parseInt(env.VOLUME_BROWSER_OP_TIMEOUT_MS || '90000', 10),
+    ),
     // Escape hatch: skip Memory / NanoCpus / PidsLimit on the per-op
     // container. Only useful on hosts where the root cgroup is in
     // "domain threaded" mode (nested CI VMs, some sandboxed runners),

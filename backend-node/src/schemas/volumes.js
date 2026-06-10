@@ -53,7 +53,40 @@ export const VolumeSummary = Type.Object(
       description: 'Disk usage (-1 = unknown). May be omitted when /system/df is slow/disabled.',
     })),
   },
-  { $id: 'VolumeSummary', additionalProperties: true },
+  { $id: 'VolumeSummary', additionalProperties: false },
+);
+
+/**
+ * Inspect response: VolumeSummary fields plus the raw Docker inspect
+ * payload (status, scopes, ucfreshClusterVolume, etc.) for the Raw tab.
+ * The enriched fields are duplicated so that the SPA can read the
+ * normalised snake_case shape without picking through PascalCase docker
+ * fields, while still surfacing the full daemon response on the Raw tab.
+ */
+export const VolumeDetail = Type.Object(
+  {
+    // Normalised, snake_case — same shape as VolumeSummary.
+    name: Type.String(),
+    driver: Type.String(),
+    mountpoint: Type.String(),
+    scope: Type.String(),
+    created_at: Opt(Type.String()),
+    labels: Type.Record(Type.String(), Type.String()),
+    options: Type.Record(Type.String(), Type.String()),
+    stack: Opt(Type.String()),
+    in_use: Type.Boolean(),
+    used_by: Type.Array(VolumeUsage),
+    size_bytes: Opt(Type.Integer()),
+    // Raw daemon inspect payload (PascalCase). Tucked behind a single
+    // field so the Raw tab can render it without our enrichment cluttering
+    // the JSON, and so consumers that don't care about it can skip it.
+    raw: Type.Unsafe({
+      type: 'object',
+      additionalProperties: true,
+      description: 'Verbatim dockerode .inspect() response (PascalCase)',
+    }),
+  },
+  { $id: 'VolumeDetail', additionalProperties: false },
 );
 
 /**
@@ -124,6 +157,29 @@ export const VolumeBrowseListResponse = Type.Object(
   { $id: 'VolumeBrowseListResponse', additionalProperties: false },
 );
 
+/** Query params for the directory listing — kept as a schema so the
+ * OpenAPI doc enumerates the sort options and bounds. */
+export const VolumeBrowseListQuery = Type.Object(
+  {
+    path: Type.Optional(Type.String({ default: '' })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50000, default: 5000 })),
+    offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
+    // Server-side sort (#19). The previous client-side sort was misleading
+    // on paginated directories ("page 1 sorted by size" wasn't actually
+    // "top 100 by size").
+    sort: Type.Optional(Type.Unsafe({
+      type: 'string', enum: ['name', 'size', 'mtime'], default: 'name',
+    })),
+    order: Type.Optional(Type.Unsafe({
+      type: 'string', enum: ['asc', 'desc'], default: 'asc',
+    })),
+    // Surface dirs-first ordering even in non-name sorts — directories
+    // are usually what the user wants to drill into.
+    dirs_first: Type.Optional(Type.Boolean({ default: true })),
+  },
+  { $id: 'VolumeBrowseListQuery', additionalProperties: false },
+);
+
 export const VolumeBrowseChmodRequest = Type.Object(
   {
     path: Type.String({ minLength: 1, maxLength: 4096 }),
@@ -139,10 +195,10 @@ export const VolumeBrowseChmodRequest = Type.Object(
 
 /**
  * chown: change owner / group on a path. Numeric IDs only — name lookup
- * inside the sidecar would resolve against the sidecar's /etc/passwd
- * which doesn't necessarily match the volume's actual user database.
- * At least one of uid / gid must be provided; -1 means "leave unchanged"
- * (matches the POSIX chown(2) semantics).
+ * inside the helper container would resolve against that container's
+ * /etc/passwd, which doesn't necessarily match the volume's actual user
+ * database. At least one of uid / gid must be provided; -1 means
+ * "leave unchanged" (matches the POSIX chown(2) semantics).
  */
 export const VolumeBrowseChownRequest = Type.Object(
   {
@@ -154,11 +210,16 @@ export const VolumeBrowseChownRequest = Type.Object(
   { $id: 'VolumeBrowseChownRequest', additionalProperties: false },
 );
 
+// Bulk request bounds: each path up to 1024 chars × up to 500 items
+// keeps the JSON payload well under Linux's 128 KB argv ceiling even
+// when serialised, and matches the "I selected a lot of stuff in the
+// UI" upper bound. Larger batches probably want pagination anyway.
+const BULK_PATH = Type.String({ minLength: 1, maxLength: 1024 });
+const BULK_ITEMS = { minItems: 1, maxItems: 500 };
+
 export const VolumeBrowseBulkChownRequest = Type.Object(
   {
-    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
-      minItems: 1, maxItems: 1000,
-    }),
+    paths: Type.Array(BULK_PATH, BULK_ITEMS),
     uid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
     gid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
     recursive: Type.Optional(Type.Boolean({ default: false })),
@@ -206,9 +267,7 @@ export const VolumeBrowseSaveResponse = Type.Object(
  */
 export const VolumeBrowseBulkChmodRequest = Type.Object(
   {
-    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
-      minItems: 1, maxItems: 1000,
-    }),
+    paths: Type.Array(BULK_PATH, BULK_ITEMS),
     mode: Type.String({
       pattern: '^0?[0-7]{3,4}$',
       description: 'Octal mode (e.g. "0644", "755")',
@@ -223,11 +282,43 @@ export const VolumeBrowseBulkChmodRequest = Type.Object(
  */
 export const VolumeBrowseBulkDeleteRequest = Type.Object(
   {
-    paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
-      minItems: 1, maxItems: 1000,
-    }),
+    paths: Type.Array(BULK_PATH, BULK_ITEMS),
   },
   { $id: 'VolumeBrowseBulkDeleteRequest', additionalProperties: false },
+);
+
+/**
+ * Combined Permissions request (#20): apply mode and/or owner changes
+ * atomically inside one container, so the user can't get half-applied
+ * state (mode changed but owner failed, or vice versa).
+ *
+ * - Provide `mode` to chmod, `uid`/`gid` (-1 = unchanged) to chown.
+ * - At least one of (mode, uid, gid) must be present.
+ * - `recursive` applies to both halves uniformly.
+ */
+export const VolumeBrowsePermissionsRequest = Type.Object(
+  {
+    path: Type.String({ minLength: 1, maxLength: 4096 }),
+    mode: Type.Optional(Type.String({
+      pattern: '^0?[0-7]{3,4}$',
+      description: 'Octal mode (e.g. "0644")',
+    })),
+    uid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    gid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowsePermissionsRequest', additionalProperties: false },
+);
+
+export const VolumeBrowseBulkPermissionsRequest = Type.Object(
+  {
+    paths: Type.Array(BULK_PATH, BULK_ITEMS),
+    mode: Type.Optional(Type.String({ pattern: '^0?[0-7]{3,4}$' })),
+    uid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    gid: Type.Optional(Type.Integer({ minimum: -1, maximum: 4294967295 })),
+    recursive: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBrowseBulkPermissionsRequest', additionalProperties: false },
 );
 
 /**
@@ -265,11 +356,16 @@ export const VolumeBrowseRenameRequest = Type.Object(
  * Response for the inline file-view endpoint. Either a text payload (UTF-8
  * if decodable, else latin-1 as a fallback), or a "binary" marker when the
  * file contains NULs in the first 8 KB.
+ *
+ * `mtime` is included so the editor can use the freshest concurrency
+ * token (was previously taking it from the directory listing, which may
+ * have been stale by the time the user opened the file).
  */
 export const VolumeBrowseViewResponse = Type.Object(
   {
     path: Type.String(),
     size: Type.Integer(),
+    mtime: Type.Number({ description: 'Unix mtime when the view was taken; pass back as if_mtime on save' }),
     is_binary: Type.Boolean(),
     truncated: Type.Boolean(),
     encoding: Opt(Type.String()),

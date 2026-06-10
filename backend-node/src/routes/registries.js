@@ -75,6 +75,7 @@ r.post(
   {
     summary: 'Add or replace a registry credential set',
     admin: true,
+    destructive: true,
     body: RegistryRequest,
     responses: { 200: PassThroughObject },
   },
@@ -94,6 +95,7 @@ r.put(
   {
     summary: 'Add or replace by path (name comes from URL)',
     admin: true,
+    destructive: true,
     params: NameParam,
     body: RegistryUpdateRequest,
     responses: { 200: PassThroughObject },
@@ -117,6 +119,7 @@ r.delete(
   {
     summary: 'Delete a registry credential set',
     admin: true,
+    destructive: true,
     params: NameParam,
     responses: { 200: PassThroughObject },
   },
@@ -136,6 +139,7 @@ r.post(
   {
     summary: 'Test login against the saved credentials',
     admin: true,
+    destructive: true,
     params: NameParam,
     responses: { 200: PassThroughObject },
   },

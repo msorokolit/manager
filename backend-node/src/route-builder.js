@@ -34,7 +34,7 @@
 //   const spec = buildOpenApiSpec(operations);
 
 import { Router } from 'express';
-import { authenticate, requireAdmin } from './auth.js';
+import { authenticate, requireAdmin, requireDestructive } from './auth.js';
 import { validateBody, validateParams, validateQuery } from './validate.js';
 import { expensiveConcurrency } from './rate-limit.js';
 
@@ -60,12 +60,18 @@ export function createApiRouter(basePath, defaults = {}) {
 
     const auth = spec.auth !== false;
     const admin = !!spec.admin;
+    const destructive = !!spec.destructive;
     const expensive = !!spec.expensive;
     const tags = spec.tags || (defaults.tag ? [defaults.tag] : []);
 
     const mws = [];
     if (auth) mws.push(authenticate);
     if (admin) mws.push(requireAdmin);
+    // `destructive` is an opt-in second gate that checks ALLOW_DESTRUCTIVE.
+    // Routes that mutate Docker state irreversibly (volume rm, container kill,
+    // prune, etc.) set both `admin: true` and `destructive: true`. Filesystem
+    // mutations inside a volume (chmod, edit) set only `admin: true`.
+    if (destructive) mws.push(requireDestructive);
     // The concurrency cap is per-user, so authenticate must have run first.
     if (expensive) mws.push(expensiveConcurrency());
     if (spec.params) mws.push(validateParams(spec.params));
@@ -83,6 +89,7 @@ export function createApiRouter(basePath, defaults = {}) {
       tags,
       auth,
       admin,
+      destructive,
       expensive,
       summary: spec.summary,
       description: spec.description,
