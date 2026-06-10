@@ -41,6 +41,7 @@ import tar from 'tar-stream';
 import { getClient } from '../docker-client.js';
 import { settings } from '../config.js';
 import { asyncHandler, HttpError, intQuery } from '../util.js';
+import { getLabels, mergeLabels } from '../labels-store.js';
 import { createApiRouter, customResponse } from '../route-builder.js';
 import {
   PassThroughObject,
@@ -434,6 +435,37 @@ async function ensureVolumeExists(volume) {
   catch (err) {
     if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
     throw err;
+  }
+}
+
+/**
+ * Refuse the request when the volume is marked read-only.
+ *
+ * The flag comes from the *merged* label set (daemon labels overlaid
+ * with the manager-side extra_labels store), so toggling read-only via
+ * the inspect modal takes effect on the very next write without a
+ * volume recreate.
+ *
+ * Called at the top of every write endpoint in this module. Read paths
+ * (list / view / archive) skip the check because they're inherently
+ * non-destructive — we mount :ro and the kernel enforces that.
+ */
+async function denyIfReadOnly(volume) {
+  let v;
+  try { v = await getClient().getVolume(volume).inspect(); }
+  catch (err) {
+    if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
+    throw err;
+  }
+  const extras = await getLabels(volume);
+  const merged = mergeLabels(v.Labels, extras);
+  if (merged['com.docker.manager.readonly'] === 'true') {
+    throw new HttpError(
+      403,
+      `Volume "${volume}" is marked read-only ` +
+      `(com.docker.manager.readonly=true); refusing write operation. ` +
+      `Clear the label in the volume inspect modal to enable edits.`,
+    );
   }
 }
 
@@ -854,6 +886,7 @@ r.post(
   asyncHandler(async (req, res) => {
     if (!req.file) throw new HttpError(400, 'file is required');
     const safe = safePath(req.query.path || '');
+    await denyIfReadOnly(req.params.name);
     await assertSafeOnce(req.params.name, safe);
 
     const fname = path.posix.basename(req.file.originalname || 'uploaded');
@@ -885,6 +918,7 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Invalid directory');
+    await denyIfReadOnly(req.params.name);
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', MKDIR_SCRIPT, safe],
@@ -907,6 +941,7 @@ r.delete(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Refusing to delete root');
+    await denyIfReadOnly(req.params.name);
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', DELETE_SCRIPT, safe],
@@ -935,6 +970,7 @@ r.post(
     if (from === to) {
       return res.json({ moved: from.slice('/target'.length), to: to.slice('/target'.length) });
     }
+    await denyIfReadOnly(req.params.name);
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', RENAME_SCRIPT, from, to],
@@ -960,6 +996,7 @@ r.post(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.body.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot chmod the volume root');
+    await denyIfReadOnly(req.params.name);
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', CHMOD_SCRIPT, req.body.mode, safe, req.body.recursive ? '1' : '0'],
@@ -985,6 +1022,7 @@ r.post(
     }
     const safe = safePath(req.body.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot chown the volume root');
+    await denyIfReadOnly(req.params.name);
     const uid = req.body.uid == null ? -1 : req.body.uid;
     const gid = req.body.gid == null ? -1 : req.body.gid;
     const out = await runOnce(
@@ -1019,6 +1057,7 @@ r.put(
   asyncHandler(async (req, res) => {
     const safe = safePath(req.query.path);
     if (safe === '/target') throw new HttpError(400, 'Cannot edit the volume root');
+    await denyIfReadOnly(req.params.name);
     const content = Buffer.from(req.body.content || '', 'utf8');
     const args = [
       'python3', '-c', EDIT_SCRIPT,
@@ -1069,6 +1108,7 @@ r.post(
     responses: { 200: VolumeBrowseBulkResponse },
   },
   asyncHandler(async (req, res) => {
+    await denyIfReadOnly(req.params.name);
     const paths = req.body.paths.map((p) => safePath(p));
     const spec = JSON.stringify({ mode: req.body.mode, recursive: !!req.body.recursive, paths });
     const out = await runOnce(
@@ -1104,6 +1144,7 @@ r.post(
     if (req.body.uid == null && req.body.gid == null) {
       throw new HttpError(400, 'At least one of uid / gid must be provided');
     }
+    await denyIfReadOnly(req.params.name);
     const paths = req.body.paths.map((p) => safePath(p));
     const spec = JSON.stringify({
       uid: req.body.uid == null ? -1 : req.body.uid,
@@ -1141,6 +1182,7 @@ r.post(
     responses: { 200: VolumeBrowseBulkResponse },
   },
   asyncHandler(async (req, res) => {
+    await denyIfReadOnly(req.params.name);
     const paths = req.body.paths.map((p) => safePath(p));
     const spec = JSON.stringify({ paths });
     const out = await runOnce(

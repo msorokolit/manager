@@ -266,6 +266,75 @@ describe('Volume browser schemas', () => {
       saved: true, path: '/foo.txt', size: 42, mtime: 1781040000.5,
     })).toBe(true);
   });
+
+  // ---------- Tier 1 / 2 enrichment ----------
+
+  it('VolumeSummary accepts the enriched shape with empty usage / null size', () => {
+    expect(valid(S.VolumeSummary, {
+      name: 'v1', driver: 'local', mountpoint: '/p', scope: 'local',
+      labels: {}, options: {},
+      in_use: false, used_by: [],
+      read_only: false,
+    })).toBe(true);
+  });
+
+  it('VolumeSummary accepts populated stack + used_by + size + read_only', () => {
+    expect(valid(S.VolumeSummary, {
+      name: 'v1', driver: 'local', mountpoint: '/p', scope: 'local',
+      created_at: '2026-06-10T10:00:00Z',
+      labels: { 'com.docker.compose.project': 'demo' },
+      options: {},
+      stack: 'demo',
+      in_use: true,
+      used_by: [
+        { container_id: 'abc', container_name: 'demo-web-1', mount_path: '/v', rw: true },
+        { container_id: 'def', container_name: 'demo-backup-1', mount_path: '/src', rw: false },
+      ],
+      size_bytes: 12345,
+      read_only: true,
+    })).toBe(true);
+  });
+
+  it('VolumeSummary rejects used_by entries missing fields', () => {
+    // (VolumeUsage is registered as part of VolumeSummary; we exercise
+    // its constraints through the parent rather than re-registering.)
+    expect(valid(S.VolumeSummary, {
+      name: 'v', driver: 'local', mountpoint: '/p', scope: 'local',
+      labels: {}, options: {}, in_use: true, read_only: false,
+      used_by: [{ container_id: 'x', container_name: 'y', mount_path: '/z' /* missing rw */ }],
+    })).toBe(false);
+  });
+
+  it('VolumeLabelsUpdateRequest accepts arbitrary string→string maps', () => {
+    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: {} })).toBe(true);
+    expect(valid(S.VolumeLabelsUpdateRequest, {
+      extra_labels: { 'com.docker.manager.readonly': 'true', 'owner': 'team-a' },
+    })).toBe(true);
+  });
+
+  it('VolumeLabelsUpdateRequest rejects non-string values', () => {
+    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: { x: 42 } })).toBe(false);
+    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: { x: null } })).toBe(false);
+  });
+
+  it('VolumeBulkDeleteRequest enforces min/max items', () => {
+    expect(valid(S.VolumeBulkDeleteRequest, { names: ['a'] })).toBe(true);
+    expect(valid(S.VolumeBulkDeleteRequest, { names: ['a', 'b'], force: true })).toBe(true);
+    expect(valid(S.VolumeBulkDeleteRequest, { names: [] })).toBe(false);
+    const tooMany = Array.from({ length: 1001 }, (_, i) => `v${i}`);
+    expect(valid(S.VolumeBulkDeleteRequest, { names: tooMany })).toBe(false);
+  });
+
+  it('VolumeBulkResponse has the expected shape', () => {
+    expect(valid(S.VolumeBulkResponse, {
+      succeeded: 2, failed: 1,
+      results: [
+        { name: 'v1', ok: true },
+        { name: 'v2', ok: true },
+        { name: 'v3', ok: false, error: 'in use' },
+      ],
+    })).toBe(true);
+  });
 });
 
 describe('CreateContainerRequest mem fields (M4)', () => {

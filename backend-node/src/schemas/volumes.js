@@ -15,6 +15,19 @@ export const CreateVolumeRequest = Type.Object(
   { $id: 'CreateVolumeRequest', additionalProperties: false },
 );
 
+// One entry of "which container is using this volume right now". Same
+// shape on the wire whether the volume is in use or not (we just send
+// an empty array). `rw` mirrors the kernel mount mode the container has.
+export const VolumeUsage = Type.Object(
+  {
+    container_id: Type.String(),
+    container_name: Type.String(),
+    mount_path: Type.String(),
+    rw: Type.Boolean(),
+  },
+  { $id: 'VolumeUsage', additionalProperties: false },
+);
+
 export const VolumeSummary = Type.Object(
   {
     name: Type.String(),
@@ -22,10 +35,77 @@ export const VolumeSummary = Type.Object(
     mountpoint: Type.String(),
     scope: Type.String(),
     created_at: Opt(Type.String()),
-    labels: Type.Record(Type.String(), Type.String()),
+    labels: Type.Record(Type.String(), Type.String(), {
+      description: 'Merged: daemon labels + manager extra_labels (extras win on conflict)',
+    }),
     options: Type.Record(Type.String(), Type.String()),
+    // Enriched fields — Portainer-parity columns for the volume list.
+    stack: Opt(Type.String({
+      description: 'Compose project name from com.docker.compose.project label',
+    })),
+    in_use: Type.Boolean({
+      description: 'True when at least one container has this volume mounted',
+    }),
+    used_by: Type.Array(VolumeUsage, {
+      description: 'Containers currently mounting this volume + their mount info',
+    }),
+    size_bytes: Opt(Type.Integer({
+      description: 'Disk usage (-1 = unknown). May be omitted when /system/df is slow/disabled.',
+    })),
+    read_only: Type.Boolean({
+      default: false,
+      description: 'True iff com.docker.manager.readonly label resolves to "true"',
+    }),
   },
   { $id: 'VolumeSummary', additionalProperties: true },
+);
+
+/**
+ * Replace the manager-side `extra_labels` map for a volume. We don't
+ * touch the daemon's own labels (the Engine API has no PATCH for that),
+ * but our list/inspect responses merge the two so the UI sees them as
+ * one label set. Pass an empty object to clear all manager labels.
+ */
+export const VolumeLabelsUpdateRequest = Type.Object(
+  {
+    extra_labels: Type.Record(Type.String(), Type.String(), {
+      description: 'Manager-side labels for this volume (replaces existing extras)',
+    }),
+  },
+  { $id: 'VolumeLabelsUpdateRequest', additionalProperties: false },
+);
+
+/**
+ * Bulk delete for the volume list's multi-select. Per-item failures
+ * (in-use, not-found) come back in `results` so the UI can render a
+ * row-by-row report rather than failing the whole batch on one error.
+ */
+export const VolumeBulkDeleteRequest = Type.Object(
+  {
+    names: Type.Array(Type.String({ minLength: 1, maxLength: 255 }), {
+      minItems: 1, maxItems: 1000,
+    }),
+    force: Type.Optional(Type.Boolean({ default: false })),
+  },
+  { $id: 'VolumeBulkDeleteRequest', additionalProperties: false },
+);
+
+export const VolumeBulkResult = Type.Object(
+  {
+    name: Type.String(),
+    ok: Type.Boolean(),
+    error: Opt(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const VolumeBulkResponse = Type.Object(
+  {
+    succeeded: Type.Integer(),
+    failed: Type.Integer(),
+    results: Type.Array(VolumeBulkResult),
+  },
+  { $id: 'VolumeBulkResponse', additionalProperties: false },
 );
 
 // ---------- Volume browser (Portainer-style file manager) ----------

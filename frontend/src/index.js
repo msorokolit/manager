@@ -1584,45 +1584,216 @@ import { FitAddon } from '@xterm/addon-fit';
        ${btn('Prune unused', { kind: 'secondary', id: 'prune-vols' })}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     );
-    const list = document.createElement('div'); root.appendChild(list);
 
-    async function load() {
-      list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
-      try {
-        const items = await api('/api/volumes');
-        const rows = items.map((v) => `
+    // Filter / search controls live above the table so they're visible
+    // without scrolling on long volume lists.
+    const controls = document.createElement('div');
+    controls.className = 'mb-3 flex flex-wrap items-center gap-2 text-xs';
+    controls.innerHTML = `
+      <input id="vols-search" type="text" placeholder="🔎 Search by name, mountpoint, stack…"
+             class="flex-1 min-w-[240px] rounded border-slate-700 bg-slate-950 text-sm"/>
+      <label class="flex items-center gap-2 text-slate-300">
+        <input id="vols-unused" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
+        Unused only
+      </label>
+      <label class="flex items-center gap-2 text-slate-300">
+        <input id="vols-ro" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
+        Read-only only
+      </label>
+      <span id="vols-count" class="text-slate-500 ml-auto"></span>
+    `;
+    root.appendChild(controls);
+
+    const bulk = document.createElement('div');
+    bulk.id = 'vols-bulk';
+    bulk.className = 'mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs';
+    bulk.innerHTML = `
+      <span><span id="vols-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
+      <div class="flex items-center gap-2">
+        <button id="vols-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>
+        <button id="vols-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
+      </div>`;
+    root.appendChild(bulk);
+
+    const listEl = document.createElement('div'); root.appendChild(listEl);
+
+    // ---- State for filters + selection ----
+    let lastVolumes = [];
+    const selected = new Set();
+
+    function visibleVolumes() {
+      const q = controls.querySelector('#vols-search').value.trim().toLowerCase();
+      const unusedOnly = controls.querySelector('#vols-unused').checked;
+      const roOnly = controls.querySelector('#vols-ro').checked;
+      return lastVolumes.filter((v) => {
+        if (unusedOnly && v.in_use) return false;
+        if (roOnly && !v.read_only) return false;
+        if (q) {
+          const hay = (v.name + ' ' + (v.mountpoint || '') + ' ' + (v.stack || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function renderBulkBar() {
+      if (selected.size === 0) {
+        bulk.classList.add('hidden'); bulk.classList.remove('flex'); return;
+      }
+      bulk.classList.remove('hidden'); bulk.classList.add('flex');
+      bulk.querySelector('#vols-bulk-count').textContent = String(selected.size);
+    }
+
+    function renderRows() {
+      const vols = visibleVolumes();
+      controls.querySelector('#vols-count').textContent =
+        `${vols.length} of ${lastVolumes.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+
+      if (lastVolumes.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No volumes on this host.</div>`;
+        return;
+      }
+      if (vols.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No volumes match the current filters.</div>`;
+        return;
+      }
+
+      const rows = vols.map((v) => {
+        const inUseBadge = v.in_use
+          ? `<span class="ml-1 inline-flex items-center rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300" title="${v.used_by.map((u)=>escapeHtml(u.container_name)+(u.rw?' (rw)':' (ro)')).join(', ')}">in use × ${v.used_by.length}</span>`
+          : `<span class="ml-1 inline-flex items-center rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">unused</span>`;
+        const roBadge = v.read_only
+          ? `<span class="ml-1 inline-flex items-center rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-300" title="com.docker.manager.readonly=true">RO</span>`
+          : '';
+        const sizeCell = v.size_bytes == null || v.size_bytes < 0
+          ? `<span class="text-slate-600">—</span>`
+          : `<span class="font-mono">${escapeHtml(fmtBytes(v.size_bytes))}</span>`;
+        const stackCell = v.stack
+          ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(v.stack)}</a>`
+          : `<span class="text-slate-600">—</span>`;
+        const isChecked = selected.has(v.name) ? 'checked' : '';
+        return `
           <tr class="hover:bg-slate-900/60">
-            <td class="px-4 py-2">
-              <div class="font-medium">${escapeHtml(v.name)}</div>
-              <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(v.driver || '')}</div>
+            <td class="px-3 py-2 w-8">
+              <input type="checkbox" class="vols-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(v.name)}" ${isChecked}/>
             </td>
-            <td class="px-4 py-2 text-slate-300 font-mono text-xs">${escapeHtml(v.mountpoint || '')}</td>
+            <td class="px-4 py-2">
+              <div class="font-medium">${escapeHtml(v.name)}${roBadge}${inUseBadge}</div>
+              <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(v.driver || '')} · ${escapeHtml(v.mountpoint || '')}</div>
+            </td>
+            <td class="px-4 py-2 text-slate-300">${stackCell}</td>
+            <td class="px-4 py-2 text-slate-400">${sizeCell}</td>
             <td class="px-4 py-2 text-slate-400">${fmtDate(v.created_at)}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                <button data-act="browse" data-id="${v.name}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>
-                <button data-act="inspect" data-id="${v.name}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
-                <button data-act="remove" data-id="${v.name}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                <button data-act="browse" data-id="${escapeHtml(v.name)}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>
+                <button data-act="inspect" data-id="${escapeHtml(v.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
+                <button data-act="remove" data-id="${escapeHtml(v.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = table(['Name', 'Mountpoint', 'Created', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      listEl.innerHTML = table(
+        [
+          `<input id="vols-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all visible"/>`,
+          'Name', 'Stack', 'Size', 'Created', '',
+        ],
+        rows,
+      );
+
+      // Sync select-all checkbox state
+      const cb = listEl.querySelector('#vols-select-all');
+      if (cb) {
+        const onPage = vols.filter((v) => selected.has(v.name)).length;
+        cb.checked = onPage === vols.length;
+        cb.indeterminate = onPage > 0 && onPage < vols.length;
+        cb.addEventListener('change', (e) => {
+          if (e.target.checked) for (const v of vols) selected.add(v.name);
+          else for (const v of vols) selected.delete(v.name);
+          renderRows(); renderBulkBar();
+        });
       }
     }
 
-    list.addEventListener('click', async (e) => {
+    async function load() {
+      listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        lastVolumes = await api('/api/volumes');
+        // Drop selections for volumes that no longer exist after the refresh.
+        for (const n of [...selected]) {
+          if (!lastVolumes.some((v) => v.name === n)) selected.delete(n);
+        }
+        renderRows();
+        renderBulkBar();
+      } catch (e) {
+        listEl.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // ---- Event wiring ----
+    controls.querySelector('#vols-search').addEventListener('input', () => { renderRows(); });
+    controls.querySelector('#vols-unused').addEventListener('change', () => { renderRows(); });
+    controls.querySelector('#vols-ro').addEventListener('change', () => { renderRows(); });
+
+    listEl.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.vols-check');
+      if (!cb) return;
+      if (cb.checked) selected.add(cb.dataset.name);
+      else selected.delete(cb.dataset.name);
+      renderBulkBar();
+      // Refresh just the select-all + count, cheap to re-render
+      controls.querySelector('#vols-count').textContent =
+        `${visibleVolumes().length} of ${lastVolumes.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+      const all = listEl.querySelector('#vols-select-all');
+      if (all) {
+        const vols = visibleVolumes();
+        const onPage = vols.filter((v) => selected.has(v.name)).length;
+        all.checked = onPage === vols.length;
+        all.indeterminate = onPage > 0 && onPage < vols.length;
+      }
+    });
+
+    bulk.querySelector('#vols-bulk-clear').onclick = () => { selected.clear(); renderRows(); renderBulkBar(); };
+    bulk.querySelector('#vols-bulk-rm').onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const ok = await confirmModal(
+        `Delete <strong>${names.length}</strong> volume${names.length === 1 ? '' : 's'}? <em>This is permanent — data will be lost.</em>`,
+        { danger: true, confirmLabel: 'Delete all' },
+      );
+      if (!ok) return;
+      try {
+        const out = await api('/api/volumes/delete/bulk', {
+          method: 'POST',
+          body: JSON.stringify({ names, force: false }),
+        });
+        for (const r of out.results || []) {
+          if (!r.ok) toast(`${r.name}: ${r.error || 'failed'}`, 'error');
+        }
+        if (out.succeeded) {
+          toast(`Deleted ${out.succeeded}${out.failed ? ` of ${names.length}` : ''}`, out.failed ? 'warn' : 'success');
+        }
+      } catch (e) { toast(`Bulk delete failed: ${e.message}`, 'error'); }
+      selected.clear();
+      load();
+    };
+
+    listEl.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
       const id = t.dataset.id; const act = t.dataset.act;
       try {
         if (act === 'browse') {
           await openVolumeBrowser(id);
         } else if (act === 'inspect') {
-          const data = await api(`/api/volumes/${encodeURIComponent(id)}`);
-          await modal({ title: `Inspect volume`, body: jsonView(data), size: 'xl' });
+          await openVolumeInspect(id, () => load());
         } else if (act === 'remove') {
-          const ok = await confirmModal('Remove this volume? Data will be lost.', { danger: true, confirmLabel: 'Remove' });
+          const v = lastVolumes.find((x) => x.name === id);
+          const warn = v && v.in_use
+            ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${v.used_by.length} container(s) — delete will fail unless you stop them first.</p>`
+            : '';
+          const ok = await confirmModal(`Remove volume <code>${escapeHtml(id)}</code>? Data will be lost.${warn}`, { danger: true, confirmLabel: 'Remove' });
           if (!ok) return;
           await api(`/api/volumes/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
           toast('Volume removed', 'success'); load();
@@ -2164,6 +2335,339 @@ import { FitAddon } from '@xterm/addon-fit';
     return sameYear
       ? d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })
       : d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: '2-digit' });
+  }
+
+  /**
+   * Portainer-style tabbed inspect modal.
+   *
+   * Tabs:
+   *   Overview   metadata + RO toggle + Browse / Delete actions
+   *   Mounted by list of containers using it (container -> mount path + rw/ro)
+   *   Labels     editor for the merged label set; manager-side labels
+   *              are written through PUT /api/volumes/:name/labels.
+   *              Daemon labels are read-only with a "(daemon)" badge.
+   *   Raw        the full dockerode inspect payload (jsonView)
+   *
+   * `onChange` is called after any mutation (delete, RO toggle, label
+   * save) so the caller can refresh its list.
+   */
+  async function openVolumeInspect(name, onChange) {
+    let data;
+    try { data = await api(`/api/volumes/${encodeURIComponent(name)}`); }
+    catch (e) { toast(e.message, 'error'); return; }
+
+    const READONLY_LABEL = 'com.docker.manager.readonly';
+    const daemonLabels = data.DaemonLabels || {};
+    const extraLabels = { ...(data.ExtraLabels || {}) };
+
+    const wrap = document.createElement('div');
+    wrap.className = 'flex flex-col gap-3';
+    wrap.innerHTML = `
+      <div class="flex flex-wrap items-center gap-2 text-xs border-b border-slate-800 pb-2">
+        ${['overview','mounted','labels','browse','raw'].map((t, i) => `
+          <button data-tab="${t}" class="vi-tab rounded px-2 py-1 ${i===0?'bg-sky-500/20 text-sky-300':'text-slate-400 hover:bg-slate-800'}">${
+            {overview:'Overview', mounted:'Mounted by', labels:'Labels', browse:'Browse', raw:'Raw'}[t]
+          }</button>
+        `).join('')}
+        <span class="ml-auto flex items-center gap-1">
+          ${data.ReadOnly ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">read-only</span>` : ''}
+          ${data.InUse ? `<span class="inline-flex items-center rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">in use × ${data.UsedBy.length}</span>` : `<span class="inline-flex items-center rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
+        </span>
+      </div>
+      <div id="vi-panel" class="min-h-[40vh]"></div>`;
+
+    const panel = wrap.querySelector('#vi-panel');
+
+    function fieldRow(label, value, opts = {}) {
+      return `
+        <div class="grid grid-cols-[10rem_1fr] gap-3 py-1.5 border-b border-slate-800/50">
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 self-start mt-0.5">${escapeHtml(label)}</div>
+          <div class="text-sm ${opts.mono ? 'font-mono text-slate-300' : 'text-slate-200'}">${value}</div>
+        </div>`;
+    }
+
+    function copyButton(text, label = 'copy') {
+      const id = `c-${Math.random().toString(36).slice(2, 8)}`;
+      return `<button id="${id}" data-copy="${escapeHtml(text)}" class="ml-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300">${label}</button>`;
+    }
+
+    function renderOverview() {
+      const stackLink = data.Stack
+        ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(data.Stack)}</a>`
+        : '<span class="text-slate-500">—</span>';
+      const optsRows = Object.entries(data.Options || {}).map(([k, v]) =>
+        `<tr><td class="pr-3 py-0.5 text-slate-400 font-mono text-[11px]">${escapeHtml(k)}</td><td class="font-mono text-[11px] text-slate-200">${escapeHtml(String(v))}</td></tr>`,
+      ).join('');
+      panel.innerHTML = `
+        <div class="space-y-1">
+          ${fieldRow('Name', `<code class="text-slate-100">${escapeHtml(data.Name)}</code>${copyButton(data.Name)}`)}
+          ${fieldRow('Driver', escapeHtml(data.Driver), { mono: true })}
+          ${fieldRow('Scope', escapeHtml(data.Scope || ''))}
+          ${fieldRow('Mountpoint', `<span class="font-mono">${escapeHtml(data.Mountpoint || '')}</span>${copyButton(data.Mountpoint || '')}`)}
+          ${fieldRow('Stack (owner)', stackLink)}
+          ${fieldRow('Created', escapeHtml(data.CreatedAt || ''))}
+          ${fieldRow('Driver options', optsRows ? `<table>${optsRows}</table>` : '<span class="text-slate-500">none</span>')}
+          ${fieldRow('Read-only', `
+            <label class="inline-flex items-center gap-2 cursor-pointer text-sm">
+              <input id="vi-ro-toggle" type="checkbox" class="h-4 w-4" ${data.ReadOnly ? 'checked' : ''}/>
+              <span class="text-slate-400">Refuse all write operations on this volume. Sets <code class="text-[11px]">${READONLY_LABEL}=true</code>.</span>
+            </label>
+          `)}
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>
+          <button id="vi-delete" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove volume</button>
+        </div>`;
+
+      panel.querySelector('#vi-ro-toggle').addEventListener('change', async (e) => {
+        try {
+          const next = { ...extraLabels };
+          if (e.target.checked) next[READONLY_LABEL] = 'true';
+          else delete next[READONLY_LABEL];
+          await api(`/api/volumes/${encodeURIComponent(name)}/labels`, {
+            method: 'PUT',
+            body: JSON.stringify({ extra_labels: next }),
+          });
+          extraLabels[READONLY_LABEL] = next[READONLY_LABEL];
+          if (!next[READONLY_LABEL]) delete extraLabels[READONLY_LABEL];
+          data.ReadOnly = !!next[READONLY_LABEL];
+          data.Labels = { ...daemonLabels, ...extraLabels };
+          toast(`Read-only ${e.target.checked ? 'enabled' : 'disabled'}`, 'success');
+          if (onChange) onChange();
+        } catch (ex) {
+          toast(ex.message, 'error');
+          e.target.checked = !e.target.checked; // roll back UI
+        }
+      });
+      panel.querySelector('#vi-browse').onclick = async () => {
+        // The Browse tab embeds the file manager directly; switch to it.
+        activate('browse');
+      };
+      panel.querySelector('#vi-delete').onclick = async () => {
+        const warn = data.InUse
+          ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${data.UsedBy.length} container(s) — delete will fail unless you stop them first.</p>`
+          : '';
+        const ok = await confirmModal(
+          `Remove volume <code>${escapeHtml(name)}</code>? Data will be lost.${warn}`,
+          { danger: true, confirmLabel: 'Remove' },
+        );
+        if (!ok) return;
+        try {
+          await api(`/api/volumes/${encodeURIComponent(name)}?force=true`, { method: 'DELETE' });
+          toast('Volume removed', 'success');
+          if (onChange) onChange();
+          // Force-close the inspect modal.
+          modalRef.close && modalRef.close(null);
+        } catch (ex) { toast(ex.message, 'error'); }
+      };
+    }
+
+    function renderMounted() {
+      if (!data.InUse) {
+        panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">Not mounted by any container.</div>`;
+        return;
+      }
+      const rows = data.UsedBy.map((u) => `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-4 py-2"><code class="text-slate-100">${escapeHtml(u.container_name)}</code><div class="text-[11px] text-slate-500 font-mono">${escapeHtml(u.container_id.slice(0, 12))}</div></td>
+          <td class="px-4 py-2 font-mono text-xs text-slate-300">${escapeHtml(u.mount_path)}</td>
+          <td class="px-4 py-2">${u.rw
+            ? `<span class="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">rw</span>`
+            : `<span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-300">ro</span>`}</td>
+        </tr>`).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">${data.UsedBy.length} container${data.UsedBy.length === 1 ? '' : 's'} currently mount${data.UsedBy.length === 1 ? 's' : ''} this volume.</p>
+        <table class="w-full text-left text-sm">
+          <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="px-4 py-2">Container</th><th class="px-4 py-2">Mount path</th><th class="px-4 py-2">Mode</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function renderLabels() {
+      const merged = { ...daemonLabels, ...extraLabels };
+      const allKeys = [...new Set([...Object.keys(daemonLabels), ...Object.keys(extraLabels)])].sort();
+      const rows = allKeys.map((k) => {
+        const fromDaemon = k in daemonLabels;
+        const fromManager = k in extraLabels;
+        const value = merged[k];
+        const sourceBadge = fromManager && fromDaemon
+          ? `<span class="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] text-sky-300">manager (overrides daemon)</span>`
+          : fromManager
+            ? `<span class="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] text-sky-300">manager</span>`
+            : `<span class="rounded bg-slate-700/40 px-1.5 py-0.5 text-[9px] text-slate-400">daemon (immutable)</span>`;
+        return `
+          <tr class="border-b border-slate-800/60">
+            <td class="px-2 py-1">
+              <input ${fromDaemon && !fromManager ? 'disabled' : ''} data-k="${escapeHtml(k)}" data-field="k"
+                     value="${escapeHtml(k)}" class="vi-label-input w-full rounded border-slate-700 bg-slate-950 px-2 py-1 text-xs font-mono text-slate-200 disabled:opacity-60"/>
+            </td>
+            <td class="px-2 py-1">
+              <input ${fromDaemon && !fromManager ? 'disabled' : ''} data-k="${escapeHtml(k)}" data-field="v"
+                     value="${escapeHtml(value)}" class="vi-label-input w-full rounded border-slate-700 bg-slate-950 px-2 py-1 text-xs font-mono text-slate-200 disabled:opacity-60"/>
+            </td>
+            <td class="px-2 py-1 text-right whitespace-nowrap">${sourceBadge}
+              ${fromManager ? `<button data-k="${escapeHtml(k)}" data-act="rm" class="ml-1 rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5 py-0.5 text-[10px]">×</button>` : ''}
+            </td>
+          </tr>`;
+      }).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">
+          Daemon labels are immutable (Docker has no API to edit them after creation). Manager labels are stored separately and merged into every inspect — they're how the read-only marker and other manager-side metadata persist.
+        </p>
+        <table class="w-full text-left">
+          <thead class="text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="px-2 py-1">Key</th><th class="px-2 py-1">Value</th><th class="px-2 py-1 text-right">Source</th></tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="3" class="px-2 py-4 text-center text-xs text-slate-500">No labels</td></tr>'}</tbody>
+        </table>
+        <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
+          <input id="vi-label-newk" placeholder="new.label.key" class="rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs"/>
+          <input id="vi-label-newv" placeholder="value" class="rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs"/>
+          <button id="vi-label-add" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-slate-300">+ Add label</button>
+          <span class="ml-auto"></span>
+          <button id="vi-label-save" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1 font-medium">Save changes</button>
+        </div>
+        <div id="vi-label-status" class="mt-2 hidden rounded px-3 py-1.5 text-xs"></div>`;
+
+      function setStatus(msg, kind = 'info') {
+        const el = panel.querySelector('#vi-label-status');
+        if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
+        el.classList.remove('hidden');
+        el.textContent = msg;
+        el.className = 'mt-2 rounded px-3 py-1.5 text-xs ' + (
+          kind === 'err' ? 'bg-rose-500/15 text-rose-200'
+          : kind === 'ok' ? 'bg-emerald-500/15 text-emerald-200'
+          : 'bg-slate-800/60 text-slate-300');
+      }
+
+      // Live-collect the manager-side label state from the inputs + the
+      // remove buttons; the daemon labels are skipped (disabled inputs).
+      function collectExtras() {
+        const next = {};
+        // Keep extras whose key wasn't removed via the × button
+        const removed = new Set();
+        for (const b of panel.querySelectorAll('button[data-act="rm"][data-removed="1"]')) {
+          removed.add(b.dataset.k);
+        }
+        for (const k of Object.keys(extraLabels)) {
+          if (removed.has(k)) continue;
+          const kInput = panel.querySelector(`input.vi-label-input[data-k="${CSS.escape(k)}"][data-field="k"]`);
+          const vInput = panel.querySelector(`input.vi-label-input[data-k="${CSS.escape(k)}"][data-field="v"]`);
+          const finalK = (kInput?.value || k).trim();
+          const finalV = (vInput?.value || '').trim();
+          if (finalK) next[finalK] = finalV;
+        }
+        const nk = panel.querySelector('#vi-label-newk').value.trim();
+        const nv = panel.querySelector('#vi-label-newv').value.trim();
+        if (nk) next[nk] = nv;
+        return next;
+      }
+
+      panel.addEventListener('click', (e) => {
+        const t = e.target.closest('button[data-act="rm"]'); if (!t) return;
+        t.dataset.removed = '1';
+        // Visually grey the row
+        const row = t.closest('tr');
+        for (const i of row.querySelectorAll('input')) i.disabled = true;
+        row.classList.add('line-through', 'opacity-50');
+        t.disabled = true;
+      });
+
+      panel.querySelector('#vi-label-add').onclick = () => {
+        // Just commit + re-render to absorb the new row cleanly.
+        const next = collectExtras();
+        // Apply optimistically to in-modal state, then re-render Labels.
+        Object.keys(extraLabels).forEach((k) => delete extraLabels[k]);
+        Object.assign(extraLabels, next);
+        renderLabels();
+      };
+
+      panel.querySelector('#vi-label-save').onclick = async () => {
+        const next = collectExtras();
+        try {
+          const out = await api(`/api/volumes/${encodeURIComponent(name)}/labels`, {
+            method: 'PUT',
+            body: JSON.stringify({ extra_labels: next }),
+          });
+          Object.keys(extraLabels).forEach((k) => delete extraLabels[k]);
+          Object.assign(extraLabels, out.extra_labels || {});
+          data.ExtraLabels = extraLabels;
+          data.Labels = { ...daemonLabels, ...extraLabels };
+          data.ReadOnly = extraLabels[READONLY_LABEL] === 'true';
+          setStatus(`Saved ${Object.keys(extraLabels).length} manager-side label${Object.keys(extraLabels).length === 1 ? '' : 's'}`, 'ok');
+          renderLabels();
+          if (onChange) onChange();
+        } catch (ex) {
+          setStatus(ex.message, 'err');
+        }
+      };
+    }
+
+    function renderBrowse() {
+      // Embed the existing volume browser by mounting a placeholder; the
+      // browser code expects to live in a modal, so we adapt by giving
+      // it our panel and surfacing a "open standalone" button instead
+      // of re-implementing it.
+      panel.innerHTML = `
+        <div class="rounded border border-slate-800 bg-slate-950/40 p-6 text-center text-sm text-slate-300">
+          <p class="mb-3">The file manager opens in a dedicated full-screen modal.</p>
+          <button id="vi-browse-open" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-2 font-medium">📁 Open file manager</button>
+        </div>`;
+      panel.querySelector('#vi-browse-open').onclick = async () => {
+        // Close the inspect modal first so we don't have two on top of
+        // each other (the browser is already xl and its own world).
+        modalRef.close && modalRef.close(null);
+        await openVolumeBrowser(name);
+      };
+    }
+
+    function renderRaw() {
+      panel.innerHTML = '';
+      panel.appendChild(jsonView({
+        ...data,
+        // Hide our enriched fields from the raw view — they're shown in
+        // their own tabs and would otherwise clutter the JSON.
+        DaemonLabels: undefined, ExtraLabels: undefined,
+        UsedBy: undefined, InUse: undefined, ReadOnly: undefined, Stack: undefined,
+      }));
+    }
+
+    const renderers = {
+      overview: renderOverview,
+      mounted: renderMounted,
+      labels: renderLabels,
+      browse: renderBrowse,
+      raw: renderRaw,
+    };
+
+    function activate(t) {
+      for (const b of wrap.querySelectorAll('.vi-tab')) {
+        const on = b.dataset.tab === t;
+        b.className = 'vi-tab rounded px-2 py-1 ' + (on ? 'bg-sky-500/20 text-sky-300' : 'text-slate-400 hover:bg-slate-800');
+      }
+      renderers[t]();
+    }
+
+    wrap.addEventListener('click', (e) => {
+      const t = e.target.closest('.vi-tab'); if (t) activate(t.dataset.tab);
+      // Copy buttons
+      const c = e.target.closest('button[data-copy]');
+      if (c) {
+        const txt = c.dataset.copy;
+        navigator.clipboard?.writeText(txt).then(() => {
+          c.textContent = 'copied'; setTimeout(() => { c.textContent = 'copy'; }, 1200);
+        }).catch(() => toast('Copy failed (clipboard unavailable)', 'warn'));
+      }
+    });
+
+    activate('overview');
+
+    const modalRef = {};
+    await modal({
+      title: `Inspect: ${name}`, body: wrap, size: 'xl', ref: modalRef,
+    });
   }
 
   async function openVolumeBrowser(volumeName) {
