@@ -3,15 +3,9 @@
 // We enrich the daemon's volume list with three things Portainer ships
 // out of the box but Docker's /volumes API doesn't carry:
 //   - which containers are using the volume right now, and in what mode
+//     (each used_by entry carries the kernel mount mode as `rw`)
 //   - the owning compose project (via the com.docker.compose.project label)
 //   - on-disk size (via /system/df, best-effort: it's slow on huge hosts)
-//
-// And one Portainer-equivalent feature: the `com.docker.manager.readonly`
-// label, set at volume create time, that disables every write operation
-// in the file manager. Labels are immutable in Docker (no PATCH endpoint
-// for them), so flipping read-only on an existing volume requires a
-// delete + recreate-with-label cycle. That's the same contract the
-// `com.docker.compose.*` labels work under.
 import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, boolQuery } from '../util.js';
@@ -26,13 +20,7 @@ import {
 
 const r = createApiRouter('/api/volumes', { tag: 'volumes' });
 
-const READONLY_LABEL = 'com.docker.manager.readonly';
 const STACK_LABEL = 'com.docker.compose.project';
-
-/** True iff the volume's native labels mark it read-only. */
-export function isVolumeReadOnly(labels) {
-  return (labels || {})[READONLY_LABEL] === 'true';
-}
 
 // Build a {volume_name -> [{container_id, container_name, mount_path, rw}]}
 // map from a single listContainers(all) call. We do this once per /volumes
@@ -92,7 +80,6 @@ function enrich(v, { usage, sizes }) {
     in_use: used.length > 0,
     used_by: used,
     size_bytes: sz,
-    read_only: isVolumeReadOnly(labels),
   };
 }
 
@@ -114,7 +101,7 @@ const RemoveQuery = Type.Object(
 r.get(
   '/',
   {
-    summary: 'List volumes (enriched: usage, stack owner, size, read-only marker)',
+    summary: 'List volumes (enriched: usage with per-container rw/ro mode, stack owner, size)',
     query: ListQuery,
     responses: { 200: Type.Array(VolumeSummary) },
   },
@@ -207,7 +194,7 @@ r.post(
 r.get(
   '/:name',
   {
-    summary: 'Inspect a volume (enriched with usage, stack, read-only marker)',
+    summary: 'Inspect a volume (enriched with usage + stack)',
     params: NameParam,
     responses: { 200: PassThroughObject },
   },
@@ -223,7 +210,6 @@ r.get(
       ...v,
       UsedBy: usage.get(req.params.name) || [],
       InUse: (usage.get(req.params.name) || []).length > 0,
-      ReadOnly: isVolumeReadOnly(labels),
       Stack: labels[STACK_LABEL] || null,
     });
   }),

@@ -274,11 +274,10 @@ describe('Volume browser schemas', () => {
       name: 'v1', driver: 'local', mountpoint: '/p', scope: 'local',
       labels: {}, options: {},
       in_use: false, used_by: [],
-      read_only: false,
     })).toBe(true);
   });
 
-  it('VolumeSummary accepts populated stack + used_by + size + read_only', () => {
+  it('VolumeSummary accepts populated stack + used_by with mixed rw/ro mounts + size', () => {
     expect(valid(S.VolumeSummary, {
       name: 'v1', driver: 'local', mountpoint: '/p', scope: 'local',
       created_at: '2026-06-10T10:00:00Z',
@@ -291,16 +290,15 @@ describe('Volume browser schemas', () => {
         { container_id: 'def', container_name: 'demo-backup-1', mount_path: '/src', rw: false },
       ],
       size_bytes: 12345,
-      read_only: true,
     })).toBe(true);
   });
 
-  it('VolumeSummary rejects used_by entries missing fields', () => {
+  it('VolumeSummary rejects used_by entries missing the rw mode', () => {
     // (VolumeUsage is registered as part of VolumeSummary; we exercise
     // its constraints through the parent rather than re-registering.)
     expect(valid(S.VolumeSummary, {
       name: 'v', driver: 'local', mountpoint: '/p', scope: 'local',
-      labels: {}, options: {}, in_use: true, read_only: false,
+      labels: {}, options: {}, in_use: true,
       used_by: [{ container_id: 'x', container_name: 'y', mount_path: '/z' /* missing rw */ }],
     })).toBe(false);
   });

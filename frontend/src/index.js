@@ -1596,10 +1596,6 @@ import { FitAddon } from '@xterm/addon-fit';
         <input id="vols-unused" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
         Unused only
       </label>
-      <label class="flex items-center gap-2 text-slate-300">
-        <input id="vols-ro" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
-        Read-only only
-      </label>
       <span id="vols-count" class="text-slate-500 ml-auto"></span>
     `;
     root.appendChild(controls);
@@ -1624,10 +1620,8 @@ import { FitAddon } from '@xterm/addon-fit';
     function visibleVolumes() {
       const q = controls.querySelector('#vols-search').value.trim().toLowerCase();
       const unusedOnly = controls.querySelector('#vols-unused').checked;
-      const roOnly = controls.querySelector('#vols-ro').checked;
       return lastVolumes.filter((v) => {
         if (unusedOnly && v.in_use) return false;
-        if (roOnly && !v.read_only) return false;
         if (q) {
           const hay = (v.name + ' ' + (v.mountpoint || '') + ' ' + (v.stack || '')).toLowerCase();
           if (!hay.includes(q)) return false;
@@ -1660,12 +1654,18 @@ import { FitAddon } from '@xterm/addon-fit';
       }
 
       const rows = vols.map((v) => {
+        const rwCount = v.used_by.filter((u) => u.rw).length;
+        const roCount = v.used_by.length - rwCount;
+        // Split the "in use" badge into rw / ro pills so an admin can
+        // see at a glance whether the volume is actively being WRITTEN
+        // by something — important when deciding if it's safe to delete
+        // or edit through the file manager.
         const inUseBadge = v.in_use
-          ? `<span class="ml-1 inline-flex items-center rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300" title="${v.used_by.map((u)=>escapeHtml(u.container_name)+(u.rw?' (rw)':' (ro)')).join(', ')}">in use × ${v.used_by.length}</span>`
+          ? `<span class="ml-1 inline-flex items-center gap-1 text-[10px]" title="${v.used_by.map((u)=>escapeHtml(u.container_name)+': '+escapeHtml(u.mount_path)+(u.rw?' (rw)':' (ro)')).join(', ')}">
+              ${rwCount > 0 ? `<span class="rounded bg-emerald-500/20 px-1.5 py-0.5 font-medium text-emerald-300">rw × ${rwCount}</span>` : ''}
+              ${roCount > 0 ? `<span class="rounded bg-amber-500/20 px-1.5 py-0.5 font-medium text-amber-300">ro × ${roCount}</span>` : ''}
+            </span>`
           : `<span class="ml-1 inline-flex items-center rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">unused</span>`;
-        const roBadge = v.read_only
-          ? `<span class="ml-1 inline-flex items-center rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-300" title="com.docker.manager.readonly=true">RO</span>`
-          : '';
         const sizeCell = v.size_bytes == null || v.size_bytes < 0
           ? `<span class="text-slate-600">—</span>`
           : `<span class="font-mono">${escapeHtml(fmtBytes(v.size_bytes))}</span>`;
@@ -1679,7 +1679,7 @@ import { FitAddon } from '@xterm/addon-fit';
               <input type="checkbox" class="vols-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(v.name)}" ${isChecked}/>
             </td>
             <td class="px-4 py-2">
-              <div class="font-medium">${escapeHtml(v.name)}${roBadge}${inUseBadge}</div>
+              <div class="font-medium">${escapeHtml(v.name)}${inUseBadge}</div>
               <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(v.driver || '')} · ${escapeHtml(v.mountpoint || '')}</div>
             </td>
             <td class="px-4 py-2 text-slate-300">${stackCell}</td>
@@ -1734,7 +1734,6 @@ import { FitAddon } from '@xterm/addon-fit';
     // ---- Event wiring ----
     controls.querySelector('#vols-search').addEventListener('input', () => { renderRows(); });
     controls.querySelector('#vols-unused').addEventListener('change', () => { renderRows(); });
-    controls.querySelector('#vols-ro').addEventListener('change', () => { renderRows(); });
 
     listEl.addEventListener('change', (e) => {
       const cb = e.target.closest('input.vols-check');
@@ -1819,18 +1818,9 @@ import { FitAddon } from '@xterm/addon-fit';
           <label class="block"><span class="text-xs text-slate-400">Driver options (KEY=VALUE per line)</span>
             <textarea id="v-driveropts" rows="3" placeholder="type=nfs&#10;o=addr=1.2.3.4,rw&#10;device=:/exports/data"
                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
-          <label class="block"><span class="text-xs text-slate-400">Labels (KEY=VALUE per line)</span>
+          <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Labels (KEY=VALUE per line)</span>
             <textarea id="v-labels" rows="3" placeholder="owner=team-a&#10;tier=prod"
                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
-          <label class="md:col-span-2 flex items-start gap-2 text-xs text-slate-300">
-            <input id="v-readonly" type="checkbox" class="mt-0.5 h-3.5 w-3.5"/>
-            <span>
-              <strong>Mark as read-only</strong> &mdash; adds <code class="text-[11px]">com.docker.manager.readonly=true</code> to the labels.
-              The file manager will refuse every write operation on this volume.
-              Labels are immutable, so this can only be set at create time;
-              to unmark, delete and recreate without the label.
-            </span>
-          </label>
         </div>`;
 
       function parseKv(text) {
@@ -1852,14 +1842,10 @@ import { FitAddon } from '@xterm/addon-fit';
         actions: [
           { label: 'Cancel', value: false, kind: 'secondary' },
           { label: 'Create', kind: 'primary', value: true, onClick: async () => {
-            const labels = parseKv(wrap.querySelector('#v-labels').value);
-            if (wrap.querySelector('#v-readonly').checked) {
-              labels['com.docker.manager.readonly'] = 'true';
-            }
             const payload = {
               name: wrap.querySelector('#v-name').value.trim(),
               driver: wrap.querySelector('#v-driver').value.trim() || 'local',
-              labels,
+              labels: parseKv(wrap.querySelector('#v-labels').value),
               driver_opts: parseKv(wrap.querySelector('#v-driveropts').value),
             };
             if (!payload.name) return false;
@@ -2377,26 +2363,24 @@ import { FitAddon } from '@xterm/addon-fit';
    * Portainer-style tabbed inspect modal.
    *
    * Tabs:
-   *   Overview   metadata + RO toggle + Browse / Delete actions
+   *   Overview   metadata + Browse / Delete actions
    *   Mounted by list of containers using it (container -> mount path + rw/ro)
-   *   Labels     editor for the merged label set; manager-side labels
-   *              are written through PUT /api/volumes/:name/labels.
-   *              Daemon labels are read-only with a "(daemon)" badge.
+   *   Labels     display-only — Docker labels are immutable after
+   *              volume creation, so we show them but never edit
+   *   Browse     embeds the file manager
    *   Raw        the full dockerode inspect payload (jsonView)
    *
-   * `onChange` is called after any mutation (delete, RO toggle, label
-   * save) so the caller can refresh its list.
+   * `onChange` is called after a delete so the caller can refresh
+   * its list.
    */
   async function openVolumeInspect(name, onChange) {
     let data;
     try { data = await api(`/api/volumes/${encodeURIComponent(name)}`); }
     catch (e) { toast(e.message, 'error'); return; }
 
-    const READONLY_LABEL = 'com.docker.manager.readonly';
-    // Native Docker labels are immutable after volume creation, so the
-    // inspect modal can only DISPLAY them — there's no "save" path. To
-    // change a volume's labels (including the read-only marker), the
-    // admin recreates it with the new label set at create time.
+    // Native Docker labels are immutable after volume creation (the
+    // Engine API has no PATCH /volumes/{name}). The Labels tab below
+    // displays them but never edits.
     const labels = { ...(data.Labels || {}) };
 
     const wrap = document.createElement('div');
@@ -2409,8 +2393,12 @@ import { FitAddon } from '@xterm/addon-fit';
           }</button>
         `).join('')}
         <span class="ml-auto flex items-center gap-1">
-          ${data.ReadOnly ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">read-only</span>` : ''}
-          ${data.InUse ? `<span class="inline-flex items-center rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">in use × ${data.UsedBy.length}</span>` : `<span class="inline-flex items-center rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
+          ${data.InUse ? (() => {
+            const rwN = data.UsedBy.filter((u) => u.rw).length;
+            const roN = data.UsedBy.length - rwN;
+            return `${rwN > 0 ? `<span class="inline-flex items-center rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">rw × ${rwN}</span>` : ''}
+                    ${roN > 0 ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">ro × ${roN}</span>` : ''}`;
+          })() : `<span class="inline-flex items-center rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
         </span>
       </div>
       <div id="vi-panel" class="min-h-[40vh]"></div>`;
@@ -2446,10 +2434,6 @@ import { FitAddon } from '@xterm/addon-fit';
           ${fieldRow('Stack (owner)', stackLink)}
           ${fieldRow('Created', escapeHtml(data.CreatedAt || ''))}
           ${fieldRow('Driver options', optsRows ? `<table>${optsRows}</table>` : '<span class="text-slate-500">none</span>')}
-          ${fieldRow('Read-only', data.ReadOnly
-            ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300">enabled</span>
-               <span class="ml-2 text-xs text-slate-500">Set via <code class="text-[11px]">${READONLY_LABEL}=true</code> at volume create time. Recreate the volume to change this.</span>`
-            : `<span class="text-xs text-slate-500">Not set. To enable, create a new volume with <code class="text-[11px]">${READONLY_LABEL}=true</code> in its labels.</span>`)}
         </div>
         <div class="mt-4 flex flex-wrap gap-2">
           <button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>
@@ -2513,10 +2497,9 @@ import { FitAddon } from '@xterm/addon-fit';
       panel.innerHTML = `
         <p class="mb-2 text-xs text-slate-500">
           Volume labels are set at create time and are <strong>immutable</strong> — Docker's Engine API has no
-          <code class="text-[11px]">PATCH /volumes/{name}</code> endpoint. To add or change labels (including the
-          <code class="text-[11px]">${READONLY_LABEL}</code> marker), delete the volume and recreate it with the new label set.
-          The same rule applies to <code class="text-[11px]">com.docker.compose.project</code> and every other label
-          you see here.
+          <code class="text-[11px]">PATCH /volumes/{name}</code> endpoint. To add or change labels (e.g.
+          <code class="text-[11px]">com.docker.compose.project</code>), delete the volume and recreate it with the
+          new label set.
         </p>
         <table class="w-full text-left">
           <thead class="text-[10px] uppercase tracking-wider text-slate-400">
@@ -2550,7 +2533,7 @@ import { FitAddon } from '@xterm/addon-fit';
         ...data,
         // Hide our enriched fields from the raw view — they're shown in
         // their own tabs and would otherwise clutter the JSON.
-        UsedBy: undefined, InUse: undefined, ReadOnly: undefined, Stack: undefined,
+        UsedBy: undefined, InUse: undefined, Stack: undefined,
       }));
     }
 

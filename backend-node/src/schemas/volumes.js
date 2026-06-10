@@ -47,15 +47,11 @@ export const VolumeSummary = Type.Object(
       description: 'True when at least one container has this volume mounted',
     }),
     used_by: Type.Array(VolumeUsage, {
-      description: 'Containers currently mounting this volume + their mount info',
+      description: 'Containers currently mounting this volume + their mount info (incl. per-mount rw/ro)',
     }),
     size_bytes: Opt(Type.Integer({
       description: 'Disk usage (-1 = unknown). May be omitted when /system/df is slow/disabled.',
     })),
-    read_only: Type.Boolean({
-      default: false,
-      description: 'True iff com.docker.manager.readonly label resolves to "true"',
-    }),
   },
   { $id: 'VolumeSummary', additionalProperties: true },
 );
