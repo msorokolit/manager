@@ -46,14 +46,39 @@ import { FitAddon } from '@xterm/addon-fit';
     return state.auth && state.auth.token ? `Bearer ${state.auth.token}` : '';
   }
 
+  /**
+   * Shared fetch wrapper. Adds the bearer token, picks a content-type
+   * for JSON bodies, auto-logs-out on 401, and routes the response
+   * through the right reader depending on `opts.responseType`:
+   *
+   *   - 'json' (default): parses JSON, returns object
+   *   - 'text':           returns text
+   *   - 'blob':           returns Blob (used for file/archive download)
+   *   - 'response':       returns the raw Response (caller wants headers
+   *                        or streaming control)
+   *
+   * #21: download / upload / edit calls now route through here too so
+   * they share the 401 auto-logout behaviour. Previously they used raw
+   * fetch and a 401 would leave the SPA "logged in" but unable to do
+   * anything until the user manually re-loaded.
+   */
   async function api(path, opts = {}) {
     const headers = new Headers(opts.headers || {});
     const ah = authHeader();
     if (ah) headers.set('Authorization', ah);
-    if (opts.body && !(opts.body instanceof FormData) && !headers.has('Content-Type')) {
+    if (
+      opts.body &&
+      !(opts.body instanceof FormData) &&
+      !(opts.body instanceof Blob) &&
+      !(opts.body instanceof ArrayBuffer) &&
+      !headers.has('Content-Type')
+    ) {
       headers.set('Content-Type', 'application/json');
     }
-    const res = await fetch(path, { ...opts, headers });
+    const responseType = opts.responseType || 'auto';
+    // Strip our extension so it doesn't leak into the underlying fetch().
+    const { responseType: _ignored, ...fetchOpts } = opts;
+    const res = await fetch(path, { ...fetchOpts, headers });
     if (res.status === 401) {
       logout();
       throw new Error('Unauthorized');
@@ -61,9 +86,15 @@ import { FitAddon } from '@xterm/addon-fit';
     if (!res.ok) {
       let detail = res.statusText;
       try { const j = await res.json(); detail = j.detail || JSON.stringify(j); } catch {}
-      throw new Error(`${res.status}: ${detail}`);
+      const err = new Error(`${res.status}: ${detail}`);
+      err.status = res.status;
+      try { err.body = await res.clone().json(); } catch {}
+      throw err;
     }
+    if (responseType === 'response') return res;
+    if (responseType === 'blob') return res.blob();
     if (res.status === 204) return null;
+    if (responseType === 'text') return res.text();
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('application/json')) return res.json();
     return res.text();
@@ -87,6 +118,13 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Modal ----------
+  //
+  // P0 #2: titles are set via textContent on the rendered <h3>, NOT
+  // interpolated into the innerHTML scaffold. The previous version
+  // injected `${title}` into innerHTML directly, which made every
+  // caller's `title: 'Edit: ' + filename` an XSS sink because file
+  // names inside volumes are attacker-controlled (any process running
+  // inside a container can write a file named '<img src=x onerror=...>').
   function modal({ title, body, actions, size = 'lg', onBeforeClose, ref }) {
     return new Promise((resolve) => {
       const host = document.getElementById('modal-host');
@@ -97,12 +135,17 @@ import { FitAddon } from '@xterm/addon-fit';
       wrap.innerHTML = `
         <div class="w-full ${widths[size] || widths.lg} ${heights[size] || 'max-h-[90vh]'} overflow-hidden flex flex-col rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
           <div class="flex items-center justify-between border-b border-slate-800 px-5 py-3">
-            <h3 class="text-sm font-semibold" data-role="title">${title}</h3>
+            <h3 class="text-sm font-semibold" data-role="title"></h3>
             <button class="text-slate-400 hover:text-white" data-act="close">✕</button>
           </div>
           <div class="flex-1 overflow-auto scroll-thin p-5" data-role="body"></div>
           <div class="flex justify-end gap-2 border-t border-slate-800 bg-slate-900/50 px-5 py-3" data-role="actions"></div>
         </div>`;
+      // Title via textContent — never innerHTML. Callers that want
+      // rich-text titles (e.g. a "dirty" bullet badge) must use the
+      // `ref.titleEl` handle and build their own DOM nodes.
+      const titleEl = wrap.querySelector('[data-role="title"]');
+      titleEl.textContent = String(title == null ? '' : title);
       const bodyEl = wrap.querySelector('[data-role="body"]');
       if (typeof body === 'string') bodyEl.innerHTML = body;
       else if (body instanceof Node) bodyEl.appendChild(body);
@@ -164,6 +207,60 @@ import { FitAddon } from '@xterm/addon-fit';
       }
       host.appendChild(wrap);
     });
+  }
+
+  /**
+   * Modal-based replacement for `window.prompt`. Returns the entered
+   * string, or null if cancelled. Validates the input with the
+   * caller-supplied `validate(value)` callback — return null for OK,
+   * a string for the error message.
+   */
+  function inputModal({
+    title = 'Input',
+    label = 'Value',
+    initial = '',
+    placeholder = '',
+    okLabel = 'OK',
+    validate = () => null,
+  } = {}) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <label class="block">
+        <span class="text-xs uppercase tracking-wider text-slate-400" data-role="label"></span>
+        <input data-role="input" type="text"
+               class="mt-2 w-full rounded border-slate-700 bg-slate-950 text-sm" />
+      </label>
+      <p data-role="err" class="mt-2 text-xs text-rose-300 hidden"></p>`;
+    wrap.querySelector('[data-role="label"]').textContent = label;
+    const input = wrap.querySelector('[data-role="input"]');
+    input.value = initial;
+    input.placeholder = placeholder;
+    const err = wrap.querySelector('[data-role="err"]');
+    function setErr(msg) {
+      if (msg) { err.textContent = msg; err.classList.remove('hidden'); }
+      else { err.textContent = ''; err.classList.add('hidden'); }
+    }
+    // Focus the input on next tick after the modal mounts.
+    setTimeout(() => { try { input.focus(); input.select(); } catch {} }, 50);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const btn = [...document.querySelectorAll('#modal-host button')]
+          .find((b) => b.textContent.trim() === okLabel);
+        btn && btn.click();
+      }
+    });
+    return modal({
+      title, body: wrap, size: 'sm',
+      actions: [
+        { label: 'Cancel', value: null, kind: 'secondary' },
+        { label: okLabel, kind: 'primary', value: 'ok', onClick: async () => {
+          const v = input.value;
+          const msg = validate(v);
+          if (msg) { setErr(msg); return false; }
+        }},
+      ],
+    }).then((res) => (res === 'ok' ? input.value : null));
   }
 
   function confirmModal(message, { danger = false, confirmLabel = 'Confirm' } = {}) {
@@ -1577,12 +1674,18 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Volumes ----------
   views.volumes = async (root) => {
+    // #23: viewers can't create / prune / delete / browse-write. We hide
+    // the Create / Prune / Remove / Browse buttons rather than letting
+    // them click into a 403. Inspect stays available (it's read-only).
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Volumes',
       'Manage persistent storage volumes',
-      `${btn('+ Create volume', { kind: 'primary', id: 'create-vol' })}
-       ${btn('Prune unused', { kind: 'secondary', id: 'prune-vols' })}
-       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
+      `${isAdmin ? btn('+ Create volume', { kind: 'primary', id: 'create-vol' }) : ''}
+       ${isAdmin ? btn('Prune unused', { kind: 'secondary', id: 'prune-vols' }) : ''}
+       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}
+       ${btn('Sizes', { kind: 'ghost', id: 'load-sizes' })}`
     );
 
     // Filter / search controls live above the table so they're visible
@@ -1606,7 +1709,7 @@ import { FitAddon } from '@xterm/addon-fit';
     bulk.innerHTML = `
       <span><span id="vols-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
       <div class="flex items-center gap-2">
-        <button id="vols-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>
+        ${isAdmin ? `<button id="vols-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>` : ''}
         <button id="vols-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
       </div>`;
     root.appendChild(bulk);
@@ -1615,6 +1718,10 @@ import { FitAddon } from '@xterm/addon-fit';
 
     // ---- State for filters + selection ----
     let lastVolumes = [];
+    // #14: sizes are opt-in to avoid the slow /system/df call on every
+    // page visit. Refresh triggers a re-load without sizes; the
+    // dedicated "Sizes" button reloads with sizes.
+    let loadSizesNext = true; // first load wants sizes
     const selected = new Set();
 
     function visibleVolumes() {
@@ -1676,7 +1783,7 @@ import { FitAddon } from '@xterm/addon-fit';
         return `
           <tr class="hover:bg-slate-900/60">
             <td class="px-3 py-2 w-8">
-              <input type="checkbox" class="vols-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(v.name)}" ${isChecked}/>
+              ${isAdmin ? `<input type="checkbox" class="vols-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(v.name)}" ${isChecked}/>` : ''}
             </td>
             <td class="px-4 py-2">
               <div class="font-medium">${escapeHtml(v.name)}${inUseBadge}</div>
@@ -1687,9 +1794,9 @@ import { FitAddon } from '@xterm/addon-fit';
             <td class="px-4 py-2 text-slate-400">${fmtDate(v.created_at)}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                <button data-act="browse" data-id="${escapeHtml(v.name)}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>
+                ${isAdmin ? `<button data-act="browse" data-id="${escapeHtml(v.name)}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>` : ''}
                 <button data-act="inspect" data-id="${escapeHtml(v.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
-                <button data-act="remove" data-id="${escapeHtml(v.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                ${isAdmin ? `<button data-act="remove" data-id="${escapeHtml(v.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
               </div>
             </td>
           </tr>`;
@@ -1719,8 +1826,24 @@ import { FitAddon } from '@xterm/addon-fit';
     async function load() {
       listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
       try {
-        lastVolumes = await api('/api/volumes');
+        // #14: pass sizes=false for background refresh to skip the slow
+        // /system/df call. Sizes are loaded once on first open and again
+        // when the user explicitly clicks "Sizes".
+        const qs = loadSizesNext ? '?sizes=true' : '?sizes=false';
+        const incoming = await api('/api/volumes' + qs);
+        // If we're refreshing without sizes, preserve the previously
+        // loaded size_bytes per-row so the column doesn't blank out.
+        if (!loadSizesNext) {
+          const prev = new Map(lastVolumes.map((v) => [v.name, v.size_bytes]));
+          for (const v of incoming) {
+            if (v.size_bytes == null && prev.has(v.name)) v.size_bytes = prev.get(v.name);
+          }
+        }
+        lastVolumes = incoming;
+        loadSizesNext = false;
         // Drop selections for volumes that no longer exist after the refresh.
+        // (#26: selections survive filter changes — they're a Set keyed
+        // by name, only dropped when the volume actually disappears.)
         for (const n of [...selected]) {
           if (!lastVolumes.some((v) => v.name === n)) selected.delete(n);
         }
@@ -1755,18 +1878,21 @@ import { FitAddon } from '@xterm/addon-fit';
     });
 
     bulk.querySelector('#vols-bulk-clear').onclick = () => { selected.clear(); renderRows(); renderBulkBar(); };
-    bulk.querySelector('#vols-bulk-rm').onclick = async () => {
+    const bulkRmBtn = bulk.querySelector('#vols-bulk-rm');
+    if (bulkRmBtn) bulkRmBtn.onclick = async () => {
       const names = [...selected];
       if (!names.length) return;
       const ok = await confirmModal(
-        `Delete <strong>${names.length}</strong> volume${names.length === 1 ? '' : 's'}? <em>This is permanent — data will be lost.</em>`,
+        `Delete <strong>${names.length}</strong> volume${names.length === 1 ? '' : 's'}? <em>This is permanent — data will be lost.</em><br><br>In-use volumes will be reported as failures; use <em>Force remove</em> from the per-row Remove dialog to override on a case-by-case basis.`,
         { danger: true, confirmLabel: 'Delete all' },
       );
       if (!ok) return;
       try {
+        // #1: bulk always sends force:false. If a user wants to
+        // force-remove an in-use volume they go through the per-row
+        // Remove flow, which has its own secondary confirm.
         const out = await api('/api/volumes/delete/bulk', {
-          method: 'POST',
-          body: JSON.stringify({ names, force: false }),
+          method: 'POST', body: JSON.stringify({ names, force: false }),
         });
         for (const r of out.results || []) {
           if (!r.ok) toast(`${r.name}: ${r.error || 'failed'}`, 'error');
@@ -1779,35 +1905,66 @@ import { FitAddon } from '@xterm/addon-fit';
       load();
     };
 
+    // #1: per-row Remove starts safe (force=false). If the daemon
+    // refuses with 409 (volume in use), we surface a SECOND confirm
+    // that's explicit about the risk before retrying with force=true.
+    async function removeVolume(id) {
+      const v = lastVolumes.find((x) => x.name === id);
+      const warn = v && v.in_use
+        ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${v.used_by.length} container(s). The daemon will refuse to delete it unless you also force-remove.</p>`
+        : '';
+      const proceed = await confirmModal(
+        `Remove volume <code>${escapeHtml(id)}</code>? Data will be lost.${warn}`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!proceed) return;
+      try {
+        await api(`/api/volumes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        toast('Volume removed', 'success'); load();
+      } catch (e) {
+        // 409 — in use. Offer the force path with extra friction.
+        if (e.status === 409) {
+          const forceOk = await confirmModal(
+            `<strong>Volume <code>${escapeHtml(id)}</code> is in use.</strong> ` +
+            `Force-removing will detach it from running containers — they will fail their next read/write to this volume.<br><br>` +
+            `Continue with <strong>force=true</strong>?`,
+            { danger: true, confirmLabel: 'Force remove' },
+          );
+          if (!forceOk) return;
+          try {
+            await api(`/api/volumes/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
+            toast('Volume force-removed', 'warn'); load();
+          } catch (ex) { toast(ex.message, 'error'); }
+        } else {
+          toast(e.message, 'error');
+        }
+      }
+    }
+
     listEl.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
       const id = t.dataset.id; const act = t.dataset.act;
       try {
-        if (act === 'browse') {
-          await openVolumeBrowser(id);
-        } else if (act === 'inspect') {
-          await openVolumeInspect(id, () => load());
-        } else if (act === 'remove') {
-          const v = lastVolumes.find((x) => x.name === id);
-          const warn = v && v.in_use
-            ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${v.used_by.length} container(s) — delete will fail unless you stop them first.</p>`
-            : '';
-          const ok = await confirmModal(`Remove volume <code>${escapeHtml(id)}</code>? Data will be lost.${warn}`, { danger: true, confirmLabel: 'Remove' });
-          if (!ok) return;
-          await api(`/api/volumes/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
-          toast('Volume removed', 'success'); load();
-        }
+        if (act === 'browse') await openVolumeBrowser(id);
+        else if (act === 'inspect') await openVolumeInspect(id, () => load());
+        else if (act === 'remove') await removeVolume(id);
       } catch (ex) { toast(ex.message, 'error'); }
     });
 
-    document.getElementById('refresh').onclick = load;
-    document.getElementById('prune-vols').onclick = async () => {
+    // #14: 'Refresh' polls without sizes (fast); 'Sizes' explicitly
+    // re-fetches WITH /system/df so admins can see current disk usage
+    // when they care.
+    document.getElementById('refresh').onclick = () => { loadSizesNext = false; load(); };
+    document.getElementById('load-sizes').onclick = () => { loadSizesNext = true; load(); };
+    const pruneBtn = document.getElementById('prune-vols');
+    if (pruneBtn) pruneBtn.onclick = async () => {
       const ok = await confirmModal('Prune unused volumes? Data will be lost.', { danger: true, confirmLabel: 'Prune' });
       if (!ok) return;
       try { const r = await api('/api/volumes/prune', { method: 'POST' }); toast(`Reclaimed ${fmtBytes(r.SpaceReclaimed || 0)}`, 'success'); load(); }
       catch (e) { toast(e.message, 'error'); }
     };
-    document.getElementById('create-vol').onclick = async () => {
+    const createBtn = document.getElementById('create-vol');
+    if (createBtn) createBtn.onclick = async () => {
       const wrap = document.createElement('div');
       wrap.innerHTML = `
         <div class="grid gap-3 md:grid-cols-2">
@@ -1837,6 +1994,7 @@ import { FitAddon } from '@xterm/addon-fit';
         return out;
       }
 
+      let created = null;
       const ok = await modal({
         title: 'Create volume', body: wrap, size: 'md',
         actions: [
@@ -1848,13 +2006,28 @@ import { FitAddon } from '@xterm/addon-fit';
               labels: parseKv(wrap.querySelector('#v-labels').value),
               driver_opts: parseKv(wrap.querySelector('#v-driveropts').value),
             };
-            if (!payload.name) return false;
-            try { await api('/api/volumes', { method: 'POST', body: JSON.stringify(payload) }); toast('Volume created', 'success'); }
-            catch (e) { toast(e.message, 'error'); return false; }
+            // Mirror the server's name regex client-side so users get an
+            // inline error instead of a generic API failure (#13 in the
+            // review). Stays loose — server is the source of truth.
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(payload.name)) {
+              toast('Invalid name: must start with a letter or digit and contain only [A-Za-z0-9_.-]', 'warn');
+              return false;
+            }
+            try {
+              created = await api('/api/volumes', { method: 'POST', body: JSON.stringify(payload) });
+              toast('Volume created', 'success');
+            } catch (e) { toast(e.message, 'error'); return false; }
           }},
         ],
       });
-      if (ok) load();
+      // #28: prepend the enriched row from the server instead of
+      // re-fetching the whole list.
+      if (ok && created) {
+        lastVolumes = [created, ...lastVolumes];
+        renderRows(); renderBulkBar();
+      } else if (ok) {
+        load();
+      }
     };
 
     await load();
@@ -2374,28 +2547,35 @@ import { FitAddon } from '@xterm/addon-fit';
    * its list.
    */
   async function openVolumeInspect(name, onChange) {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     let data;
     try { data = await api(`/api/volumes/${encodeURIComponent(name)}`); }
     catch (e) { toast(e.message, 'error'); return; }
 
-    // Native Docker labels are immutable after volume creation (the
-    // Engine API has no PATCH /volumes/{name}). The Labels tab below
-    // displays them but never edits.
-    const labels = { ...(data.Labels || {}) };
+    // VolumeDetail (#10): the inspect endpoint now returns the same
+    // normalised snake_case shape as the list, plus a `raw` field
+    // carrying the verbatim Docker inspect payload for the Raw tab.
+    const labels = { ...(data.labels || {}) };
+    const usedBy = data.used_by || [];
+    const inUse = !!data.in_use;
+    const stack = data.stack || null;
 
     const wrap = document.createElement('div');
     wrap.className = 'flex flex-col gap-3';
+    // #25: rename the placeholder tab so it's not misleading. The label
+    // now matches the button.
     wrap.innerHTML = `
       <div class="flex flex-wrap items-center gap-2 text-xs border-b border-slate-800 pb-2">
         ${['overview','mounted','labels','browse','raw'].map((t, i) => `
           <button data-tab="${t}" class="vi-tab rounded px-2 py-1 ${i===0?'bg-sky-500/20 text-sky-300':'text-slate-400 hover:bg-slate-800'}">${
-            {overview:'Overview', mounted:'Mounted by', labels:'Labels', browse:'Browse', raw:'Raw'}[t]
+            {overview:'Overview', mounted:'Mounted by', labels:'Labels', browse:'Open file manager', raw:'Raw'}[t]
           }</button>
         `).join('')}
         <span class="ml-auto flex items-center gap-1">
-          ${data.InUse ? (() => {
-            const rwN = data.UsedBy.filter((u) => u.rw).length;
-            const roN = data.UsedBy.length - rwN;
+          ${inUse ? (() => {
+            const rwN = usedBy.filter((u) => u.rw).length;
+            const roN = usedBy.length - rwN;
             return `${rwN > 0 ? `<span class="inline-flex items-center rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">rw × ${rwN}</span>` : ''}
                     ${roN > 0 ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">ro × ${roN}</span>` : ''}`;
           })() : `<span class="inline-flex items-center rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
@@ -2419,34 +2599,37 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     function renderOverview() {
-      const stackLink = data.Stack
-        ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(data.Stack)}</a>`
+      const stackLink = stack
+        ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(stack)}</a>`
         : '<span class="text-slate-500">—</span>';
-      const optsRows = Object.entries(data.Options || {}).map(([k, v]) =>
+      const optsRows = Object.entries(data.options || {}).map(([k, v]) =>
         `<tr><td class="pr-3 py-0.5 text-slate-400 font-mono text-[11px]">${escapeHtml(k)}</td><td class="font-mono text-[11px] text-slate-200">${escapeHtml(String(v))}</td></tr>`,
       ).join('');
       panel.innerHTML = `
         <div class="space-y-1">
-          ${fieldRow('Name', `<code class="text-slate-100">${escapeHtml(data.Name)}</code>${copyButton(data.Name)}`)}
-          ${fieldRow('Driver', escapeHtml(data.Driver), { mono: true })}
-          ${fieldRow('Scope', escapeHtml(data.Scope || ''))}
-          ${fieldRow('Mountpoint', `<span class="font-mono">${escapeHtml(data.Mountpoint || '')}</span>${copyButton(data.Mountpoint || '')}`)}
+          ${fieldRow('Name', `<code class="text-slate-100">${escapeHtml(data.name)}</code>${copyButton(data.name)}`)}
+          ${fieldRow('Driver', escapeHtml(data.driver), { mono: true })}
+          ${fieldRow('Scope', escapeHtml(data.scope || ''))}
+          ${fieldRow('Mountpoint', `<span class="font-mono">${escapeHtml(data.mountpoint || '')}</span>${copyButton(data.mountpoint || '')}`)}
           ${fieldRow('Stack (owner)', stackLink)}
-          ${fieldRow('Created', escapeHtml(data.CreatedAt || ''))}
+          ${fieldRow('Created', escapeHtml(data.created_at || ''))}
           ${fieldRow('Driver options', optsRows ? `<table>${optsRows}</table>` : '<span class="text-slate-500">none</span>')}
         </div>
         <div class="mt-4 flex flex-wrap gap-2">
-          <button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>
-          <button id="vi-delete" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove volume</button>
+          ${isAdmin ? `<button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>` : ''}
+          ${isAdmin ? `<button id="vi-delete" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove volume</button>` : ''}
         </div>`;
 
-      panel.querySelector('#vi-browse').onclick = async () => {
-        // The Browse tab embeds the file manager directly; switch to it.
-        activate('browse');
-      };
-      panel.querySelector('#vi-delete').onclick = async () => {
-        const warn = data.InUse
-          ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${data.UsedBy.length} container(s) — delete will fail unless you stop them first.</p>`
+      const browseBtn = panel.querySelector('#vi-browse');
+      if (browseBtn) browseBtn.onclick = async () => activate('browse');
+
+      const deleteBtn = panel.querySelector('#vi-delete');
+      if (deleteBtn) deleteBtn.onclick = async () => {
+        // #1: force-false-with-409-fallback. The first request is
+        // safe; if the daemon says "in use", we offer the force path
+        // with extra friction.
+        const warn = inUse
+          ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${usedBy.length} container(s). The daemon will refuse to delete it unless you also force-remove.</p>`
           : '';
         const ok = await confirmModal(
           `Remove volume <code>${escapeHtml(name)}</code>? Data will be lost.${warn}`,
@@ -2454,21 +2637,36 @@ import { FitAddon } from '@xterm/addon-fit';
         );
         if (!ok) return;
         try {
-          await api(`/api/volumes/${encodeURIComponent(name)}?force=true`, { method: 'DELETE' });
+          await api(`/api/volumes/${encodeURIComponent(name)}`, { method: 'DELETE' });
           toast('Volume removed', 'success');
           if (onChange) onChange();
-          // Force-close the inspect modal.
           modalRef.close && modalRef.close(null);
-        } catch (ex) { toast(ex.message, 'error'); }
+        } catch (ex) {
+          if (ex.status === 409) {
+            const forceOk = await confirmModal(
+              `<strong>Volume <code>${escapeHtml(name)}</code> is in use.</strong> ` +
+              `Force-removing will detach it from running containers — they will fail their next read/write to this volume.<br><br>` +
+              `Continue with <strong>force=true</strong>?`,
+              { danger: true, confirmLabel: 'Force remove' },
+            );
+            if (!forceOk) return;
+            try {
+              await api(`/api/volumes/${encodeURIComponent(name)}?force=true`, { method: 'DELETE' });
+              toast('Volume force-removed', 'warn');
+              if (onChange) onChange();
+              modalRef.close && modalRef.close(null);
+            } catch (e2) { toast(e2.message, 'error'); }
+          } else { toast(ex.message, 'error'); }
+        }
       };
     }
 
     function renderMounted() {
-      if (!data.InUse) {
+      if (!inUse) {
         panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">Not mounted by any container.</div>`;
         return;
       }
-      const rows = data.UsedBy.map((u) => `
+      const rows = usedBy.map((u) => `
         <tr class="hover:bg-slate-900/60">
           <td class="px-4 py-2"><code class="text-slate-100">${escapeHtml(u.container_name)}</code><div class="text-[11px] text-slate-500 font-mono">${escapeHtml(u.container_id.slice(0, 12))}</div></td>
           <td class="px-4 py-2 font-mono text-xs text-slate-300">${escapeHtml(u.mount_path)}</td>
@@ -2477,7 +2675,7 @@ import { FitAddon } from '@xterm/addon-fit';
             : `<span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-300">ro</span>`}</td>
         </tr>`).join('');
       panel.innerHTML = `
-        <p class="mb-2 text-xs text-slate-500">${data.UsedBy.length} container${data.UsedBy.length === 1 ? '' : 's'} currently mount${data.UsedBy.length === 1 ? 's' : ''} this volume.</p>
+        <p class="mb-2 text-xs text-slate-500">${usedBy.length} container${usedBy.length === 1 ? '' : 's'} currently mount${usedBy.length === 1 ? 's' : ''} this volume.</p>
         <table class="w-full text-left text-sm">
           <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
             <tr><th class="px-4 py-2">Container</th><th class="px-4 py-2">Mount path</th><th class="px-4 py-2">Mode</th></tr>
@@ -2510,18 +2708,16 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     function renderBrowse() {
-      // Embed the existing volume browser by mounting a placeholder; the
-      // browser code expects to live in a modal, so we adapt by giving
-      // it our panel and surfacing a "open standalone" button instead
-      // of re-implementing it.
+      // #25: the file manager renders in its own dedicated modal — we
+      // intentionally don't embed it here (it expects to be the only
+      // modal in the stack and uses the full-screen toggle), so the
+      // Browse tab is a launcher. Tab label matches the action.
       panel.innerHTML = `
         <div class="rounded border border-slate-800 bg-slate-950/40 p-6 text-center text-sm text-slate-300">
-          <p class="mb-3">The file manager opens in a dedicated full-screen modal.</p>
+          <p class="mb-3">The volume file manager opens as its own modal.</p>
           <button id="vi-browse-open" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-2 font-medium">📁 Open file manager</button>
         </div>`;
       panel.querySelector('#vi-browse-open').onclick = async () => {
-        // Close the inspect modal first so we don't have two on top of
-        // each other (the browser is already xl and its own world).
         modalRef.close && modalRef.close(null);
         await openVolumeBrowser(name);
       };
@@ -2529,12 +2725,10 @@ import { FitAddon } from '@xterm/addon-fit';
 
     function renderRaw() {
       panel.innerHTML = '';
-      panel.appendChild(jsonView({
-        ...data,
-        // Hide our enriched fields from the raw view — they're shown in
-        // their own tabs and would otherwise clutter the JSON.
-        UsedBy: undefined, InUse: undefined, Stack: undefined,
-      }));
+      // #10: the inspect endpoint carries the verbatim Docker payload
+      // under `raw`, so we just display that — no need to strip our
+      // enrichment fields one by one.
+      panel.appendChild(jsonView(data.raw || {}));
     }
 
     const renderers = {
@@ -2714,6 +2908,12 @@ import { FitAddon } from '@xterm/addon-fit';
       const nameCls = entry.is_dir
         ? 'text-sky-300 cursor-pointer'
         : (entry.is_link ? 'text-violet-300' : 'text-slate-200');
+      // #29: explain why symlink names aren't clickable. Hovering tells
+      // the admin what a click would do (or wouldn't); the per-row
+      // Download/Rename/Permissions/Delete actions still work.
+      const nameTitle = entry.is_link
+        ? `Symlink → ${entry.link_target || '?'} — not followed in the UI to avoid escaping the volume; use Download to fetch the link's target contents`
+        : (entry.is_dir ? 'Open folder' : 'View / edit file');
 
       const isText = !entry.is_dir && !entry.is_link;
       const isChecked = selected.has(entry.name) ? 'checked' : '';
@@ -2723,7 +2923,7 @@ import { FitAddon } from '@xterm/addon-fit';
           <div><input type="checkbox" class="vb-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-act="select" ${isChecked}/></div>
           <div class="flex items-center gap-2 min-w-0">
             <span>${_fileIcon(entry)}</span>
-            <span class="${nameCls} truncate" data-act="navigate">${nameCell}</span>
+            <span class="${nameCls} truncate" data-act="navigate" title="${escapeHtml(nameTitle)}">${nameCell}</span>
           </div>
           <div class="text-right text-slate-400 font-mono">${sizeCol}</div>
           <div class="text-slate-400 truncate" title="${escapeHtml(entry.user)}:${escapeHtml(entry.group)}">${owner}</div>
@@ -2827,15 +3027,12 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     async function downloadUrl(p, endpoint = 'file') {
-      const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`, {
-        headers: { Authorization: authHeader() },
-      });
-      if (!res.ok) {
-        let det = res.statusText;
-        try { det = (await res.json()).detail || det; } catch {}
-        throw new Error(`Download failed: ${det}`);
-      }
-      return res.blob();
+      // Routes through api() (#21) so 401 triggers auto-logout and
+      // server-side error details surface uniformly.
+      return api(
+        `/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`,
+        { responseType: 'blob' },
+      );
     }
 
     function triggerDownload(blob, filename) {
@@ -2915,7 +3112,17 @@ import { FitAddon } from '@xterm/addon-fit';
 
       function updateTitle() {
         if (!ref.titleEl) return;
-        ref.titleEl.innerHTML = `${dirty ? '<span class="text-amber-400">●</span> ' : ''}Edit: ${escapeHtml(name)}`;
+        // Build the title via DOM so the file name (attacker-controlled
+        // text inside a volume) can NEVER reach innerHTML. The dirty
+        // bullet is a separate span element.
+        ref.titleEl.replaceChildren();
+        if (dirty) {
+          const bullet = document.createElement('span');
+          bullet.className = 'text-amber-400';
+          bullet.textContent = '● ';
+          ref.titleEl.appendChild(bullet);
+        }
+        ref.titleEl.appendChild(document.createTextNode(`Edit: ${name}`));
       }
 
       async function reload() {
@@ -2950,28 +3157,37 @@ import { FitAddon } from '@xterm/addon-fit';
       }
 
       // The actual save call. Returns true if we should close the modal.
+      // #21: routes through api() so 401 triggers auto-logout.
       async function save({ overrideConflict = false } = {}) {
         if (!canEdit) return false;
         const content = editor.state.doc.toString();
         const body = { content };
         if (mtimeCursor != null && !overrideConflict) body.if_mtime = mtimeCursor;
         try {
-          const res = await fetch(
+          const out = await api(
             `/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(p)}`,
-            {
-              method: 'PUT',
-              headers: { Authorization: authHeader(), 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-            },
+            { method: 'PUT', body: JSON.stringify(body) },
           );
-          if (res.status === 409) {
-            const det = await res.json();
-            // Conflict — server changed underneath us. Offer three paths.
+          mtimeCursor = out.mtime;
+          dirty = false; updateTitle();
+          toast('Saved', 'success');
+          load(cur); // refresh the listing so size/mtime update
+          return true;
+        } catch (e) {
+          // 409 → optimistic-concurrency conflict. The server returns
+          // the current mtime so we can offer Reload / Overwrite paths.
+          if (e.status === 409) {
+            const serverMtime = e.body && e.body.server_mtime;
+            const wrapEl = document.createElement('div');
+            wrapEl.innerHTML = `
+              <p class="text-sm text-slate-300"></p>
+              <p class="mt-2 text-xs text-slate-500">Server mtime: <code></code> — your edit was based on <code></code>.</p>
+              <p class="mt-2 text-xs text-slate-400">Reload discards your edits and re-reads the file. Overwrite forces your version onto the new one.</p>`;
+            wrapEl.querySelector('p:nth-child(1)').textContent = (e.body && e.body.detail) || 'Conflict';
+            wrapEl.querySelector('code:nth-of-type(1)').textContent = String(serverMtime);
+            wrapEl.querySelector('code:nth-of-type(2)').textContent = String(mtimeCursor);
             const action = await modal({
-              title: 'File changed on disk', size: 'md',
-              body: `<p class="text-sm text-slate-300">${escapeHtml(det.detail || 'Conflict')}</p>
-                <p class="mt-2 text-xs text-slate-500">Server mtime: <code>${det.server_mtime}</code> — your edit was based on <code>${mtimeCursor}</code>.</p>
-                <p class="mt-2 text-xs text-slate-400">Reload discards your edits and re-reads the file. Overwrite forces your version onto the new one.</p>`,
+              title: 'File changed on disk', size: 'md', body: wrapEl,
               actions: [
                 { label: 'Reload',   kind: 'secondary', value: 'reload' },
                 { label: 'Overwrite anyway', kind: 'danger', value: 'force' },
@@ -2982,17 +3198,6 @@ import { FitAddon } from '@xterm/addon-fit';
             if (action === 'force')  { return save({ overrideConflict: true }); }
             return false;
           }
-          if (!res.ok) {
-            let msg = res.statusText; try { msg = (await res.json()).detail || msg; } catch {}
-            throw new Error(msg);
-          }
-          const out = await res.json();
-          mtimeCursor = out.mtime;
-          dirty = false; updateTitle();
-          toast('Saved', 'success');
-          load(cur); // refresh the listing so size/mtime update
-          return true;
-        } catch (e) {
           toast(e.message, 'error');
           return false;
         }
@@ -3055,12 +3260,27 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
 
+    // #24: replace window.prompt with a real modal — gives us validation,
+    // proper keyboard handling, consistent styling, and works in browsers
+    // that block prompts.
     async function renameAt(oldName) {
-      const next = window.prompt(`Rename "${oldName}" to:`, oldName);
-      if (!next || next === oldName) return;
-      if (next.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
+      const next = await inputModal({
+        title: `Rename`,
+        label: `Rename "${oldName}" to:`,
+        initial: oldName,
+        okLabel: 'Rename',
+        validate: (v) => {
+          const t = (v || '').trim();
+          if (!t) return 'Name is required';
+          if (t.includes('/')) return 'Name cannot contain "/"';
+          if (t === '.' || t === '..') return 'Reserved name';
+          if (t === oldName) return 'New name must be different';
+          return null;
+        },
+      });
+      if (next == null || next.trim() === oldName) return;
       const from = childPath(oldName);
-      const to = childPath(next);
+      const to = childPath(next.trim());
       try {
         await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/rename`, {
           method: 'POST',
@@ -3232,47 +3452,35 @@ import { FitAddon } from '@xterm/addon-fit';
       const recursive = !!(view.querySelector('#perm-recursive') && view.querySelector('#perm-recursive').checked);
       const paths = names.map(childPath);
       const single = names.length === 1;
-      let chmodOk = !doMode;
-      let chownOk = !doOwn;
 
-      // -- chmod --
-      if (doMode) {
-        try {
-          if (single) {
-            await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod`, {
-              method: 'POST', body: JSON.stringify({ path: paths[0], mode, recursive }),
-            });
-            chmodOk = true;
-          } else {
-            const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chmod/bulk`, {
-              method: 'POST', body: JSON.stringify({ paths, mode, recursive }),
-            });
-            chmodOk = (out.failed === 0);
-            for (const r of out.results || []) if (!r.ok) toast(`chmod ${r.path}: ${r.error || 'failed'}`, 'error');
-          }
-        } catch (e) { toast(`chmod failed: ${e.message}`, 'error'); }
-      }
+      // #20: single atomic endpoint. The server applies mode and/or
+      // owner in one container — no more "chmod succeeded but chown
+      // failed and now the file is in a half-applied state".
+      const body = { recursive };
+      if (doMode) body.mode = mode;
+      if (doOwn)  { body.uid = uid; body.gid = gid; }
 
-      // -- chown --
-      if (doOwn) {
-        try {
-          if (single) {
-            await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chown`, {
-              method: 'POST', body: JSON.stringify({ path: paths[0], uid, gid, recursive }),
-            });
-            chownOk = true;
-          } else {
-            const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/chown/bulk`, {
-              method: 'POST', body: JSON.stringify({ paths, uid, gid, recursive }),
-            });
-            chownOk = (out.failed === 0);
-            for (const r of out.results || []) if (!r.ok) toast(`chown ${r.path}: ${r.error || 'failed'}`, 'error');
+      let okAll = true;
+      try {
+        if (single) {
+          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/permissions`, {
+            method: 'POST', body: JSON.stringify({ path: paths[0], ...body }),
+          });
+        } else {
+          const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/permissions/bulk`, {
+            method: 'POST', body: JSON.stringify({ paths, ...body }),
+          });
+          okAll = (out.failed === 0);
+          for (const r of out.results || []) {
+            if (!r.ok) toast(`${r.path}: ${r.error || 'failed'}`, 'error');
           }
-        } catch (e) { toast(`chown failed: ${e.message}`, 'error'); }
+        }
+      } catch (e) {
+        toast(`Permissions failed: ${e.message}`, 'error');
+        return false;
       }
 
       const what = [doMode && 'mode', doOwn && 'owner'].filter(Boolean).join(' + ');
-      const okAll = chmodOk && chownOk;
       toast(
         `${what} applied to ${names.length} item${names.length === 1 ? '' : 's'}${okAll ? '' : ' (partial)'}`,
         okAll ? 'success' : 'warn',
@@ -3290,12 +3498,12 @@ import { FitAddon } from '@xterm/addon-fit';
         setStatus(`Uploading ${file.name} (${i + 1}/${files.length})…`);
         const fd = new FormData(); fd.append('file', file);
         try {
-          const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
-            method: 'POST',
-            headers: { Authorization: authHeader() },
-            body: fd,
-          });
-          if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
+          // #21: route through api() so 401 triggers auto-logout and
+          // server-side validation errors surface consistently.
+          await api(
+            `/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`,
+            { method: 'POST', body: fd },
+          );
           ok += 1;
         } catch (ex) { fail += 1; toast(`${file.name}: ${ex.message}`, 'error'); }
       }
@@ -3414,11 +3622,23 @@ import { FitAddon } from '@xterm/addon-fit';
     wrap.querySelector('#vb-refresh').onclick = () => load(cur);
 
     wrap.querySelector('#vb-mkdir').onclick = async () => {
-      const name = window.prompt('New folder name:');
-      if (!name) return;
-      if (name.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
+      // #24: modal prompt with inline validation.
+      const name = await inputModal({
+        title: 'New folder',
+        label: `New folder name (under ${cur})`,
+        placeholder: 'subdir',
+        okLabel: 'Create',
+        validate: (v) => {
+          const t = (v || '').trim();
+          if (!t) return 'Name is required';
+          if (t.includes('/')) return 'Name cannot contain "/"';
+          if (t === '.' || t === '..') return 'Reserved name';
+          return null;
+        },
+      });
+      if (name == null) return;
       try {
-        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(childPath(name))}`, { method: 'POST' });
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(childPath(name.trim()))}`, { method: 'POST' });
         toast('Folder created', 'success'); load(cur);
       } catch (ex) { toast(ex.message, 'error'); }
     };
@@ -3507,7 +3727,16 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     // ---------- Boot ----------
-    setStatus(`Each operation runs in a short-lived "${state.config.browser_image}" container with this volume mounted read-only / read-write at /target.`, 'info');
+    // #27: show the "how it works" banner only the first time. Once
+    // the admin has seen it, they don't need the wall-of-text on every
+    // browse. They can re-show it via localStorage if they ever want.
+    const BANNER_KEY = 'docker-manager.vb-helper-banner-seen';
+    let bannerSeen = false;
+    try { bannerSeen = localStorage.getItem(BANNER_KEY) === '1'; } catch {}
+    if (!bannerSeen) {
+      setStatus(`Each operation runs in a short-lived "${state.config.browser_image}" container with this volume mounted read-only / read-write at /target.`, 'info');
+      try { localStorage.setItem(BANNER_KEY, '1'); } catch {}
+    }
     load('/');
 
     await modal({ title: `Browse: ${volumeName}`, body: wrap, size: 'xl' });
