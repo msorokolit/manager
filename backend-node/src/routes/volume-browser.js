@@ -41,7 +41,6 @@ import tar from 'tar-stream';
 import { getClient } from '../docker-client.js';
 import { settings } from '../config.js';
 import { asyncHandler, HttpError, intQuery } from '../util.js';
-import { getLabels, mergeLabels } from '../labels-store.js';
 import { createApiRouter, customResponse } from '../route-builder.js';
 import {
   PassThroughObject,
@@ -441,10 +440,10 @@ async function ensureVolumeExists(volume) {
 /**
  * Refuse the request when the volume is marked read-only.
  *
- * The flag comes from the *merged* label set (daemon labels overlaid
- * with the manager-side extra_labels store), so toggling read-only via
- * the inspect modal takes effect on the very next write without a
- * volume recreate.
+ * The flag is the native Docker label `com.docker.manager.readonly` —
+ * set at volume create time and immutable thereafter (Docker has no
+ * PATCH endpoint for volume labels). To flip the flag on an existing
+ * volume, delete it and recreate with the label set.
  *
  * Called at the top of every write endpoint in this module. Read paths
  * (list / view / archive) skip the check because they're inherently
@@ -457,14 +456,12 @@ async function denyIfReadOnly(volume) {
     if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
     throw err;
   }
-  const extras = await getLabels(volume);
-  const merged = mergeLabels(v.Labels, extras);
-  if (merged['com.docker.manager.readonly'] === 'true') {
+  if ((v.Labels || {})['com.docker.manager.readonly'] === 'true') {
     throw new HttpError(
       403,
       `Volume "${volume}" is marked read-only ` +
       `(com.docker.manager.readonly=true); refusing write operation. ` +
-      `Clear the label in the volume inspect modal to enable edits.`,
+      `Recreate the volume without the label to enable edits.`,
     );
   }
 }

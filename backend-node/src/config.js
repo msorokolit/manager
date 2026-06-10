@@ -85,15 +85,6 @@ export function settingsFromEnv(env = process.env) {
       100,
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
-    // Manager-side per-volume label store. Docker has no API for editing
-    // a volume's labels after creation, so we keep our own `extra_labels`
-    // map (keyed by volume name) on disk and merge it into every volume
-    // inspect / list response. Used for things like the read-only
-    // marker (`com.docker.manager.readonly=true`).
-    volumeLabelsFile:
-      env.VOLUME_LABELS_FILE ||
-      `${env.DATA_DIR || '/data'}/volume-labels.json`,
-
     // ---- Volume-browser one-shot containers ----
     // Escape hatch: skip Memory / NanoCpus / PidsLimit on the per-op
     // container. Only useful on hosts where the root cgroup is in

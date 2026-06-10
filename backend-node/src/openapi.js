@@ -31,7 +31,6 @@ const COMPONENT_SCHEMAS = [
   S.CreateVolumeRequest,
   S.VolumeSummary,
   S.VolumeUsage,
-  S.VolumeLabelsUpdateRequest,
   S.VolumeBulkDeleteRequest,
   S.VolumeBulkResponse,
   S.VolumeBrowseEntry,

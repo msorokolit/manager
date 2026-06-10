@@ -305,18 +305,6 @@ describe('Volume browser schemas', () => {
     })).toBe(false);
   });
 
-  it('VolumeLabelsUpdateRequest accepts arbitrary string→string maps', () => {
-    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: {} })).toBe(true);
-    expect(valid(S.VolumeLabelsUpdateRequest, {
-      extra_labels: { 'com.docker.manager.readonly': 'true', 'owner': 'team-a' },
-    })).toBe(true);
-  });
-
-  it('VolumeLabelsUpdateRequest rejects non-string values', () => {
-    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: { x: 42 } })).toBe(false);
-    expect(valid(S.VolumeLabelsUpdateRequest, { extra_labels: { x: null } })).toBe(false);
-  });
-
   it('VolumeBulkDeleteRequest enforces min/max items', () => {
     expect(valid(S.VolumeBulkDeleteRequest, { names: ['a'] })).toBe(true);
     expect(valid(S.VolumeBulkDeleteRequest, { names: ['a', 'b'], force: true })).toBe(true);

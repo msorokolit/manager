@@ -36,7 +36,7 @@ export const VolumeSummary = Type.Object(
     scope: Type.String(),
     created_at: Opt(Type.String()),
     labels: Type.Record(Type.String(), Type.String(), {
-      description: 'Merged: daemon labels + manager extra_labels (extras win on conflict)',
+      description: 'Native Docker labels set at volume create time (immutable)',
     }),
     options: Type.Record(Type.String(), Type.String()),
     // Enriched fields — Portainer-parity columns for the volume list.
@@ -58,21 +58,6 @@ export const VolumeSummary = Type.Object(
     }),
   },
   { $id: 'VolumeSummary', additionalProperties: true },
-);
-
-/**
- * Replace the manager-side `extra_labels` map for a volume. We don't
- * touch the daemon's own labels (the Engine API has no PATCH for that),
- * but our list/inspect responses merge the two so the UI sees them as
- * one label set. Pass an empty object to clear all manager labels.
- */
-export const VolumeLabelsUpdateRequest = Type.Object(
-  {
-    extra_labels: Type.Record(Type.String(), Type.String(), {
-      description: 'Manager-side labels for this volume (replaces existing extras)',
-    }),
-  },
-  { $id: 'VolumeLabelsUpdateRequest', additionalProperties: false },
 );
 
 /**

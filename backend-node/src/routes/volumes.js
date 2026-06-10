@@ -6,37 +6,32 @@
 //   - the owning compose project (via the com.docker.compose.project label)
 //   - on-disk size (via /system/df, best-effort: it's slow on huge hosts)
 //
-// And one thing Portainer doesn't have: a per-volume manager-side label
-// store that survives across recreates (see ./labels-store.js). Lets
-// admins flip the read-only marker without recreating the volume.
+// And one Portainer-equivalent feature: the `com.docker.manager.readonly`
+// label, set at volume create time, that disables every write operation
+// in the file manager. Labels are immutable in Docker (no PATCH endpoint
+// for them), so flipping read-only on an existing volume requires a
+// delete + recreate-with-label cycle. That's the same contract the
+// `com.docker.compose.*` labels work under.
 import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, boolQuery, HttpError } from '../util.js';
+import { asyncHandler, boolQuery } from '../util.js';
 import { createApiRouter } from '../route-builder.js';
 import {
   CreateVolumeRequest,
   PassThroughObject,
   VolumeBulkDeleteRequest,
   VolumeBulkResponse,
-  VolumeLabelsUpdateRequest,
   VolumeSummary,
 } from '../schemas/index.js';
-import {
-  clearLabels,
-  getAllLabels,
-  getLabels,
-  mergeLabels,
-  setLabels,
-} from '../labels-store.js';
 
 const r = createApiRouter('/api/volumes', { tag: 'volumes' });
 
 const READONLY_LABEL = 'com.docker.manager.readonly';
 const STACK_LABEL = 'com.docker.compose.project';
 
-/** True iff the merged labels mark the volume read-only. */
-export function isVolumeReadOnly(mergedLabels) {
-  return (mergedLabels || {})[READONLY_LABEL] === 'true';
+/** True iff the volume's native labels mark it read-only. */
+export function isVolumeReadOnly(labels) {
+  return (labels || {})[READONLY_LABEL] === 'true';
 }
 
 // Build a {volume_name -> [{container_id, container_name, mount_path, rw}]}
@@ -81,8 +76,8 @@ async function diskUsageMap() {
   }
 }
 
-function enrich(v, { usage, sizes, extras }) {
-  const merged = mergeLabels(v.Labels, extras[v.Name]);
+function enrich(v, { usage, sizes }) {
+  const labels = v.Labels || {};
   const used = usage.get(v.Name) || [];
   const sz = sizes.has(v.Name) ? sizes.get(v.Name) : null;
   return {
@@ -91,13 +86,13 @@ function enrich(v, { usage, sizes, extras }) {
     mountpoint: v.Mountpoint,
     scope: v.Scope,
     created_at: v.CreatedAt,
-    labels: merged,
+    labels,
     options: v.Options || {},
-    stack: merged[STACK_LABEL] || null,
+    stack: labels[STACK_LABEL] || null,
     in_use: used.length > 0,
     used_by: used,
     size_bytes: sz,
-    read_only: isVolumeReadOnly(merged),
+    read_only: isVolumeReadOnly(labels),
   };
 }
 
@@ -126,14 +121,13 @@ r.get(
   asyncHandler(async (req, res) => {
     const wantSizes = boolQuery(req.query.sizes, true);
     const docker = getClient();
-    const [list, containers, sizes, extras] = await Promise.all([
+    const [list, containers, sizes] = await Promise.all([
       docker.listVolumes(),
       docker.listContainers({ all: true }),
       wantSizes ? diskUsageMap() : Promise.resolve(new Map()),
-      getAllLabels(),
     ]);
     const usage = indexUsage(containers);
-    res.json((list.Volumes || []).map((v) => enrich(v, { usage, sizes, extras })));
+    res.json((list.Volumes || []).map((v) => enrich(v, { usage, sizes })));
   }),
 );
 
@@ -157,12 +151,11 @@ r.post(
     // Echo the enriched shape so the SPA can drop it straight into the
     // table without a follow-up /list call.
     const v = await docker.getVolume(b.name).inspect();
-    const [containers, sizes, extras] = await Promise.all([
+    const [containers, sizes] = await Promise.all([
       docker.listContainers({ all: true }),
       diskUsageMap(),
-      getAllLabels(),
     ]);
-    res.json(enrich(v, { usage: indexUsage(containers), sizes, extras }));
+    res.json(enrich(v, { usage: indexUsage(containers), sizes }));
   }),
 );
 
@@ -194,9 +187,6 @@ r.post(
       const item = { name };
       try {
         await getClient().getVolume(name).remove({ force });
-        // Also drop the manager-side extra labels so they don't pile up
-        // for volumes that no longer exist.
-        await clearLabels(name).catch(() => {});
         item.ok = true;
       } catch (err) {
         item.ok = false;
@@ -217,60 +207,25 @@ r.post(
 r.get(
   '/:name',
   {
-    summary: 'Inspect a volume (enriched + manager labels merged)',
+    summary: 'Inspect a volume (enriched with usage, stack, read-only marker)',
     params: NameParam,
     responses: { 200: PassThroughObject },
   },
   asyncHandler(async (req, res) => {
     const docker = getClient();
-    const [v, containers, extras] = await Promise.all([
+    const [v, containers] = await Promise.all([
       docker.getVolume(req.params.name).inspect(),
       docker.listContainers({ all: true }),
-      getLabels(req.params.name),
     ]);
-    const merged = mergeLabels(v.Labels, extras);
+    const labels = v.Labels || {};
     const usage = indexUsage(containers);
-    // Surface both the merged labels and the raw daemon labels so the
-    // UI can show "(daemon)" vs "(manager)" badges in the Labels tab.
     res.json({
       ...v,
-      Labels: merged,
-      DaemonLabels: v.Labels || {},
-      ExtraLabels: extras,
       UsedBy: usage.get(req.params.name) || [],
       InUse: (usage.get(req.params.name) || []).length > 0,
-      ReadOnly: isVolumeReadOnly(merged),
-      Stack: merged[STACK_LABEL] || null,
+      ReadOnly: isVolumeReadOnly(labels),
+      Stack: labels[STACK_LABEL] || null,
     });
-  }),
-);
-
-/**
- * Replace the manager-side extra_labels for one volume. The daemon's
- * native labels are not touched (Docker has no PATCH for those). The
- * resulting merged set is returned so the SPA can update its row in
- * place without a follow-up list call.
- */
-r.put(
-  '/:name/labels',
-  {
-    summary: 'Replace manager-side extra_labels for a volume',
-    admin: true,
-    params: NameParam,
-    body: VolumeLabelsUpdateRequest,
-    responses: { 200: PassThroughObject },
-  },
-  asyncHandler(async (req, res) => {
-    const docker = getClient();
-    // Confirm the volume exists before touching the store, so we don't
-    // accumulate orphan label entries.
-    try { await docker.getVolume(req.params.name).inspect(); }
-    catch (err) {
-      if (err.statusCode === 404) throw new HttpError(404, 'Volume not found');
-      throw err;
-    }
-    const saved = await setLabels(req.params.name, req.body.extra_labels || {});
-    res.json({ name: req.params.name, extra_labels: saved });
   }),
 );
 
@@ -286,7 +241,6 @@ r.delete(
   asyncHandler(async (req, res) => {
     const force = boolQuery(req.query.force, false);
     await getClient().getVolume(req.params.name).remove({ force });
-    await clearLabels(req.params.name).catch(() => {});
     res.json({ removed: req.params.name });
   }),
 );

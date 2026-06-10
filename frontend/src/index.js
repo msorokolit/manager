@@ -1816,15 +1816,51 @@ import { FitAddon } from '@xterm/addon-fit';
             <input id="v-name" required class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
           <label class="block"><span class="text-xs text-slate-400">Driver</span>
             <input id="v-driver" value="local" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+          <label class="block"><span class="text-xs text-slate-400">Driver options (KEY=VALUE per line)</span>
+            <textarea id="v-driveropts" rows="3" placeholder="type=nfs&#10;o=addr=1.2.3.4,rw&#10;device=:/exports/data"
+                      class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
+          <label class="block"><span class="text-xs text-slate-400">Labels (KEY=VALUE per line)</span>
+            <textarea id="v-labels" rows="3" placeholder="owner=team-a&#10;tier=prod"
+                      class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
+          <label class="md:col-span-2 flex items-start gap-2 text-xs text-slate-300">
+            <input id="v-readonly" type="checkbox" class="mt-0.5 h-3.5 w-3.5"/>
+            <span>
+              <strong>Mark as read-only</strong> &mdash; adds <code class="text-[11px]">com.docker.manager.readonly=true</code> to the labels.
+              The file manager will refuse every write operation on this volume.
+              Labels are immutable, so this can only be set at create time;
+              to unmark, delete and recreate without the label.
+            </span>
+          </label>
         </div>`;
+
+      function parseKv(text) {
+        const out = {};
+        for (const raw of (text || '').split(/\r?\n/)) {
+          const line = raw.trim();
+          if (!line || line.startsWith('#')) continue;
+          const eq = line.indexOf('=');
+          if (eq <= 0) continue;
+          const k = line.slice(0, eq).trim();
+          const v = line.slice(eq + 1).trim();
+          if (k) out[k] = v;
+        }
+        return out;
+      }
+
       const ok = await modal({
         title: 'Create volume', body: wrap, size: 'md',
         actions: [
           { label: 'Cancel', value: false, kind: 'secondary' },
           { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+            const labels = parseKv(wrap.querySelector('#v-labels').value);
+            if (wrap.querySelector('#v-readonly').checked) {
+              labels['com.docker.manager.readonly'] = 'true';
+            }
             const payload = {
               name: wrap.querySelector('#v-name').value.trim(),
               driver: wrap.querySelector('#v-driver').value.trim() || 'local',
+              labels,
+              driver_opts: parseKv(wrap.querySelector('#v-driveropts').value),
             };
             if (!payload.name) return false;
             try { await api('/api/volumes', { method: 'POST', body: JSON.stringify(payload) }); toast('Volume created', 'success'); }
@@ -2357,8 +2393,11 @@ import { FitAddon } from '@xterm/addon-fit';
     catch (e) { toast(e.message, 'error'); return; }
 
     const READONLY_LABEL = 'com.docker.manager.readonly';
-    const daemonLabels = data.DaemonLabels || {};
-    const extraLabels = { ...(data.ExtraLabels || {}) };
+    // Native Docker labels are immutable after volume creation, so the
+    // inspect modal can only DISPLAY them — there's no "save" path. To
+    // change a volume's labels (including the read-only marker), the
+    // admin recreates it with the new label set at create time.
+    const labels = { ...(data.Labels || {}) };
 
     const wrap = document.createElement('div');
     wrap.className = 'flex flex-col gap-3';
@@ -2407,38 +2446,16 @@ import { FitAddon } from '@xterm/addon-fit';
           ${fieldRow('Stack (owner)', stackLink)}
           ${fieldRow('Created', escapeHtml(data.CreatedAt || ''))}
           ${fieldRow('Driver options', optsRows ? `<table>${optsRows}</table>` : '<span class="text-slate-500">none</span>')}
-          ${fieldRow('Read-only', `
-            <label class="inline-flex items-center gap-2 cursor-pointer text-sm">
-              <input id="vi-ro-toggle" type="checkbox" class="h-4 w-4" ${data.ReadOnly ? 'checked' : ''}/>
-              <span class="text-slate-400">Refuse all write operations on this volume. Sets <code class="text-[11px]">${READONLY_LABEL}=true</code>.</span>
-            </label>
-          `)}
+          ${fieldRow('Read-only', data.ReadOnly
+            ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300">enabled</span>
+               <span class="ml-2 text-xs text-slate-500">Set via <code class="text-[11px]">${READONLY_LABEL}=true</code> at volume create time. Recreate the volume to change this.</span>`
+            : `<span class="text-xs text-slate-500">Not set. To enable, create a new volume with <code class="text-[11px]">${READONLY_LABEL}=true</code> in its labels.</span>`)}
         </div>
         <div class="mt-4 flex flex-wrap gap-2">
           <button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>
           <button id="vi-delete" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove volume</button>
         </div>`;
 
-      panel.querySelector('#vi-ro-toggle').addEventListener('change', async (e) => {
-        try {
-          const next = { ...extraLabels };
-          if (e.target.checked) next[READONLY_LABEL] = 'true';
-          else delete next[READONLY_LABEL];
-          await api(`/api/volumes/${encodeURIComponent(name)}/labels`, {
-            method: 'PUT',
-            body: JSON.stringify({ extra_labels: next }),
-          });
-          extraLabels[READONLY_LABEL] = next[READONLY_LABEL];
-          if (!next[READONLY_LABEL]) delete extraLabels[READONLY_LABEL];
-          data.ReadOnly = !!next[READONLY_LABEL];
-          data.Labels = { ...daemonLabels, ...extraLabels };
-          toast(`Read-only ${e.target.checked ? 'enabled' : 'disabled'}`, 'success');
-          if (onChange) onChange();
-        } catch (ex) {
-          toast(ex.message, 'error');
-          e.target.checked = !e.target.checked; // roll back UI
-        }
-      });
       panel.querySelector('#vi-browse').onclick = async () => {
         // The Browse tab embeds the file manager directly; switch to it.
         activate('browse');
@@ -2486,123 +2503,27 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     function renderLabels() {
-      const merged = { ...daemonLabels, ...extraLabels };
-      const allKeys = [...new Set([...Object.keys(daemonLabels), ...Object.keys(extraLabels)])].sort();
-      const rows = allKeys.map((k) => {
-        const fromDaemon = k in daemonLabels;
-        const fromManager = k in extraLabels;
-        const value = merged[k];
-        const sourceBadge = fromManager && fromDaemon
-          ? `<span class="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] text-sky-300">manager (overrides daemon)</span>`
-          : fromManager
-            ? `<span class="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] text-sky-300">manager</span>`
-            : `<span class="rounded bg-slate-700/40 px-1.5 py-0.5 text-[9px] text-slate-400">daemon (immutable)</span>`;
-        return `
-          <tr class="border-b border-slate-800/60">
-            <td class="px-2 py-1">
-              <input ${fromDaemon && !fromManager ? 'disabled' : ''} data-k="${escapeHtml(k)}" data-field="k"
-                     value="${escapeHtml(k)}" class="vi-label-input w-full rounded border-slate-700 bg-slate-950 px-2 py-1 text-xs font-mono text-slate-200 disabled:opacity-60"/>
-            </td>
-            <td class="px-2 py-1">
-              <input ${fromDaemon && !fromManager ? 'disabled' : ''} data-k="${escapeHtml(k)}" data-field="v"
-                     value="${escapeHtml(value)}" class="vi-label-input w-full rounded border-slate-700 bg-slate-950 px-2 py-1 text-xs font-mono text-slate-200 disabled:opacity-60"/>
-            </td>
-            <td class="px-2 py-1 text-right whitespace-nowrap">${sourceBadge}
-              ${fromManager ? `<button data-k="${escapeHtml(k)}" data-act="rm" class="ml-1 rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5 py-0.5 text-[10px]">×</button>` : ''}
-            </td>
-          </tr>`;
-      }).join('');
+      const keys = Object.keys(labels).sort();
+      const rows = keys.map((k) => `
+        <tr class="border-b border-slate-800/60">
+          <td class="px-2 py-1 align-top font-mono text-xs text-slate-300 break-all">${escapeHtml(k)}</td>
+          <td class="px-2 py-1 align-top font-mono text-xs text-slate-200 break-all">${escapeHtml(labels[k])}</td>
+        </tr>
+      `).join('');
       panel.innerHTML = `
         <p class="mb-2 text-xs text-slate-500">
-          Daemon labels are immutable (Docker has no API to edit them after creation). Manager labels are stored separately and merged into every inspect — they're how the read-only marker and other manager-side metadata persist.
+          Volume labels are set at create time and are <strong>immutable</strong> — Docker's Engine API has no
+          <code class="text-[11px]">PATCH /volumes/{name}</code> endpoint. To add or change labels (including the
+          <code class="text-[11px]">${READONLY_LABEL}</code> marker), delete the volume and recreate it with the new label set.
+          The same rule applies to <code class="text-[11px]">com.docker.compose.project</code> and every other label
+          you see here.
         </p>
         <table class="w-full text-left">
           <thead class="text-[10px] uppercase tracking-wider text-slate-400">
-            <tr><th class="px-2 py-1">Key</th><th class="px-2 py-1">Value</th><th class="px-2 py-1 text-right">Source</th></tr>
+            <tr><th class="w-1/3 px-2 py-1">Key</th><th class="px-2 py-1">Value</th></tr>
           </thead>
-          <tbody>${rows || '<tr><td colspan="3" class="px-2 py-4 text-center text-xs text-slate-500">No labels</td></tr>'}</tbody>
-        </table>
-        <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
-          <input id="vi-label-newk" placeholder="new.label.key" class="rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs"/>
-          <input id="vi-label-newv" placeholder="value" class="rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs"/>
-          <button id="vi-label-add" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-slate-300">+ Add label</button>
-          <span class="ml-auto"></span>
-          <button id="vi-label-save" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1 font-medium">Save changes</button>
-        </div>
-        <div id="vi-label-status" class="mt-2 hidden rounded px-3 py-1.5 text-xs"></div>`;
-
-      function setStatus(msg, kind = 'info') {
-        const el = panel.querySelector('#vi-label-status');
-        if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
-        el.classList.remove('hidden');
-        el.textContent = msg;
-        el.className = 'mt-2 rounded px-3 py-1.5 text-xs ' + (
-          kind === 'err' ? 'bg-rose-500/15 text-rose-200'
-          : kind === 'ok' ? 'bg-emerald-500/15 text-emerald-200'
-          : 'bg-slate-800/60 text-slate-300');
-      }
-
-      // Live-collect the manager-side label state from the inputs + the
-      // remove buttons; the daemon labels are skipped (disabled inputs).
-      function collectExtras() {
-        const next = {};
-        // Keep extras whose key wasn't removed via the × button
-        const removed = new Set();
-        for (const b of panel.querySelectorAll('button[data-act="rm"][data-removed="1"]')) {
-          removed.add(b.dataset.k);
-        }
-        for (const k of Object.keys(extraLabels)) {
-          if (removed.has(k)) continue;
-          const kInput = panel.querySelector(`input.vi-label-input[data-k="${CSS.escape(k)}"][data-field="k"]`);
-          const vInput = panel.querySelector(`input.vi-label-input[data-k="${CSS.escape(k)}"][data-field="v"]`);
-          const finalK = (kInput?.value || k).trim();
-          const finalV = (vInput?.value || '').trim();
-          if (finalK) next[finalK] = finalV;
-        }
-        const nk = panel.querySelector('#vi-label-newk').value.trim();
-        const nv = panel.querySelector('#vi-label-newv').value.trim();
-        if (nk) next[nk] = nv;
-        return next;
-      }
-
-      panel.addEventListener('click', (e) => {
-        const t = e.target.closest('button[data-act="rm"]'); if (!t) return;
-        t.dataset.removed = '1';
-        // Visually grey the row
-        const row = t.closest('tr');
-        for (const i of row.querySelectorAll('input')) i.disabled = true;
-        row.classList.add('line-through', 'opacity-50');
-        t.disabled = true;
-      });
-
-      panel.querySelector('#vi-label-add').onclick = () => {
-        // Just commit + re-render to absorb the new row cleanly.
-        const next = collectExtras();
-        // Apply optimistically to in-modal state, then re-render Labels.
-        Object.keys(extraLabels).forEach((k) => delete extraLabels[k]);
-        Object.assign(extraLabels, next);
-        renderLabels();
-      };
-
-      panel.querySelector('#vi-label-save').onclick = async () => {
-        const next = collectExtras();
-        try {
-          const out = await api(`/api/volumes/${encodeURIComponent(name)}/labels`, {
-            method: 'PUT',
-            body: JSON.stringify({ extra_labels: next }),
-          });
-          Object.keys(extraLabels).forEach((k) => delete extraLabels[k]);
-          Object.assign(extraLabels, out.extra_labels || {});
-          data.ExtraLabels = extraLabels;
-          data.Labels = { ...daemonLabels, ...extraLabels };
-          data.ReadOnly = extraLabels[READONLY_LABEL] === 'true';
-          setStatus(`Saved ${Object.keys(extraLabels).length} manager-side label${Object.keys(extraLabels).length === 1 ? '' : 's'}`, 'ok');
-          renderLabels();
-          if (onChange) onChange();
-        } catch (ex) {
-          setStatus(ex.message, 'err');
-        }
-      };
+          <tbody>${rows || '<tr><td colspan="2" class="px-2 py-4 text-center text-xs text-slate-500">No labels</td></tr>'}</tbody>
+        </table>`;
     }
 
     function renderBrowse() {
@@ -2629,7 +2550,6 @@ import { FitAddon } from '@xterm/addon-fit';
         ...data,
         // Hide our enriched fields from the raw view — they're shown in
         // their own tabs and would otherwise clutter the JSON.
-        DaemonLabels: undefined, ExtraLabels: undefined,
         UsedBy: undefined, InUse: undefined, ReadOnly: undefined, Stack: undefined,
       }));
     }
