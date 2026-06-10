@@ -437,14 +437,22 @@ async function ensureVolumeExists(volume) {
   }
 }
 
-// Capability set used by operations that need to chown / chmod / read /
-// write files we don't own. The container is otherwise locked down
-// (NetworkMode:none, only /target mounted, AutoRemove, no other caps),
-// so the security loss from granting these three is minimal.
-//   CHOWN          — required for lchown(); even root can't chown without it
-//   FOWNER         — bypass DAC owner check for chmod/utime on files we don't own
-//   DAC_OVERRIDE   — bypass read/write/search DAC checks (mixed-ownership volumes)
-const WRITE_CAPS = ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'];
+// Capability set used by every volume-browser operation. The container is
+// otherwise locked down (NetworkMode:none, only /target mounted, AutoRemove,
+// no other caps, PidsLimit, no host networking, no devices), so granting
+// these three to root inside the container is a tiny ask compared to what
+// a file-manager admin needs to do:
+//   CHOWN              — required for lchown(); even root can't chown without it
+//   FOWNER             — bypass DAC owner check for chmod/utime on files we don't own
+//   DAC_OVERRIDE       — bypass read/write/search DAC checks (mixed-ownership
+//                        volumes — e.g. a file owned by uid 1000 mode 0600
+//                        is unreadable to root-without-DAC_OVERRIDE)
+//
+// Read paths take the same caps because of the last bullet: without them,
+// list / view / archive against a volume whose files belong to other UIDs
+// returns EACCES even though we're root. That's exactly the case after
+// any successful chown.
+const BROWSER_CAPS = ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'];
 
 function browserHostConfig(volume, { readonly = false, capAdd = [] } = {}) {
   const hc = {
@@ -661,7 +669,7 @@ r.get(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', LIST_SCRIPT, safe, String(limit), String(offset)],
-      { readonly: true },
+      { readonly: true, capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'list');
     res.json({
@@ -686,7 +694,7 @@ r.get(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', VIEW_SCRIPT, safe],
-      { readonly: true },
+      { readonly: true, capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'view');
     res.json({
@@ -714,7 +722,7 @@ async function assertSafeOnce(volume, safe) {
   const out = await runOnce(
     volume,
     ['python3', '-c', ASSERT_SAFE_SCRIPT, safe],
-    { readonly: true },
+    { readonly: true, capAdd: BROWSER_CAPS },
   );
   parseScriptResult(out, 'safety check'); // throws 400 on escape
 }
@@ -880,7 +888,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', MKDIR_SCRIPT, safe],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     parseScriptResult(out, 'mkdir');
     res.json({ created: safe.slice('/target'.length) || '/' });
@@ -902,7 +910,7 @@ r.delete(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', DELETE_SCRIPT, safe],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     parseScriptResult(out, 'delete');
     res.json({ removed: safe.slice('/target'.length) });
@@ -930,7 +938,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', RENAME_SCRIPT, from, to],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     parseScriptResult(out, 'rename');
     res.json({
@@ -955,7 +963,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', CHMOD_SCRIPT, req.body.mode, safe, req.body.recursive ? '1' : '0'],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     parseScriptResult(out, 'chmod');
     res.json({ path: safe.slice('/target'.length) || '/', mode: req.body.mode });
@@ -982,7 +990,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', CHOWN_SCRIPT, safe, String(uid), String(gid), req.body.recursive ? '1' : '0'],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     parseScriptResult(out, 'chown');
     res.json({
@@ -1018,7 +1026,7 @@ r.put(
       req.body.if_mtime != null ? String(req.body.if_mtime) : '',
       req.body.mode || '',
     ];
-    const out = await runOnce(req.params.name, args, { stdin: content, capAdd: WRITE_CAPS });
+    const out = await runOnce(req.params.name, args, { stdin: content, capAdd: BROWSER_CAPS });
     const text = (out.stdout || '').trim();
     if (!text) {
       throw new HttpError(500, `edit produced no output${out.stderr ? ': ' + out.stderr.slice(0, 200) : ''}`);
@@ -1066,7 +1074,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', BULK_CHMOD_SCRIPT, spec],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'bulk chmod');
     const results = (data.results || []).map((r) => ({
@@ -1106,7 +1114,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', BULK_CHOWN_SCRIPT, spec],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'bulk chown');
     const results = (data.results || []).map((r) => ({
@@ -1138,7 +1146,7 @@ r.post(
     const out = await runOnce(
       req.params.name,
       ['python3', '-c', BULK_DELETE_SCRIPT, spec],
-      { capAdd: WRITE_CAPS },
+      { capAdd: BROWSER_CAPS },
     );
     const data = parseScriptResult(out, 'bulk delete');
     const results = (data.results || []).map((r) => ({

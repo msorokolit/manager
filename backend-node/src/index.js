@@ -24,6 +24,7 @@ import volumesApi from './routes/volumes.js';
 import volumeBrowserApi, {
   ensureBrowserImage,
 } from './routes/volume-browser.js';
+import { isAllowedWsOrigin } from './ws-origin.js';
 import stacksApi from './routes/stacks.js';
 import registriesApi from './routes/registries.js';
 import execApi, { handleExecWebSocket } from './routes/exec.js';
@@ -66,7 +67,14 @@ app.set('trust proxy', 1);
 // the page would break those.
 if (!settings.helmetDisabled) {
   const helmetOpts = {
-    crossOriginEmbedderPolicy: false,
+    // COEP=require-corp: every embedded resource has to opt into being
+    // loaded by us via Cross-Origin-Resource-Policy. Re-enabled now that
+    // the SPA is fully bundled with no CDN scripts; same-origin assets
+    // automatically count as same-origin under our same-site CORP, and
+    // the only "cross-origin"-looking resources we use are data: URIs
+    // (favicon) which aren't subject to COEP. Swagger UI at /api/docs
+    // does load cross-origin assets and opts out further down.
+    crossOriginEmbedderPolicy: { policy: 'require-corp' },
     crossOriginResourcePolicy: { policy: 'same-site' },
     // Disable HSTS by default — a TLS-terminating proxy is a better place to
     // set Strict-Transport-Security with a deployment-appropriate max-age.
@@ -165,10 +173,13 @@ const openApiSpec = buildOpenApiSpec(allOperations);
 app.get('/api/openapi.json', (_req, res) => res.json(openApiSpec));
 app.use(
   '/api/docs',
-  // Tighten CSP slightly for the docs page so the inline initializer Swagger
-  // UI ships with isn't blocked.
+  // Swagger UI ships with an inline initializer and pulls a couple of its
+  // own assets cross-origin; both of those are blocked by our default
+  // CSP and COEP. Strip both headers for the docs sub-tree only — the
+  // SPA proper keeps the strict policy.
   (req, res, next) => {
     res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
     next();
   },
   swaggerUi.serve,
@@ -231,15 +242,31 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 const EXEC_PATH = /^\/api\/containers\/([^/]+)\/exec\/?$/;
 
+function rejectUpgrade(socket, status, reason) {
+  // Write a minimal HTTP error response then close. ws's `handleUpgrade`
+  // would respond with `Connection: close` but for non-handshakes we own
+  // the socket directly. Keeping the response body short avoids tripping
+  // strict clients that don't expect data after the status line.
+  try {
+    socket.write(
+      `HTTP/1.1 ${status} ${reason}\r\n` +
+      `Content-Length: 0\r\n` +
+      `Connection: close\r\n\r\n`,
+    );
+  } catch { /* socket may already be dead */ }
+  socket.destroy();
+}
+
 server.on('upgrade', (req, socket, head) => {
   let url;
   try {
     url = new URL(req.url, 'http://x');
   } catch {
-    return socket.destroy();
+    return rejectUpgrade(socket, 400, 'Bad Request');
   }
   const m = EXEC_PATH.exec(url.pathname);
-  if (!m) return socket.destroy();
+  if (!m) return rejectUpgrade(socket, 404, 'Not Found');
+  if (!isAllowedWsOrigin(req)) return rejectUpgrade(socket, 403, 'Forbidden');
   wss.handleUpgrade(req, socket, head, (ws) => {
     handleExecWebSocket(ws, req, { id: m[1] }).catch((err) => {
       try {
