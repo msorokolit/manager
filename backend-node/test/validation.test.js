@@ -459,3 +459,136 @@ describe('CreateContainerRequest mem fields (M4)', () => {
     expect(isValid({ shm_size: 'lol' })).toBe(false);
   });
 });
+
+// ---------- Networks (Portainer-parity) ----------
+
+describe('Network schemas', () => {
+  it('CreateNetworkRequest accepts a minimal payload', () => {
+    expect(valid(S.CreateNetworkRequest, { name: 'my-net' })).toBe(true);
+  });
+
+  it('CreateNetworkRequest accepts a full payload (driver + IPAM + opts + labels)', () => {
+    expect(valid(S.CreateNetworkRequest, {
+      name: 'tier-1',
+      driver: 'macvlan',
+      internal: true,
+      attachable: false,
+      enable_ipv6: true,
+      driver_opts: { parent: 'eth0' },
+      ipam: {
+        driver: 'default',
+        options: { foo: 'bar' },
+        config: [
+          { subnet: '172.20.0.0/16', gateway: '172.20.0.1', ip_range: '172.20.10.0/24',
+            aux_addresses: { router: '172.20.0.1' } },
+          { subnet: '2001:db8::/64', gateway: '2001:db8::1' },
+        ],
+      },
+      labels: { owner: 'team-a' },
+    })).toBe(true);
+  });
+
+  it('CreateNetworkRequest rejects bad names', () => {
+    expect(valid(S.CreateNetworkRequest, { name: '' })).toBe(false);
+    expect(valid(S.CreateNetworkRequest, { name: '-leading-dash' })).toBe(false);
+    expect(valid(S.CreateNetworkRequest, { name: 'has space' })).toBe(false);
+    expect(valid(S.CreateNetworkRequest, { name: 'has/slash' })).toBe(false);
+    expect(valid(S.CreateNetworkRequest, { name: 'a'.repeat(256) })).toBe(false);
+  });
+
+  it('CreateNetworkRequest enforces additionalProperties: false', () => {
+    expect(valid(S.CreateNetworkRequest, { name: 'n', sneaky: 1 })).toBe(false);
+  });
+
+  it('CreateNetworkRequest enforces IPAM config maxItems', () => {
+    expect(valid(S.CreateNetworkRequest, {
+      name: 'n',
+      ipam: { config: Array.from({ length: 17 }, () => ({ subnet: '10.0.0.0/24' })) },
+    })).toBe(false);
+  });
+
+  it('ConnectRequest accepts a MAC address', () => {
+    expect(valid(S.ConnectRequest, { container: 'cid', mac_address: '02:42:ac:11:00:02' })).toBe(true);
+    expect(valid(S.ConnectRequest, { container: 'cid', mac_address: '02-42-AC-11-00-02' })).toBe(true);
+  });
+
+  it('ConnectRequest rejects malformed MAC addresses', () => {
+    expect(valid(S.ConnectRequest, { container: 'cid', mac_address: 'not-a-mac' })).toBe(false);
+    expect(valid(S.ConnectRequest, { container: 'cid', mac_address: '02:42:ac:11:00' })).toBe(false);
+    expect(valid(S.ConnectRequest, { container: 'cid', mac_address: '02:42:ac:11:00:zz' })).toBe(false);
+  });
+
+  it('ConnectRequest accepts full payload (aliases, IPv4/6, links, driver_opts)', () => {
+    expect(valid(S.ConnectRequest, {
+      container: 'cid',
+      aliases: ['db', 'primary'],
+      ipv4_address: '172.20.0.10',
+      ipv6_address: '2001:db8::10',
+      mac_address: '02:42:ac:11:00:02',
+      links: ['cache:redis'],
+      driver_opts: { foo: 'bar' },
+    })).toBe(true);
+  });
+
+  it('DisconnectRequest defaults force to false', () => {
+    expect(valid(S.DisconnectRequest, { container: 'cid' })).toBe(true);
+    expect(valid(S.DisconnectRequest, { container: 'cid', force: true })).toBe(true);
+  });
+
+  it('NetworkSummary requires the new enriched fields', () => {
+    const ok = {
+      id: 'abc', short_id: 'abc',
+      name: 'n', driver: 'bridge', scope: 'local',
+      internal: false, attachable: true, enable_ipv6: false,
+      stack: null, system: false, ipam_driver: 'default',
+      subnets: [], gateways: [], in_use: false, containers_count: 0, used_by: [],
+      labels: {},
+    };
+    expect(valid(S.NetworkSummary, ok)).toBe(true);
+    // Drop a required field — should fail.
+    const bad = { ...ok }; delete bad.system;
+    expect(valid(S.NetworkSummary, bad)).toBe(false);
+    // additionalProperties: false rejects extras.
+    expect(valid(S.NetworkSummary, { ...ok, surprise: 1 })).toBe(false);
+  });
+
+  it('NetworkSummary rejects used_by entries missing fields', () => {
+    const base = {
+      id: 'abc', short_id: 'abc', name: 'n', driver: 'bridge', scope: 'local',
+      internal: false, attachable: true, enable_ipv6: false,
+      stack: null, system: false, ipam_driver: 'default',
+      subnets: [], gateways: [], in_use: true, containers_count: 1, labels: {},
+    };
+    // Missing container_name + aliases on the usage entry.
+    expect(valid(S.NetworkSummary, {
+      ...base, used_by: [{ container_id: 'cid' }],
+    })).toBe(false);
+    expect(valid(S.NetworkSummary, {
+      ...base,
+      used_by: [{
+        container_id: 'cid', container_name: 'web-1',
+        ipv4: '172.20.0.2', ipv6: null, mac: '02:42:ac:11:00:02', aliases: ['web'],
+      }],
+    })).toBe(true);
+  });
+
+  it('NetworkDetail = NetworkSummary fields + ipam/options/raw', () => {
+    const summary = {
+      id: 'abc', short_id: 'abc', name: 'n', driver: 'bridge', scope: 'local',
+      internal: false, attachable: true, enable_ipv6: false,
+      stack: null, system: false, ipam_driver: 'default',
+      subnets: [], gateways: [], in_use: false, containers_count: 0, used_by: [],
+      labels: {},
+    };
+    expect(valid(S.NetworkDetail, { ...summary, ipam: { driver: 'default' }, options: {}, raw: { Name: 'n' } })).toBe(true);
+    expect(valid(S.NetworkDetail, summary)).toBe(false); // missing ipam/options/raw
+  });
+
+  it('NetworkBulkDeleteRequest enforces minItems / maxItems', () => {
+    expect(valid(S.NetworkBulkDeleteRequest, { ids: ['a'] })).toBe(true);
+    expect(valid(S.NetworkBulkDeleteRequest, { ids: [] })).toBe(false);
+    expect(valid(S.NetworkBulkDeleteRequest, {
+      ids: Array.from({ length: 501 }, (_, i) => `n${i}`),
+    })).toBe(false);
+  });
+});
