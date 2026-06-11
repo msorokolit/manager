@@ -220,6 +220,69 @@ Filters: `since`, `until`, `actor`, `action` (glob: `container.*`, `*.bulk`, etc
 
 For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a path your log shipper watches (`vector` / `fluentbit` / `filebeat`) and disable in-process rotation with `AUDIT_MAX_BYTES=0`. The JSONL format is the lowest-common-denominator input for every aggregator we tested.
 
+## Historical activity (past events + past resource usage)
+
+Live monitoring (Stats tab, Activity page, dashboard Top Consumers) shows "now" — when the page closes, the data is gone. For "what happened at 03:42 AM yesterday" you need a persistent recorder running in the background, which the manager ships out of the box.
+
+Two recorders write to their own append-only JSONL files (size-rotated, mode 0600):
+
+| Recorder | File | What it captures |
+|---|---|---|
+| **event-history** (`src/event-history.js`) | `${DATA_DIR}/events.jsonl` | Every Docker event the daemon emits (container create/start/die/destroy, image pull, network connect, volume create, health_status transitions, …) |
+| **stats-history** (`src/stats-history.js`) | `${DATA_DIR}/stats.jsonl` | One row per `STATS_HISTORY_INTERVAL_SEC`: totals + top-N container snapshots (default 30 s × top-20) |
+
+Both start automatically after `server.listen()`; both can be disabled via env. Both survive **daemon restarts** — Docker's own `/events` endpoint only retains entries since the daemon last started.
+
+### What problem this solves
+
+- *"Why did this container die at 03:42?"* → Events tab, filter by container name → see the `die` event with `exitCode` and `signal` in attributes.
+- *"What was the host doing last night?"* → Resources tab, range = "Last 24 hours" → sparklines.
+- *"Which container has been consistently using the most CPU lately?"* → Resources tab → "Heaviest containers in the window" leaderboard (sums cpu_pct across all samples in the range — favours sustained load over single spikes).
+
+### Reliability
+
+- **Auto-reconnect**: the events subscriber reconnects on stream error/end with exponential backoff (1 s, 2 s, 4 s, … capped at 60 s). A 5-minute daemon outage costs you the 5 minutes of events, not future events.
+- **Idempotent start/stop**: re-calling `start()` while already running is a no-op so a botched bootstrap doesn't open two subscribers; `stop()` is wired to `SIGTERM` / `SIGINT` so JSONL writes flush cleanly on shutdown.
+- **Per-sample failure isolation**: a sampler tick that throws (transient daemon hiccup, rotating-out container) is logged at warn and the sampler keeps ticking. One bad sample doesn't kill the recorder.
+- **Externally truncated files survive**: every 50th write re-stats the file, so `> events.jsonl` from the shell doesn't make the recorder grow past the cap silently.
+
+### API
+
+| Endpoint | Filters | Default order |
+|---|---|---|
+| `GET /api/system/events/history` | `since`, `until`, `type`, `action` (glob: `start`, `container.*`, `*.die`), `actor_id` (prefix), `actor_name`, `limit`, `offset`, `order` | `desc` (newest first — what an operator scanning for "what just happened" wants) |
+| `GET /api/system/stats/history` | `since`, `until`, `container_id` (id prefix OR exact name — matches rows whose `top[]` snapshot includes it), `limit`, `offset`, `order` | `asc` (charts need oldest-first to draw left-to-right) |
+
+Both are viewer-allowed (read-only diagnostic data). Both return `503` when the corresponding recorder is disabled, and the SPA renders that as an actionable "set `EVENTS_HISTORY_ENABLED=true` and restart" panel.
+
+### Storage budget at defaults
+
+| Recorder | Per-row size | Volume | Cap | Retention |
+|---|---|---|---|---|
+| events | ~250 bytes | bursty (~1 event per container lifecycle action) | 50 MB × 5 rotations | usually weeks-months |
+| stats | ~5 KB (totals + top-20 snapshot) | 30 s × 2880/day ≈ **14 MB/day** | 50 MB × 5 rotations | **~17 days** |
+
+### Tuning knobs
+
+All controllable via env vars (all have safe defaults):
+
+| Env var | Default | Notes |
+|---|---|---|
+| `EVENTS_HISTORY_ENABLED` | `true` | Disable on read-only mirrors of the host where the daemon is queried via another process |
+| `EVENTS_HISTORY_FILE` | `${DATA_DIR}/events.jsonl` | Point at a log-shipper-watched path and set `EVENTS_HISTORY_MAX_BYTES=0` to delegate rotation to logrotate / vector |
+| `EVENTS_HISTORY_MAX_BYTES` | `52428800` (50 MB) | 0 disables in-process rotation |
+| `EVENTS_HISTORY_ROTATE_KEEP` | `5` | Number of rotated siblings to keep |
+| `STATS_HISTORY_ENABLED` | `true` | Disable to delegate metrics to Prometheus + node_exporter + cAdvisor |
+| `STATS_HISTORY_FILE` | `${DATA_DIR}/stats.jsonl` | |
+| `STATS_HISTORY_MAX_BYTES` | `52428800` (50 MB) | 0 disables in-process rotation |
+| `STATS_HISTORY_ROTATE_KEEP` | `5` | |
+| `STATS_HISTORY_INTERVAL_SEC` | `30` | Floor 5 s (≥5 s avoids saturating the daemon — each sample is N×two-stats-calls) |
+| `STATS_HISTORY_TOP_N` | `20` | Heaviest containers snapshotted per row. 0 = totals only |
+
+### Why not just use Prometheus?
+
+For larger deployments you should. The recorders are designed for the **single-host, no-external-stack** case where the manager IS the operations console — Prometheus + Grafana would be overkill for "I want to see what happened last night." Pointing your monitoring stack at the daemon + node_exporter is the right answer at scale; toggle `STATS_HISTORY_ENABLED=false` and `EVENTS_HISTORY_ENABLED=false` to disable the recorders in that setup.
+
 ## Live monitoring: stats, processes, top consumers
 
 The manager surfaces three monitoring views, each scoped to a different question.

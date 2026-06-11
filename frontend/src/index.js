@@ -23,6 +23,10 @@ import { FitAddon } from '@xterm/addon-fit';
     { id: 'networks', label: 'Networks', icon: '🌐' },
     { id: 'volumes', label: 'Volumes', icon: '💾' },
     { id: 'activity', label: 'Activity', icon: '📈' },
+    // 'History' surfaces the persistent recorders (events.jsonl +
+    // stats.jsonl) that capture activity even when no SPA tab is
+    // open. Available to viewer + admin since it's read-only.
+    { id: 'history', label: 'History', icon: '🕒' },
     { id: 'registries', label: 'Registries', icon: '🔑' },
     { id: 'sessions', label: 'Sessions', icon: '🪪' },
     // 'Audit' is admin-only; the nav-render code hides items where
@@ -1027,6 +1031,7 @@ import { FitAddon } from '@xterm/addon-fit';
               ${isAdmin ? actionButton(c, 'stop', '■ Stop', 'secondary', c.state !== 'running') : ''}
               <button data-act="logs" data-id="${c.id}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Logs</button>
               ${isAdmin ? `<button data-act="exec" data-id="${c.id}" data-name="${escapeHtml(c.name)}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" ${c.state !== 'running' ? 'disabled' : ''} ${c.state !== 'running' ? 'title="Container must be running"' : ''}>⌨ Terminal</button>` : ''}
+              <button data-act="history" data-id="${c.id}" data-name="${escapeHtml(c.name)}" title="Past events for this container" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">🕒 History</button>
               ${isAdmin ? `<button data-act="duplicate" data-id="${c.id}" data-name="${escapeHtml(c.name)}" title="Create a new container with the same settings" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⎘ Duplicate</button>` : ''}
               ${isAdmin ? `<button data-act="remove" data-id="${c.id}" class="rounded-md bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
             </div>
@@ -1115,6 +1120,16 @@ import { FitAddon } from '@xterm/addon-fit';
         if (act === 'inspect') return showContainerInspect(id);
         if (act === 'logs') return showContainerLogs(id);
         if (act === 'exec') return openTerminal(id, t.dataset.name);
+        if (act === 'history') {
+          // Cross-link to the History page with this container's
+          // id pre-filled. The History view reads the hash params
+          // and applies them as filters on mount.
+          const qs = new URLSearchParams({
+            tab: 'events', container_id: id, actor_name: t.dataset.name,
+          });
+          location.hash = `#history?${qs.toString()}`;
+          return;
+        }
         if (act === 'duplicate') {
           // Fetch the full inspect for the prefill — the list summary
           // doesn't carry HostConfig. Best-effort; if it fails we
@@ -7107,6 +7122,356 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Activity (live events + per-container live stats) ----------
+  /**
+   * History view — surfaces the persistent JSONL recorders that
+   * capture events + resource samples whether or not the SPA is
+   * open. Two sub-tabs:
+   *
+   *   Events    — filterable, paginated log of every Docker event
+   *               since the recorder was started. Read from
+   *               GET /api/system/events/history.
+   *   Resources — time-windowed sparklines of host totals
+   *               (CPU%, memory, network rate, block I/O rate) read
+   *               from GET /api/system/stats/history.
+   *
+   * The view honors a few hash-query params for cross-linking:
+   *   #history?tab=events&container_id=<id>
+   *   #history?tab=resources&since=<iso>&until=<iso>
+   *
+   * Both endpoints return 503 when the corresponding recorder is
+   * disabled (EVENTS_HISTORY_ENABLED=false or
+   * STATS_HISTORY_ENABLED=false). The view catches that and shows
+   * an actionable empty state instead of a generic error toast.
+   */
+  views.history = async (root) => {
+    // Allow cross-links from elsewhere (container rows, stack
+    // inspect) to land on a pre-filtered tab.
+    const params = (() => {
+      const q = (location.hash.split('?')[1] || '');
+      const out = {};
+      for (const part of q.split('&')) {
+        const [k, v] = part.split('=');
+        if (k) out[decodeURIComponent(k)] = v == null ? '' : decodeURIComponent(v);
+      }
+      return out;
+    })();
+    const initialTab = params.tab === 'resources' ? 'resources' : 'events';
+
+    root.innerHTML = pageHeader('History',
+      'Past Docker events + resource usage recorded persistently (survives daemon restarts and SPA closures)');
+    const tabs = document.createElement('div');
+    tabs.className = 'border-b border-slate-800 mb-3 flex flex-wrap gap-1 text-xs';
+    tabs.innerHTML = `
+      <button data-tab="events"    class="rounded-t px-3 py-2 transition">📜 Events</button>
+      <button data-tab="resources" class="rounded-t px-3 py-2 transition">📈 Resources</button>`;
+    root.appendChild(tabs);
+    const pane = document.createElement('div');
+    pane.id = 'history-pane';
+    root.appendChild(pane);
+
+    let activeCleanup = null;
+    function paint(tabId) {
+      if (activeCleanup) { try { activeCleanup(); } catch {} activeCleanup = null; }
+      tabs.querySelectorAll('[data-tab]').forEach((b) => {
+        const active = b.dataset.tab === tabId;
+        b.className = `rounded-t px-3 py-2 transition ${active ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`;
+      });
+      pane.replaceChildren();
+      if (tabId === 'events') activeCleanup = mountEventsHistory(pane, params);
+      else activeCleanup = mountResourcesHistory(pane, params);
+    }
+    tabs.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-tab]'); if (b) paint(b.dataset.tab);
+    });
+    window.addEventListener('hashchange', () => { if (activeCleanup) { try { activeCleanup(); } catch {} activeCleanup = null; } }, { once: true });
+    paint(initialTab);
+  };
+
+  /**
+   * Events sub-tab. Filter bar + table + pagination + detail
+   * modal. Models the audit view's layout for consistency — the
+   * two surfaces answer related questions ("what did the daemon
+   * do" vs "what did a user do") and look similar on purpose.
+   */
+  function mountEventsHistory(pane, hashParams = {}) {
+    pane.innerHTML = `
+      <div class="mb-3 rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+        <div class="grid gap-2 md:grid-cols-6">
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Since</span>
+            <input id="ev-since" type="datetime-local" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Until</span>
+            <input id="ev-until" type="datetime-local" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Type</span>
+            <select id="ev-type" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs">
+              <option value="">all</option>
+              <option>container</option><option>image</option><option>network</option>
+              <option>volume</option><option>plugin</option><option>daemon</option>
+              <option>service</option><option>node</option><option>secret</option><option>config</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Action (glob)</span>
+            <input id="ev-action" placeholder="start | die | container.* | *.pull" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Container name</span>
+            <input id="ev-actor-name" value="${escapeHtml(hashParams.actor_name || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-slate-400">Container id (prefix)</span>
+            <input id="ev-actor-id" value="${escapeHtml(hashParams.container_id || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+          </label>
+        </div>
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <button id="ev-apply" class="rounded bg-sky-500/80 hover:bg-sky-500 text-slate-950 px-3 py-1.5 text-xs font-medium">Apply</button>
+          <button id="ev-clear" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 text-xs">Clear</button>
+          <label class="flex items-center gap-1 text-xs text-slate-400 ml-2">
+            <input id="ev-auto" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Auto-refresh (10s)
+          </label>
+          <span id="ev-meta" class="ml-auto text-xs text-slate-500"></span>
+        </div>
+      </div>
+      <div id="ev-table"></div>
+      <div class="mt-3 flex items-center justify-between text-xs">
+        <button id="ev-prev" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5">← Prev</button>
+        <span id="ev-page" class="text-slate-400"></span>
+        <button id="ev-next" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5">Next →</button>
+      </div>`;
+
+    const state = { offset: 0, limit: 100, lastResp: null };
+    let pollHandle = null;
+
+    function readFilters() {
+      const isoOrEmpty = (v) => v ? new Date(v).toISOString() : '';
+      return {
+        since: isoOrEmpty(pane.querySelector('#ev-since').value),
+        until: isoOrEmpty(pane.querySelector('#ev-until').value),
+        type: pane.querySelector('#ev-type').value || '',
+        action: pane.querySelector('#ev-action').value.trim(),
+        actor_name: pane.querySelector('#ev-actor-name').value.trim(),
+        actor_id: pane.querySelector('#ev-actor-id').value.trim(),
+      };
+    }
+
+    async function load() {
+      const f = readFilters();
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(f)) if (v) qs.set(k, v);
+      qs.set('limit', state.limit);
+      qs.set('offset', state.offset);
+      try {
+        const resp = await api(`/api/system/events/history?${qs.toString()}`);
+        state.lastResp = resp;
+        renderTable(resp);
+      } catch (e) {
+        if (e.status === 503) {
+          pane.querySelector('#ev-table').innerHTML = `
+            <div class="rounded border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200">
+              Events history is disabled on this server. Set <code>EVENTS_HISTORY_ENABLED=true</code> and restart.
+            </div>`;
+        } else {
+          pane.querySelector('#ev-table').innerHTML = `<div class="rounded border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-200">${escapeHtml(e.message)}</div>`;
+        }
+      }
+    }
+
+    function renderTable(resp) {
+      pane.querySelector('#ev-meta').textContent =
+        `${resp.total} match${resp.total === 1 ? '' : 'es'} · ${resp.scanned} scanned${resp.truncated ? ' (truncated)' : ''}`;
+      pane.querySelector('#ev-page').textContent =
+        `Showing ${state.offset + 1}–${state.offset + resp.returned} of ${resp.total}`;
+      const tone = (t) => ({
+        start: 'bg-emerald-500/20 text-emerald-300',
+        create: 'bg-sky-500/20 text-sky-300',
+        die: 'bg-rose-500/20 text-rose-300',
+        destroy: 'bg-rose-500/20 text-rose-300',
+        kill: 'bg-rose-500/20 text-rose-300',
+        stop: 'bg-amber-500/20 text-amber-300',
+        restart: 'bg-amber-500/20 text-amber-300',
+        pull: 'bg-sky-500/20 text-sky-300',
+        health_status: 'bg-indigo-500/20 text-indigo-300',
+      }[t] || 'bg-slate-700/40 text-slate-300');
+      pane.querySelector('#ev-table').innerHTML = `
+        <div class="rounded-lg border border-slate-800 bg-slate-900/30 overflow-auto max-h-[60vh] scroll-thin">
+          <table class="w-full text-xs">
+            <thead class="bg-slate-900/60 sticky top-0">
+              <tr>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300">Time</th>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300">Type</th>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300">Action</th>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300">Target</th>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300">Image</th>
+                <th class="px-3 py-2 text-left font-semibold text-slate-300"></th>
+              </tr>
+            </thead>
+            <tbody>${(resp.entries || []).map((e, idx) => `
+              <tr class="hover:bg-slate-900/60 border-t border-slate-800/40">
+                <td class="px-3 py-1 font-mono text-slate-400 whitespace-nowrap">${fmtDate(e.ts)}</td>
+                <td class="px-3 py-1 text-slate-300">${escapeHtml(e.type)}</td>
+                <td class="px-3 py-1"><span class="inline-flex rounded px-1.5 py-0.5 font-medium ${tone(e.action)}">${escapeHtml(e.action)}</span></td>
+                <td class="px-3 py-1 font-mono text-slate-300 truncate max-w-[260px]" title="${escapeHtml(e.actor_name || e.actor_id || '')}">${escapeHtml(e.actor_name || (e.actor_id ? e.actor_id.slice(0, 12) : '—'))}</td>
+                <td class="px-3 py-1 font-mono text-slate-400 truncate max-w-[200px]">${escapeHtml(e.image || '—')}</td>
+                <td class="px-3 py-1 text-right"><button data-detail="${idx}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px]">Details</button></td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>`;
+      pane.querySelectorAll('[data-detail]').forEach((b) => {
+        b.onclick = () => showEventDetail(resp.entries[Number(b.dataset.detail)]);
+      });
+    }
+
+    function showEventDetail(e) {
+      const wrap = document.createElement('div');
+      wrap.innerHTML = `
+        <dl class="grid grid-cols-3 gap-y-2 text-xs mb-3">
+          <dt class="text-slate-400">Time</dt>          <dd class="col-span-2 font-mono">${fmtDate(e.ts)}</dd>
+          <dt class="text-slate-400">Type</dt>          <dd class="col-span-2">${escapeHtml(e.type)}</dd>
+          <dt class="text-slate-400">Action</dt>        <dd class="col-span-2">${escapeHtml(e.action)}</dd>
+          <dt class="text-slate-400">Scope</dt>         <dd class="col-span-2">${escapeHtml(e.scope || 'local')}</dd>
+          <dt class="text-slate-400">Actor ID</dt>      <dd class="col-span-2 font-mono">${escapeHtml(e.actor_id || '—')}</dd>
+          <dt class="text-slate-400">Actor name</dt>    <dd class="col-span-2 font-mono">${escapeHtml(e.actor_name || '—')}</dd>
+          <dt class="text-slate-400">Image</dt>         <dd class="col-span-2 font-mono">${escapeHtml(e.image || '—')}</dd>
+        </dl>
+        <div class="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Attributes</div>
+        <pre class="rounded border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-300 overflow-auto max-h-80">${escapeHtml(JSON.stringify(e.attributes || {}, null, 2))}</pre>`;
+      modal({ title: `Event detail`, body: wrap, size: 'lg', actions: [{ label: 'Close', value: null, kind: 'secondary' }] });
+    }
+
+    pane.querySelector('#ev-apply').onclick = () => { state.offset = 0; load(); };
+    pane.querySelector('#ev-clear').onclick = () => {
+      for (const id of ['ev-since','ev-until','ev-action','ev-actor-name','ev-actor-id']) {
+        const el = pane.querySelector('#' + id); if (el) el.value = '';
+      }
+      pane.querySelector('#ev-type').value = '';
+      state.offset = 0; load();
+    };
+    pane.querySelector('#ev-prev').onclick = () => {
+      state.offset = Math.max(0, state.offset - state.limit); load();
+    };
+    pane.querySelector('#ev-next').onclick = () => {
+      if (state.lastResp && state.lastResp.has_more) {
+        state.offset += state.limit; load();
+      }
+    };
+    pane.querySelector('#ev-auto').onchange = (e) => {
+      if (e.target.checked && !pollHandle) pollHandle = setInterval(load, 10000);
+      else if (!e.target.checked && pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+    };
+    load();
+    return () => { if (pollHandle) clearInterval(pollHandle); };
+  }
+
+  /**
+   * Resources sub-tab. Time-range picker → reads stats history,
+   * draws four sparkline charts (CPU%, Memory, Net rate, Block IO
+   * rate) of the host TOTALS over time. Plus a "heaviest in the
+   * window" mini-leaderboard from the top[] snapshots.
+   */
+  function mountResourcesHistory(pane, hashParams = {}) {
+    pane.innerHTML = `
+      <div class="mb-3 rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <label class="text-xs text-slate-400">Range
+            <select id="rs-range" class="ml-1 rounded border-slate-700 bg-slate-950 text-xs">
+              <option value="3600000">Last hour</option>
+              <option value="21600000" selected>Last 6 hours</option>
+              <option value="86400000">Last 24 hours</option>
+              <option value="259200000">Last 3 days</option>
+              <option value="604800000">Last 7 days</option>
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Container (id or name)
+            <input id="rs-container" value="${escapeHtml(hashParams.container_id || '')}" placeholder="filter to one container" class="ml-1 rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+          </label>
+          <button id="rs-apply" class="rounded bg-sky-500/80 hover:bg-sky-500 text-slate-950 px-3 py-1.5 text-xs font-medium">Apply</button>
+          <span id="rs-meta" class="ml-auto text-xs text-slate-500"></span>
+        </div>
+      </div>
+      <div id="rs-empty" class="hidden rounded border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200 mb-3"></div>
+      <div class="grid gap-3 md:grid-cols-2 mb-3">
+        ${_sparkBox('CPU % (total across containers)', 'rs-cpu',  'sky')}
+        ${_sparkBox('Memory used (bytes)',             'rs-mem',  'emerald')}
+        ${_sparkBox('Network rate (rx+tx, B/s)',       'rs-net',  'amber')}
+        ${_sparkBox('Block I/O rate (r+w, B/s)',       'rs-blk',  'rose')}
+      </div>
+      <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+        <div class="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Heaviest containers in the window (sum of cpu_pct across samples)</div>
+        <div id="rs-leaders" class="space-y-1.5 text-xs"></div>
+      </div>`;
+
+    async function load() {
+      const rangeMs = Number(pane.querySelector('#rs-range').value);
+      const containerId = pane.querySelector('#rs-container').value.trim();
+      const now = Date.now();
+      const since = new Date(now - rangeMs).toISOString();
+      const qs = new URLSearchParams({ since, limit: '10000' });
+      if (containerId) qs.set('container_id', containerId);
+      try {
+        const resp = await api(`/api/system/stats/history?${qs.toString()}`);
+        renderCharts(resp.entries || []);
+        pane.querySelector('#rs-meta').textContent =
+          `${resp.total} sample${resp.total === 1 ? '' : 's'} · since ${fmtDate(since)}`;
+      } catch (e) {
+        if (e.status === 503) {
+          const empty = pane.querySelector('#rs-empty');
+          empty.hidden = false; empty.classList.remove('hidden');
+          empty.innerHTML = `Stats history is disabled on this server. Set <code>STATS_HISTORY_ENABLED=true</code> and restart.`;
+        } else {
+          toast(e.message, 'error');
+        }
+      }
+    }
+
+    function renderCharts(entries) {
+      if (!entries.length) {
+        const empty = pane.querySelector('#rs-empty');
+        empty.hidden = false; empty.classList.remove('hidden');
+        empty.innerHTML = `No samples in this range yet. The sampler writes every <code>STATS_HISTORY_INTERVAL_SEC</code> seconds (30s by default) — give it a minute after server start, or widen the range.`;
+        return;
+      }
+      pane.querySelector('#rs-empty').classList.add('hidden');
+      const cpu = entries.map((e) => e.totals.cpu_pct);
+      const mem = entries.map((e) => e.totals.mem_used_bytes);
+      const net = entries.map((e) => (e.totals.net_rx_bytes_per_s || 0) + (e.totals.net_tx_bytes_per_s || 0));
+      const blk = entries.map((e) => (e.totals.blk_read_bytes_per_s || 0) + (e.totals.blk_write_bytes_per_s || 0));
+      drawSparkInto(pane.querySelector('#rs-cpu'), cpu, 100, '#0ea5e9');
+      drawSparkInto(pane.querySelector('#rs-mem'), mem, 0,   '#10b981');
+      drawSparkInto(pane.querySelector('#rs-net'), net, 0,   '#f59e0b');
+      drawSparkInto(pane.querySelector('#rs-blk'), blk, 0,   '#f43f5e');
+
+      // Leaderboard: sum cpu_pct per container across all samples
+      // in the window so consistently-busy containers float to the
+      // top (not just spike-hot ones).
+      const sums = {};
+      for (const e of entries) {
+        for (const r of (e.top || [])) {
+          const key = r.name || r.id;
+          if (!sums[key]) sums[key] = 0;
+          sums[key] += r.cpu_pct || 0;
+        }
+      }
+      const sorted = Object.entries(sums).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      const max = Math.max(1, ...sorted.map((s) => s[1]));
+      pane.querySelector('#rs-leaders').innerHTML = sorted.length ? sorted.map(([name, sum]) => {
+        const pct = (sum / max) * 100;
+        return `<div class="flex items-center gap-2">
+          <span class="w-40 truncate text-slate-300" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+          <div class="flex-1 h-2 rounded bg-slate-800 overflow-hidden"><div class="h-full bg-sky-500/80" style="width:${pct.toFixed(1)}%"></div></div>
+          <span class="w-24 text-right font-mono text-slate-400">${sum.toFixed(0)} cpu·s</span>
+        </div>`;
+      }).join('') : `<div class="text-slate-500">No per-container snapshots in this window.</div>`;
+    }
+
+    pane.querySelector('#rs-apply').onclick = load;
+    load();
+    return () => { /* nothing to clean up — single-shot fetch */ };
+  }
+
   views.activity = async (root) => {
     root.innerHTML = pageHeader('Activity', 'Live docker events and per-container stats');
     const wrap = document.createElement('div');

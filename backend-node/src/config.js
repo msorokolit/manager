@@ -109,6 +109,58 @@ export function settingsFromEnv(env = process.env) {
       1,
       parseInt(env.AUDIT_ROTATE_KEEP || '5', 10),
     ),
+    // ---- Persistent history (event-history.js + stats-history.js) ----
+    // Docker's own events endpoint only retains entries since the
+    // daemon was started; restart wipes the history. Recording
+    // events into our own JSONL file gives operators "what
+    // happened at 3am yesterday" that survives daemon restarts and
+    // doesn't require the SPA to be open at the time.
+    eventsHistoryEnabled: bool(env, 'EVENTS_HISTORY_ENABLED', true),
+    eventsHistoryFile:
+      env.EVENTS_HISTORY_FILE || path.join(dataDir, 'events.jsonl'),
+    eventsHistoryMaxBytes: Math.max(
+      0,
+      parseInt(env.EVENTS_HISTORY_MAX_BYTES || String(50 * 1024 * 1024), 10),
+    ),
+    eventsHistoryRotateKeep: Math.max(
+      1,
+      parseInt(env.EVENTS_HISTORY_ROTATE_KEEP || '5', 10),
+    ),
+    // Stats history: a background sampler runs the same buildStatsSummary
+    // the dashboard uses, then writes one row per interval to a
+    // JSONL file. Lets the SPA show charts BEFORE the moment the
+    // user opened the tab.
+    //
+    // Storage estimate at the defaults (30 s × ~250 bytes per row +
+    // top-20 container snapshots ≈ 5 KB/row → ~14 MB/day):
+    //   50 MB cap × 5 keep = ~17 days of history per host
+    // Tune up the cap or the interval if you need longer retention.
+    statsHistoryEnabled: bool(env, 'STATS_HISTORY_ENABLED', true),
+    statsHistoryFile:
+      env.STATS_HISTORY_FILE || path.join(dataDir, 'stats.jsonl'),
+    statsHistoryMaxBytes: Math.max(
+      0,
+      parseInt(env.STATS_HISTORY_MAX_BYTES || String(50 * 1024 * 1024), 10),
+    ),
+    statsHistoryRotateKeep: Math.max(
+      1,
+      parseInt(env.STATS_HISTORY_ROTATE_KEEP || '5', 10),
+    ),
+    // Sampling interval in seconds. Floor: 5 s (otherwise we
+    // saturate the daemon on hosts with many containers — each
+    // sample is N×two-stats-calls). Default: 30 s — fine resolution
+    // for trend spotting, ~17 days of history at 50 MB.
+    statsHistoryIntervalSec: Math.max(
+      5,
+      parseInt(env.STATS_HISTORY_INTERVAL_SEC || '30', 10),
+    ),
+    // Per-sample row cap. Each row stores totals plus a snapshot
+    // of the N hottest containers. Higher = more drill-down detail
+    // but bulkier storage. 20 covers all but very large hosts.
+    statsHistoryTopN: Math.max(
+      0,
+      parseInt(env.STATS_HISTORY_TOP_N || '20', 10),
+    ),
     // ---- Sessions (server-side store; see src/sessions.js) ----
     // Persistence file. The store flushes here on a debounce so a
     // restart doesn't sign every user out. Mode 0600 on every write.
