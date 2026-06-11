@@ -7,17 +7,28 @@
 // routes end-to-end via supertest.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 // Tests need control over EVENTS_HISTORY_FILE + STATS_HISTORY_FILE
-// BEFORE config.js loads. vi.hoisted runs before any imports.
+// BEFORE config.js loads.
+//
+// vi.hoisted runs SYNCHRONOUSLY before any imports execute, which
+// is exactly what we want — but it means we can't reference
+// top-of-file ESM imports inside the callback (they haven't been
+// evaluated yet). Vitest's recommended workaround is the CJS
+// `require` global it injects for this purpose; using it here is
+// the documented pattern, not a CJS-in-ESM smell.
+//
+// (An async vi.hoisted was tried — it resolves AFTER imports run,
+// which defeats the entire purpose of hoisting.)
 const ctx = vi.hoisted(() => {
-  const tmp = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'history-store-'));
-  process.env.EVENTS_HISTORY_FILE = require('node:path').join(tmp, 'events.jsonl');
-  process.env.STATS_HISTORY_FILE = require('node:path').join(tmp, 'stats.jsonl');
+  const nodeFs = require('node:fs');
+  const nodeOs = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'history-store-'));
+  process.env.EVENTS_HISTORY_FILE = nodePath.join(tmp, 'events.jsonl');
+  process.env.STATS_HISTORY_FILE = nodePath.join(tmp, 'stats.jsonl');
   process.env.EVENTS_HISTORY_MAX_BYTES = '500'; // tiny cap so rotation fires
   process.env.EVENTS_HISTORY_ROTATE_KEEP = '3';
   process.env.STATS_HISTORY_INTERVAL_SEC = '5';
@@ -321,6 +332,99 @@ describe('stats-history: recordSample + queryStats', () => {
     for (let i = 1; i < r.entries.length; i++) {
       expect(Date.parse(r.entries[i].ts)).toBeGreaterThanOrEqual(Date.parse(r.entries[i - 1].ts));
     }
+  });
+
+  it('queryStats honours order:desc when requested', async () => {
+    for (let i = 0; i < 5; i++) {
+      await statsHistory.recordSample(sampleSummary({ ts: `2026-06-11T15:0${i}:00Z` }));
+    }
+    const r = await statsHistory.queryStats({ limit: 100, order: 'desc' });
+    for (let i = 1; i < r.entries.length; i++) {
+      expect(Date.parse(r.entries[i].ts)).toBeLessThanOrEqual(Date.parse(r.entries[i - 1].ts));
+    }
+  });
+
+  it('topN: 0 writes a totals-only row (no per-container snapshot)', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({
+      id: `c${i}`, name: `c${i}`, cpu_pct: i, mem_used_bytes: 0, mem_limit_bytes: 0,
+      mem_pct: 0, net_rx_bytes_per_s: 0, net_tx_bytes_per_s: 0,
+      blk_read_bytes_per_s: 0, blk_write_bytes_per_s: 0,
+    }));
+    await statsHistory.recordSample(sampleSummary({ rows }), { topN: 0 });
+    const r = await statsHistory.queryStats({ limit: 100 });
+    expect(r.entries[0].top).toEqual([]);
+    // Totals still carry through — topN only affects the snapshot.
+    expect(r.entries[0].container_count).toBe(1);
+  });
+
+  it('in-flight guard: overlapping ticks are skipped', async () => {
+    let inflight = 0;
+    let maxInflight = 0;
+    let totalCalls = 0;
+    // sampleFn is deliberately slow — 100ms — so when we fire
+    // tick() three times back-to-back without awaiting, the second
+    // and third see the in-flight flag set and bail.
+    const slowSample = async () => {
+      inflight++;
+      maxInflight = Math.max(maxInflight, inflight);
+      totalCalls++;
+      await new Promise((r) => setTimeout(r, 100));
+      inflight--;
+      return {
+        sampled_at: new Date().toISOString(),
+        container_count: 0,
+        totals: {
+          cpu_pct: 0, mem_used_bytes: 0, mem_limit_bytes: 0,
+          net_rx_bytes_per_s: 0, net_tx_bytes_per_s: 0,
+          blk_read_bytes_per_s: 0, blk_write_bytes_per_s: 0,
+        },
+        rows: [],
+      };
+    };
+    const t = statsHistory._internals.tick;
+    // Fire three concurrent ticks. Only the first runs end-to-end;
+    // the other two should bail immediately.
+    await Promise.all([t(slowSample), t(slowSample), t(slowSample)]);
+    expect(maxInflight).toBe(1);
+    expect(totalCalls).toBe(1);
+    expect(statsHistory._internals.getSkippedTicks()).toBe(2);
+  });
+});
+
+// ============================================================
+// event-history reconnect: lastEventSec is used as `since` on reconnect
+// ============================================================
+
+describe('event-history reconnect uses lastEventSec as since', () => {
+  it('recordEvent updates lastEventSec to the recorded event time', async () => {
+    eventHistory._internals.resetForTests();
+    expect(eventHistory._internals.getLastEventSec()).toBeNull();
+    await eventHistory.recordEvent({
+      Type: 'container', Action: 'start',
+      Actor: { Attributes: {} },
+      time: 1700000000,
+    });
+    // Updated to the recorded event's wall time, NOT 'now'. This
+    // matters so reconnect can replay from exactly where we
+    // stopped, not from the moment of the reconnect.
+    expect(eventHistory._internals.getLastEventSec()).toBe(1700000000);
+  });
+
+  it('lastEventSec only advances, never goes backwards', async () => {
+    eventHistory._internals.resetForTests();
+    // Record an event from later first…
+    await eventHistory.recordEvent({
+      Type: 'container', Action: 'start',
+      Actor: { Attributes: {} }, time: 1700000100,
+    });
+    // …then one from earlier (out-of-order delivery, rare but
+    // possible with retries / reconnect replay). lastEventSec
+    // should NOT regress.
+    await eventHistory.recordEvent({
+      Type: 'container', Action: 'die',
+      Actor: { Attributes: {} }, time: 1700000050,
+    });
+    expect(eventHistory._internals.getLastEventSec()).toBe(1700000100);
   });
 });
 

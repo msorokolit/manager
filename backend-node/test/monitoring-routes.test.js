@@ -105,7 +105,7 @@ describe('GET /api/containers/:id/top', () => {
     expect(topMock).toHaveBeenCalledWith('c1', { ps_args: '-ef' });
   });
 
-  it('forwards ps_args query verbatim when valid', async () => {
+  it('forwards a whitelisted preset ps_args verbatim', async () => {
     topMock.mockResolvedValueOnce({ Titles: [], Processes: [] });
     await request(buildApp())
       .get('/api/containers/c1/top?ps_args=aux')
@@ -113,9 +113,42 @@ describe('GET /api/containers/:id/top', () => {
     expect(topMock).toHaveBeenCalledWith('c1', { ps_args: 'aux' });
   });
 
-  it('rejects ps_args containing shell metachars (defense-in-depth)', async () => {
+  it('accepts every documented preset (-ef, aux, -eo pid,user,pcpu,pmem,comm, axf)', async () => {
+    const presets = ['-ef', 'aux', '-eo pid,user,pcpu,pmem,comm', 'axf'];
+    for (const ps_args of presets) {
+      topMock.mockResolvedValueOnce({ Titles: [], Processes: [] });
+      const r = await request(buildApp())
+        .get(`/api/containers/c1/top?ps_args=${encodeURIComponent(ps_args)}`)
+        .set('Authorization', withRole('viewer'));
+      expect(r.status).toBe(200);
+      expect(topMock).toHaveBeenCalledWith('c1', { ps_args });
+    }
+  });
+
+  it('rejects ps_args containing shell metachars (regex-era allowlist still has defense in depth)', async () => {
     const cases = ['aux;rm -rf /', '`reboot`', 'aux|cat /etc/passwd', '$(whoami)', 'aux & sleep 1'];
     for (const ps_args of cases) {
+      const r = await request(buildApp())
+        .get(`/api/containers/c1/top?ps_args=${encodeURIComponent(ps_args)}`)
+        .set('Authorization', withRole('viewer'));
+      expect(r.status).toBe(400);
+    }
+    expect(topMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses ps_args that would dump env vars (security regression guard)', async () => {
+    // These all PARSE as ps args but each would expose /proc/<pid>/environ
+    // for every process in the container. The earlier regex-based
+    // allowlist would have accepted them; the new enum-based one
+    // must not.
+    const envLeakAttempts = [
+      '-eo pid,user,env,cmd',
+      '-eo pid,environ',
+      '-eo env',
+      '-ef -o env',
+      '-eo pid,comm,env',
+    ];
+    for (const ps_args of envLeakAttempts) {
       const r = await request(buildApp())
         .get(`/api/containers/c1/top?ps_args=${encodeURIComponent(ps_args)}`)
         .set('Authorization', withRole('viewer'));

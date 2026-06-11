@@ -255,6 +255,17 @@ Both start automatically after `server.listen()`; both can be disabled via env. 
 
 Both are viewer-allowed (read-only diagnostic data). Both return `503` when the corresponding recorder is disabled, and the SPA renders that as an actionable "set `EVENTS_HISTORY_ENABLED=true` and restart" panel.
 
+Both responses include `total`, `returned`, `has_more`, `scanned`, and `truncated`. The SPA's Resources history surfaces a "⚠ truncated — narrow the range" hint when the requested window contains more samples than the per-call cap (10000) or the MAX_SCAN guard fires (100k lines). **Programmatic callers should branch on `has_more` / `truncated`** rather than assuming `entries[]` is complete.
+
+### Event recorder semantics
+
+- **Reconnect resumes with `since`** — when the docker events stream errors or ends, we reconnect and pass `since: lastEventSec + 1` so the daemon replays events from the moment we lost the connection. Without this, every reconnect would create a coverage hole the size of the backoff window (up to 60s). Note: this works only as long as the daemon itself didn't restart during the gap (it has no events to replay if it did).
+- **Backpressure** — the data handler counts pending writes and pauses the docker stream when the backlog exceeds 1000 records, resuming when it drains below 500. A noisy host (100 containers with per-second health checks) on a slow disk would otherwise pile MB of pending writes in the Node heap.
+
+### Information disclosure caveat
+
+History entries include the `attributes` blob from each event, which carries every label on the container at the time. Containers occasionally store sensitive metadata in labels (auth tokens, secret-store paths). The two history endpoints are **viewer-accessible** — anyone who can log in can read them. If your environment uses labels to carry credentials (it shouldn't, but it happens), restrict viewer accounts accordingly or set `EVENTS_HISTORY_ENABLED=false`.
+
 ### Storage budget at defaults
 
 | Recorder | Per-row size | Volume | Cap | Retention |
@@ -306,14 +317,14 @@ The stats stream is torn down (`AbortController.abort()`) on any of: tab switch,
 
 Calls `GET /api/containers/:id/top?ps_args=<args>` which wraps Docker's `top` endpoint (a `ps` invocation inside the container's PID namespace). The response is column-headers + 2D string array — rendered as a dynamic table whose columns adapt to `ps_args`.
 
-Picker offers four common ps invocations:
+`ps_args` is restricted to a **closed enum** of four preset strings, not a regex allowlist. The earlier regex permitted any `ps -eo` field (including `env` / `environ`), which would have exposed every process's environment to viewer-role users (secrets routinely live in env: `DB_PASSWORD`, `API_KEY`, …). The enum closes that disclosure path; the picker offers exactly:
 
-- `-ef` (default — full process tree, comma-separated UID/PID/PPID/C/STIME/TTY/TIME/CMD)
+- `-ef` (default — UID/PID/PPID/C/STIME/TTY/TIME/CMD)
 - `aux` (BSD-style)
-- `-eo pid,user,pcpu,pmem,comm` (sorted output)
-- `axf` (process tree with parent/child indentation)
+- `-eo pid,user,pcpu,pmem,comm` (sorted output, no full cmd, no env)
+- `axf` (process tree)
 
-`ps_args` is validated against a tight allowlist regex on the backend (no `|`, `&`, `;`, `$`, backticks, quotes, `<`, `>`, parens, `*`, `?`) so even with malicious input the daemon receives nothing it can interpret as a shell construct.
+Adding a new preset requires editing `PS_ARGS_PRESETS` in `backend-node/src/routes/containers.js` after confirming the column set can't leak env / cmdline secrets you care about.
 
 Auto-refresh toggle polls every 5s. The button is read-only — viewer JWTs can fetch `top` because it's diagnostic data, no mutation.
 
@@ -369,8 +380,23 @@ Docker containers are largely immutable — once created, most settings can't ch
 - Container ID **changes** — anything pinned to the ID elsewhere breaks.
 - Logs from the old container are **lost** (Docker drops them with the container).
 - Stats and uptime reset to 0.
+- Auto-assigned **IP addresses change**; dynamically-published ports get new host ports.
 - **Named volumes survive** (`docker rm` without `-v`); anonymous volumes don't.
+- **Additional (non-default) networks** are re-attached best-effort after create, with aliases + manually-assigned IPv4/IPv6 preserved. Failures are surfaced as warnings in the result envelope, not as fatal errors — the new container starts even if one network re-attach fails.
 - If `create` fails after `remove` succeeded, the original is gone. The dialog stays open with the form populated so you can fix and retry, and the backend streams the error inline.
+
+### Recreate response shape (programmatic callers)
+
+The endpoint streams plain-text progress for humans, then a **final JSON line** for machines. The SPA parses this line; you should too. Shapes:
+
+```json
+{ "status": "ok",    "new_id": "abc123…", "network_errors": [] }
+{ "status": "error", "step": "create",    "detail": "image not found", "original_gone": true }
+{ "status": "error", "step": "stop",      "detail": "container is frozen" }
+{ "status": "error", "step": "start",     "detail": "exec format error", "new_id": "abc123…", "network_errors": [] }
+```
+
+`step` is one of `stop` / `remove` / `create` / `start`. `original_gone: true` means the source container has already been removed — re-submitting the same body will retry just the create + start.
 
 ### Duplicate
 
