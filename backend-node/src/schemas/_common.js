@@ -50,3 +50,16 @@ export const ValidationError = Type.Object(
     additionalProperties: false,
   },
 );
+
+/**
+ * Shared path-param schema for `:name` routes (#35).
+ *
+ * Both `routes/volumes.js` and `routes/volume-browser.js` previously
+ * defined the same inline `Type.Object({ name: Type.String() })`. The
+ * shared definition keeps them in sync and gives the OpenAPI generator
+ * one canonical parameter to reference.
+ */
+export const NameParam = Type.Object(
+  { name: Type.String({ minLength: 1, maxLength: 255 }) },
+  { additionalProperties: false },
+);

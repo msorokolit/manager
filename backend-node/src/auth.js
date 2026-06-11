@@ -67,11 +67,33 @@ export function authenticate(req, res, next) {
   next();
 }
 
+/**
+ * Require the caller to be the admin role.
+ *
+ * `requireAdmin` checks ONLY the role. Whether the operation is also
+ * gated by `ALLOW_DESTRUCTIVE` is a separate, opt-in concern handled by
+ * `requireDestructive` below — and tagged per-route via `destructive: true`
+ * in the route spec. This split lets operators run with
+ * `ALLOW_DESTRUCTIVE=false` while still permitting non-destructive
+ * admin work like editing volume files or creating networks.
+ */
 export function requireAdmin(req, res, next) {
   if (!req.user) return unauthorized(res);
   if (req.user.role !== 'admin') {
     return res.status(403).json({ detail: 'Admin role required for this action' });
   }
+  next();
+}
+
+/**
+ * Refuse routes tagged `destructive: true` when ALLOW_DESTRUCTIVE is
+ * off. Intended for Docker state-changing operations that can't be
+ * easily undone: volume remove / prune, container kill / remove,
+ * image / network / system prune, stack down, etc. NOT applied to
+ * filesystem mutations inside a volume (chmod, edit, mkdir, …) — for
+ * those, admin role is the only gate.
+ */
+export function requireDestructive(req, res, next) {
   if (!settings.allowDestructive) {
     return res
       .status(403)

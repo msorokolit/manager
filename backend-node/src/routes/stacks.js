@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { Type } from '@sinclair/typebox';
+import yaml from 'js-yaml';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import {
@@ -33,6 +34,57 @@ const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/;
 
 function validateName(name) {
   if (!NAME_RE.test(name || '')) throw new HttpError(400, 'invalid stack name');
+}
+
+/**
+ * Parse + sanity-check a compose YAML string before we hand it to docker
+ * compose. Catches YAML syntax errors at the API boundary instead of
+ * letting them land as a half-written file on disk + a confusing
+ * "compose config" failure several seconds later.
+ *
+ *   - rejects YAML that doesn't parse (js-yaml throws YAMLException)
+ *   - rejects non-mapping documents (e.g. lists, scalars) — compose files
+ *     are always object-at-root
+ *   - rejects documents that don't have at least one of services / volumes
+ *     / networks / configs / secrets — these are the only top-level keys
+ *     compose recognises; anything else is almost certainly a typo
+ *
+ * Returns the parsed object so callers can read e.g. services for
+ * downstream validation if they want; we don't currently use it.
+ *
+ * (We don't replace `docker compose config -q` validation — compose still
+ * runs in /validate and on `up`. This is the cheap pre-write check.)
+ */
+function parseCompose(text) {
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new HttpError(400, 'compose: body is empty');
+  }
+  let doc;
+  try {
+    doc = yaml.load(text, { schema: yaml.CORE_SCHEMA });
+  } catch (err) {
+    // js-yaml errors carry line/column info; surface them so the SPA can
+    // jump the editor cursor to the right spot.
+    const detail =
+      err && err.mark
+        ? `YAML parse error at line ${err.mark.line + 1}, column ${err.mark.column + 1}: ${err.reason || err.message}`
+        : `YAML parse error: ${(err && err.message) || err}`;
+    throw new HttpError(400, detail);
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new HttpError(400, 'compose: root must be a mapping (object)');
+  }
+  const recognised = ['services', 'volumes', 'networks', 'configs', 'secrets', 'version', 'name', 'include', 'x-'];
+  const keys = Object.keys(doc);
+  const hasRecognised = keys.some((k) => recognised.includes(k) || k.startsWith('x-'));
+  if (!hasRecognised) {
+    throw new HttpError(
+      400,
+      `compose: no recognised top-level keys (saw: ${keys.slice(0, 5).join(', ') || '<empty>'}); ` +
+      'expected at least one of services, volumes, networks, configs, secrets',
+    );
+  }
+  return doc;
   return name;
 }
 function stackDir(name) {
@@ -220,6 +272,7 @@ r.post(
   {
     summary: 'Create a stack (streams compose stdout if deploy=true)',
     admin: true,
+    destructive: true,
     expensive: true,
     body: CreateStackRequest,
     responses: { 200: streamResponse('compose up -d stdout (or {name, deployed:false})', 'text/plain') },
@@ -228,6 +281,9 @@ r.post(
     const b = req.body;
     await ensureRoot(true);
     if (isManaged(b.name)) throw new HttpError(409, `Stack '${b.name}' already exists`);
+    // Parse-before-write: catch YAML syntax errors at the API boundary so
+    // we never persist an unparseable docker-compose.yml on disk.
+    parseCompose(b.compose);
     await writeStackFiles(b.name, b.compose, b.env || null);
     if (b.deploy === false) return res.json({ name: b.name, deployed: false });
     streamCompose(res, b.name, 'up', '-d');
@@ -239,6 +295,7 @@ r.put(
   {
     summary: 'Replace compose / env files',
     admin: true,
+    destructive: true,
     params: StackNameParam,
     body: UpdateStackRequest,
     responses: { 200: PassThroughObject },
@@ -247,7 +304,12 @@ r.put(
     if (!isManaged(req.params.name)) throw new HttpError(404, 'Stack not found (or not managed)');
     const b = req.body;
     const target = stackDir(req.params.name);
-    if (b.compose != null) await fs.writeFile(path.join(target, COMPOSE_FILENAME), b.compose);
+    // Same parse-before-write guard as POST /. We only check when compose
+    // is actually being replaced; .env-only updates pass through.
+    if (b.compose != null) {
+      parseCompose(b.compose);
+      await fs.writeFile(path.join(target, COMPOSE_FILENAME), b.compose);
+    }
     if (b.env != null) await fs.writeFile(path.join(target, ENV_FILENAME), b.env);
     res.json({ name: req.params.name, updated: true });
   }),
@@ -265,6 +327,7 @@ for (const verb of ['up', 'restart', 'pull']) {
     {
       summary: `compose ${verb} (streamed)`,
       admin: true,
+    destructive: true,
       // `up` and `pull` move bytes (image pulls); `restart` doesn't, but
       // tagging it expensive is harmless and keeps the policy uniform.
       expensive: true,
@@ -283,6 +346,7 @@ r.post(
   {
     summary: 'compose down (streamed)',
     admin: true,
+    destructive: true,
     expensive: true,
     params: StackNameParam,
     query: RemoveQuery,
@@ -342,6 +406,7 @@ r.post(
   {
     summary: 'Per-service compose action (admin, streamed)',
     admin: true,
+    destructive: true,
     params: StackServiceActionParam,
     responses: { 200: StreamPlain },
   },
@@ -372,6 +437,7 @@ r.delete(
   {
     summary: 'Tear down + remove a managed stack',
     admin: true,
+    destructive: true,
     params: StackNameParam,
     responses: { 200: PassThroughObject },
   },
@@ -390,5 +456,8 @@ r.delete(
     res.json({ removed: req.params.name });
   }),
 );
+
+// Visible-for-testing only.
+export const _internals = { parseCompose };
 
 export default r;

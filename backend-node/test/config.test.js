@@ -51,6 +51,19 @@ describe('Compose deadlines (H1)', () => {
   });
 });
 
+describe('Volume browser settings', () => {
+  it('VOLUME_BROWSER_NO_LIMITS defaults to false', () => {
+    expect(settingsFromEnv({}).volumeBrowserNoLimits).toBe(false);
+  });
+
+  it('VOLUME_BROWSER_NO_LIMITS=true is honored case-insensitively', () => {
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'true' }).volumeBrowserNoLimits).toBe(true);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'TRUE' }).volumeBrowserNoLimits).toBe(true);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: 'yes' }).volumeBrowserNoLimits).toBe(false);
+    expect(settingsFromEnv({ VOLUME_BROWSER_NO_LIMITS: '1' }).volumeBrowserNoLimits).toBe(false);
+  });
+});
+
 describe('Rate-limit settings', () => {
   it('apply sensible defaults', () => {
     const s = settingsFromEnv({});

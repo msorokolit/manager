@@ -85,6 +85,23 @@ export function settingsFromEnv(env = process.env) {
       100,
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
+    // ---- Volume-browser one-shot containers ----
+    // Wall-clock cap on any single helper-container operation. A hung
+    // python script or runaway recursive chmod would otherwise pin
+    // the HTTP request open forever. 90s is generous for chmod -R on
+    // a deep tree but bounded; 0 disables (not recommended).
+    volumeBrowserOpTimeoutMs: Math.max(
+      0,
+      parseInt(env.VOLUME_BROWSER_OP_TIMEOUT_MS || '90000', 10),
+    ),
+    // Escape hatch: skip Memory / NanoCpus / PidsLimit on the per-op
+    // container. Only useful on hosts where the root cgroup is in
+    // "domain threaded" mode (nested CI VMs, some sandboxed runners),
+    // which makes runc refuse to enter cgroup v2 with domain controllers
+    // attached. The CapDrop: ALL stays applied so the container's
+    // capability surface remains minimal even with this flag on.
+    // Keep this OFF in production.
+    volumeBrowserNoLimits: (env.VOLUME_BROWSER_NO_LIMITS || '').toLowerCase() === 'true',
     // ---- Security headers (helmet) ----
     helmetDisabled: bool(env, 'HELMET_DISABLED', false),
     cspDisabled: bool(env, 'CSP_DISABLED', false),

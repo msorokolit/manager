@@ -46,14 +46,39 @@ import { FitAddon } from '@xterm/addon-fit';
     return state.auth && state.auth.token ? `Bearer ${state.auth.token}` : '';
   }
 
+  /**
+   * Shared fetch wrapper. Adds the bearer token, picks a content-type
+   * for JSON bodies, auto-logs-out on 401, and routes the response
+   * through the right reader depending on `opts.responseType`:
+   *
+   *   - 'json' (default): parses JSON, returns object
+   *   - 'text':           returns text
+   *   - 'blob':           returns Blob (used for file/archive download)
+   *   - 'response':       returns the raw Response (caller wants headers
+   *                        or streaming control)
+   *
+   * #21: download / upload / edit calls now route through here too so
+   * they share the 401 auto-logout behaviour. Previously they used raw
+   * fetch and a 401 would leave the SPA "logged in" but unable to do
+   * anything until the user manually re-loaded.
+   */
   async function api(path, opts = {}) {
     const headers = new Headers(opts.headers || {});
     const ah = authHeader();
     if (ah) headers.set('Authorization', ah);
-    if (opts.body && !(opts.body instanceof FormData) && !headers.has('Content-Type')) {
+    if (
+      opts.body &&
+      !(opts.body instanceof FormData) &&
+      !(opts.body instanceof Blob) &&
+      !(opts.body instanceof ArrayBuffer) &&
+      !headers.has('Content-Type')
+    ) {
       headers.set('Content-Type', 'application/json');
     }
-    const res = await fetch(path, { ...opts, headers });
+    const responseType = opts.responseType || 'auto';
+    // Strip our extension so it doesn't leak into the underlying fetch().
+    const { responseType: _ignored, ...fetchOpts } = opts;
+    const res = await fetch(path, { ...fetchOpts, headers });
     if (res.status === 401) {
       logout();
       throw new Error('Unauthorized');
@@ -61,9 +86,15 @@ import { FitAddon } from '@xterm/addon-fit';
     if (!res.ok) {
       let detail = res.statusText;
       try { const j = await res.json(); detail = j.detail || JSON.stringify(j); } catch {}
-      throw new Error(`${res.status}: ${detail}`);
+      const err = new Error(`${res.status}: ${detail}`);
+      err.status = res.status;
+      try { err.body = await res.clone().json(); } catch {}
+      throw err;
     }
+    if (responseType === 'response') return res;
+    if (responseType === 'blob') return res.blob();
     if (res.status === 204) return null;
+    if (responseType === 'text') return res.text();
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('application/json')) return res.json();
     return res.text();
@@ -87,27 +118,53 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Modal ----------
-  function modal({ title, body, actions, size = 'lg' }) {
+  //
+  // P0 #2: titles are set via textContent on the rendered <h3>, NOT
+  // interpolated into the innerHTML scaffold. The previous version
+  // injected `${title}` into innerHTML directly, which made every
+  // caller's `title: 'Edit: ' + filename` an XSS sink because file
+  // names inside volumes are attacker-controlled (any process running
+  // inside a container can write a file named '<img src=x onerror=...>').
+  function modal({ title, body, actions, size = 'lg', onBeforeClose, ref }) {
     return new Promise((resolve) => {
       const host = document.getElementById('modal-host');
       const wrap = document.createElement('div');
       wrap.className = 'fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 p-4 fade-in';
-      const widths = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl', xl: 'max-w-5xl' };
+      const widths = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl', xl: 'max-w-5xl', full: 'max-w-[98vw]' };
+      const heights = { full: 'h-[96vh]' };
       wrap.innerHTML = `
-        <div class="w-full ${widths[size] || widths.lg} max-h-[90vh] overflow-hidden flex flex-col rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
+        <div class="w-full ${widths[size] || widths.lg} ${heights[size] || 'max-h-[90vh]'} overflow-hidden flex flex-col rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
           <div class="flex items-center justify-between border-b border-slate-800 px-5 py-3">
-            <h3 class="text-sm font-semibold">${title}</h3>
+            <h3 class="text-sm font-semibold" data-role="title"></h3>
             <button class="text-slate-400 hover:text-white" data-act="close">✕</button>
           </div>
           <div class="flex-1 overflow-auto scroll-thin p-5" data-role="body"></div>
           <div class="flex justify-end gap-2 border-t border-slate-800 bg-slate-900/50 px-5 py-3" data-role="actions"></div>
         </div>`;
+      // Title via textContent — never innerHTML. Callers that want
+      // rich-text titles (e.g. a "dirty" bullet badge) must use the
+      // `ref.titleEl` handle and build their own DOM nodes.
+      const titleEl = wrap.querySelector('[data-role="title"]');
+      titleEl.textContent = String(title == null ? '' : title);
       const bodyEl = wrap.querySelector('[data-role="body"]');
       if (typeof body === 'string') bodyEl.innerHTML = body;
       else if (body instanceof Node) bodyEl.appendChild(body);
 
       const actionsEl = wrap.querySelector('[data-role="actions"]');
-      const close = (val) => { wrap.remove(); resolve(val); };
+      const tryClose = async (val) => {
+        // onBeforeClose returning false (or a Promise resolving to false)
+        // cancels the close. Used by the editor to prompt "discard unsaved
+        // changes?" before letting the user dismiss the modal.
+        if (onBeforeClose) {
+          try { if ((await onBeforeClose(val)) === false) return; } catch { /* ignore */ }
+        }
+        wrap.remove(); resolve(val);
+      };
+      // Forced close — skips the onBeforeClose hook. Used by action
+      // buttons whose own onClick already handled the dirty-state
+      // confirmation (e.g. Save → close on success).
+      const forceClose = (val) => { wrap.remove(); resolve(val); };
+
       (actions || [{ label: 'Close', value: null, kind: 'secondary' }]).forEach((a) => {
         const b = document.createElement('button');
         const kinds = {
@@ -121,14 +178,89 @@ import { FitAddon } from '@xterm/addon-fit';
           if (a.onClick) {
             try { const r = await a.onClick(); if (r === false) return; } catch (e) { toast(e.message, 'error'); return; }
           }
-          close(a.value);
+          // Action buttons skip the onBeforeClose hook by default — their
+          // onClick is expected to handle any save/discard logic itself.
+          // Cancel actions can opt in by setting `confirmBeforeClose: true`.
+          if (a.confirmBeforeClose) tryClose(a.value); else forceClose(a.value);
         };
         actionsEl.appendChild(b);
       });
-      wrap.querySelector('[data-act="close"]').onclick = () => close(null);
-      wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
+      wrap.querySelector('[data-act="close"]').onclick = () => tryClose(null);
+      wrap.addEventListener('click', (e) => { if (e.target === wrap) tryClose(null); });
+
+      // Optional handle for callers that need to mutate the modal after mount
+      // (the editor uses it to toggle title text + resize on full-screen).
+      if (ref) {
+        ref.titleEl = wrap.querySelector('[data-role="title"]');
+        ref.bodyEl = bodyEl;
+        ref.container = wrap.querySelector('.w-full');
+        ref.close = forceClose;
+        ref.resize = (newSize) => {
+          const w = widths[newSize] || widths.lg;
+          const h = heights[newSize] || 'max-h-[90vh]';
+          const c = ref.container;
+          // Remove any previous width/height utility, then add the new ones.
+          c.className = c.className
+            .replace(/max-w-\S+/g, '').replace(/max-h-\S+/g, '').replace(/\bh-\S+/g, '');
+          c.classList.add(...w.split(' '), ...h.split(' '));
+        };
+      }
       host.appendChild(wrap);
     });
+  }
+
+  /**
+   * Modal-based replacement for `window.prompt`. Returns the entered
+   * string, or null if cancelled. Validates the input with the
+   * caller-supplied `validate(value)` callback — return null for OK,
+   * a string for the error message.
+   */
+  function inputModal({
+    title = 'Input',
+    label = 'Value',
+    initial = '',
+    placeholder = '',
+    okLabel = 'OK',
+    validate = () => null,
+  } = {}) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <label class="block">
+        <span class="text-xs uppercase tracking-wider text-slate-400" data-role="label"></span>
+        <input data-role="input" type="text"
+               class="mt-2 w-full rounded border-slate-700 bg-slate-950 text-sm" />
+      </label>
+      <p data-role="err" class="mt-2 text-xs text-rose-300 hidden"></p>`;
+    wrap.querySelector('[data-role="label"]').textContent = label;
+    const input = wrap.querySelector('[data-role="input"]');
+    input.value = initial;
+    input.placeholder = placeholder;
+    const err = wrap.querySelector('[data-role="err"]');
+    function setErr(msg) {
+      if (msg) { err.textContent = msg; err.classList.remove('hidden'); }
+      else { err.textContent = ''; err.classList.add('hidden'); }
+    }
+    // Focus the input on next tick after the modal mounts.
+    setTimeout(() => { try { input.focus(); input.select(); } catch {} }, 50);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const btn = [...document.querySelectorAll('#modal-host button')]
+          .find((b) => b.textContent.trim() === okLabel);
+        btn && btn.click();
+      }
+    });
+    return modal({
+      title, body: wrap, size: 'sm',
+      actions: [
+        { label: 'Cancel', value: null, kind: 'secondary' },
+        { label: okLabel, kind: 'primary', value: 'ok', onClick: async () => {
+          const v = input.value;
+          const msg = validate(v);
+          if (msg) { setErr(msg); return false; }
+        }},
+      ],
+    }).then((res) => (res === 'ok' ? input.value : null));
   }
 
   function confirmModal(message, { danger = false, confirmLabel = 'Confirm' } = {}) {
@@ -1542,91 +1674,417 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Volumes ----------
   views.volumes = async (root) => {
+    // #23: viewers can't create / prune / delete / browse-write. We hide
+    // the Create / Prune / Remove / Browse buttons rather than letting
+    // them click into a 403. Inspect stays available (it's read-only).
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Volumes',
       'Manage persistent storage volumes',
-      `${btn('+ Create volume', { kind: 'primary', id: 'create-vol' })}
-       ${btn('Prune unused', { kind: 'secondary', id: 'prune-vols' })}
-       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
+      `${isAdmin ? btn('+ Create volume', { kind: 'primary', id: 'create-vol' }) : ''}
+       ${isAdmin ? btn('Prune unused', { kind: 'secondary', id: 'prune-vols' }) : ''}
+       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}
+       ${btn('Sizes', { kind: 'ghost', id: 'load-sizes' })}`
     );
-    const list = document.createElement('div'); root.appendChild(list);
 
-    async function load() {
-      list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
-      try {
-        const items = await api('/api/volumes');
-        const rows = items.map((v) => `
+    // Filter / search controls live above the table so they're visible
+    // without scrolling on long volume lists.
+    const controls = document.createElement('div');
+    controls.className = 'mb-3 flex flex-wrap items-center gap-2 text-xs';
+    controls.innerHTML = `
+      <input id="vols-search" type="text" placeholder="🔎 Search by name, mountpoint, stack…"
+             class="flex-1 min-w-[240px] rounded border-slate-700 bg-slate-950 text-sm"/>
+      <label class="flex items-center gap-2 text-slate-300">
+        <input id="vols-unused" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
+        Unused only
+      </label>
+      <span id="vols-count" class="text-slate-500 ml-auto"></span>
+    `;
+    root.appendChild(controls);
+
+    const bulk = document.createElement('div');
+    bulk.id = 'vols-bulk';
+    bulk.className = 'mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs';
+    bulk.innerHTML = `
+      <span><span id="vols-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
+      <div class="flex items-center gap-2">
+        ${isAdmin ? `<button id="vols-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>` : ''}
+        <button id="vols-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
+      </div>`;
+    root.appendChild(bulk);
+
+    const listEl = document.createElement('div'); root.appendChild(listEl);
+
+    // ---- State for filters + selection ----
+    let lastVolumes = [];
+    // #14: sizes are opt-in to avoid the slow /system/df call on every
+    // page visit. Refresh triggers a re-load without sizes; the
+    // dedicated "Sizes" button reloads with sizes.
+    let loadSizesNext = true; // first load wants sizes
+    const selected = new Set();
+
+    function visibleVolumes() {
+      const q = controls.querySelector('#vols-search').value.trim().toLowerCase();
+      const unusedOnly = controls.querySelector('#vols-unused').checked;
+      return lastVolumes.filter((v) => {
+        if (unusedOnly && v.in_use) return false;
+        if (q) {
+          const hay = (v.name + ' ' + (v.mountpoint || '') + ' ' + (v.stack || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function renderBulkBar() {
+      if (selected.size === 0) {
+        bulk.classList.add('hidden'); bulk.classList.remove('flex'); return;
+      }
+      bulk.classList.remove('hidden'); bulk.classList.add('flex');
+      bulk.querySelector('#vols-bulk-count').textContent = String(selected.size);
+    }
+
+    function renderRows() {
+      const vols = visibleVolumes();
+      controls.querySelector('#vols-count').textContent =
+        `${vols.length} of ${lastVolumes.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+
+      if (lastVolumes.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No volumes on this host.</div>`;
+        return;
+      }
+      if (vols.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No volumes match the current filters.</div>`;
+        return;
+      }
+
+      const rows = vols.map((v) => {
+        const rwCount = v.used_by.filter((u) => u.rw).length;
+        const roCount = v.used_by.length - rwCount;
+        // Split the "in use" badge into rw / ro pills so an admin can
+        // see at a glance whether the volume is actively being WRITTEN
+        // by something — important when deciding if it's safe to delete
+        // or edit through the file manager.
+        const inUseBadge = v.in_use
+          ? `<span class="ml-1 inline-flex items-center gap-1 text-[10px]" title="${v.used_by.map((u)=>escapeHtml(u.container_name)+': '+escapeHtml(u.mount_path)+(u.rw?' (rw)':' (ro)')).join(', ')}">
+              ${rwCount > 0 ? `<span class="rounded bg-emerald-500/20 px-1.5 py-0.5 font-medium text-emerald-300">rw × ${rwCount}</span>` : ''}
+              ${roCount > 0 ? `<span class="rounded bg-amber-500/20 px-1.5 py-0.5 font-medium text-amber-300">ro × ${roCount}</span>` : ''}
+            </span>`
+          : `<span class="ml-1 inline-flex items-center rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">unused</span>`;
+        const sizeCell = v.size_bytes == null || v.size_bytes < 0
+          ? `<span class="text-slate-600">—</span>`
+          : `<span class="font-mono">${escapeHtml(fmtBytes(v.size_bytes))}</span>`;
+        const stackCell = v.stack
+          ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(v.stack)}</a>`
+          : `<span class="text-slate-600">—</span>`;
+        const isChecked = selected.has(v.name) ? 'checked' : '';
+        return `
           <tr class="hover:bg-slate-900/60">
-            <td class="px-4 py-2">
-              <div class="font-medium">${escapeHtml(v.name)}</div>
-              <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(v.driver || '')}</div>
+            <td class="px-3 py-2 w-8">
+              ${isAdmin ? `<input type="checkbox" class="vols-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(v.name)}" ${isChecked}/>` : ''}
             </td>
-            <td class="px-4 py-2 text-slate-300 font-mono text-xs">${escapeHtml(v.mountpoint || '')}</td>
+            <td class="px-4 py-2">
+              <div class="font-medium">${escapeHtml(v.name)}${inUseBadge}</div>
+              <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(v.driver || '')} · ${escapeHtml(v.mountpoint || '')}</div>
+            </td>
+            <td class="px-4 py-2 text-slate-300">${stackCell}</td>
+            <td class="px-4 py-2 text-slate-400">${sizeCell}</td>
             <td class="px-4 py-2 text-slate-400">${fmtDate(v.created_at)}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                <button data-act="browse" data-id="${v.name}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>
-                <button data-act="inspect" data-id="${v.name}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
-                <button data-act="remove" data-id="${v.name}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                ${isAdmin ? `<button data-act="browse" data-id="${escapeHtml(v.name)}" class="rounded bg-sky-500/80 hover:bg-sky-500 text-white px-2 py-1 text-xs">📁 Browse</button>` : ''}
+                <button data-act="inspect" data-id="${escapeHtml(v.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
+                ${isAdmin ? `<button data-act="remove" data-id="${escapeHtml(v.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = table(['Name', 'Mountpoint', 'Created', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      listEl.innerHTML = table(
+        [
+          `<input id="vols-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all visible"/>`,
+          'Name', 'Stack', 'Size', 'Created', '',
+        ],
+        rows,
+      );
+
+      // Sync select-all checkbox state
+      const cb = listEl.querySelector('#vols-select-all');
+      if (cb) {
+        const onPage = vols.filter((v) => selected.has(v.name)).length;
+        cb.checked = onPage === vols.length;
+        cb.indeterminate = onPage > 0 && onPage < vols.length;
+        cb.addEventListener('change', (e) => {
+          if (e.target.checked) for (const v of vols) selected.add(v.name);
+          else for (const v of vols) selected.delete(v.name);
+          renderRows(); renderBulkBar();
+        });
       }
     }
 
-    list.addEventListener('click', async (e) => {
+    async function load() {
+      listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        // #14: pass sizes=false for background refresh to skip the slow
+        // /system/df call. Sizes are loaded once on first open and again
+        // when the user explicitly clicks "Sizes".
+        const qs = loadSizesNext ? '?sizes=true' : '?sizes=false';
+        const incoming = await api('/api/volumes' + qs);
+        // If we're refreshing without sizes, preserve the previously
+        // loaded size_bytes per-row so the column doesn't blank out.
+        if (!loadSizesNext) {
+          const prev = new Map(lastVolumes.map((v) => [v.name, v.size_bytes]));
+          for (const v of incoming) {
+            if (v.size_bytes == null && prev.has(v.name)) v.size_bytes = prev.get(v.name);
+          }
+        }
+        lastVolumes = incoming;
+        loadSizesNext = false;
+        // Drop selections for volumes that no longer exist after the refresh.
+        // (#26: selections survive filter changes — they're a Set keyed
+        // by name, only dropped when the volume actually disappears.)
+        for (const n of [...selected]) {
+          if (!lastVolumes.some((v) => v.name === n)) selected.delete(n);
+        }
+        renderRows();
+        renderBulkBar();
+      } catch (e) {
+        listEl.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // ---- Event wiring ----
+    controls.querySelector('#vols-search').addEventListener('input', () => { renderRows(); });
+    controls.querySelector('#vols-unused').addEventListener('change', () => { renderRows(); });
+
+    listEl.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.vols-check');
+      if (!cb) return;
+      if (cb.checked) selected.add(cb.dataset.name);
+      else selected.delete(cb.dataset.name);
+      renderBulkBar();
+      // Refresh just the select-all + count, cheap to re-render
+      controls.querySelector('#vols-count').textContent =
+        `${visibleVolumes().length} of ${lastVolumes.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+      const all = listEl.querySelector('#vols-select-all');
+      if (all) {
+        const vols = visibleVolumes();
+        const onPage = vols.filter((v) => selected.has(v.name)).length;
+        all.checked = onPage === vols.length;
+        all.indeterminate = onPage > 0 && onPage < vols.length;
+      }
+    });
+
+    bulk.querySelector('#vols-bulk-clear').onclick = () => { selected.clear(); renderRows(); renderBulkBar(); };
+    const bulkRmBtn = bulk.querySelector('#vols-bulk-rm');
+    if (bulkRmBtn) bulkRmBtn.onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const ok = await confirmModal(
+        `Delete <strong>${names.length}</strong> volume${names.length === 1 ? '' : 's'}? <em>This is permanent — data will be lost.</em><br><br>In-use volumes will be reported as failures; use <em>Force remove</em> from the per-row Remove dialog to override on a case-by-case basis.`,
+        { danger: true, confirmLabel: 'Delete all' },
+      );
+      if (!ok) return;
+      try {
+        // #1: bulk always sends force:false. If a user wants to
+        // force-remove an in-use volume they go through the per-row
+        // Remove flow, which has its own secondary confirm.
+        const out = await api('/api/volumes/delete/bulk', {
+          method: 'POST', body: JSON.stringify({ names, force: false }),
+        });
+        for (const r of out.results || []) {
+          if (!r.ok) toast(`${r.name}: ${r.error || 'failed'}`, 'error');
+        }
+        if (out.succeeded) {
+          toast(`Deleted ${out.succeeded}${out.failed ? ` of ${names.length}` : ''}`, out.failed ? 'warn' : 'success');
+        }
+      } catch (e) { toast(`Bulk delete failed: ${e.message}`, 'error'); }
+      selected.clear();
+      load();
+    };
+
+    // #1: per-row Remove starts safe (force=false). If the daemon
+    // refuses with 409 (volume in use), we surface a SECOND confirm
+    // that's explicit about the risk before retrying with force=true.
+    async function removeVolume(id) {
+      const v = lastVolumes.find((x) => x.name === id);
+      const warn = v && v.in_use
+        ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${v.used_by.length} container(s). The daemon will refuse to delete it unless you also force-remove.</p>`
+        : '';
+      const proceed = await confirmModal(
+        `Remove volume <code>${escapeHtml(id)}</code>? Data will be lost.${warn}`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!proceed) return;
+      try {
+        await api(`/api/volumes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        toast('Volume removed', 'success'); load();
+      } catch (e) {
+        // 409 — in use. Offer the force path with extra friction.
+        if (e.status === 409) {
+          const forceOk = await confirmModal(
+            `<strong>Volume <code>${escapeHtml(id)}</code> is in use.</strong> ` +
+            `Force-removing will detach it from running containers — they will fail their next read/write to this volume.<br><br>` +
+            `Continue with <strong>force=true</strong>?`,
+            { danger: true, confirmLabel: 'Force remove' },
+          );
+          if (!forceOk) return;
+          try {
+            await api(`/api/volumes/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
+            toast('Volume force-removed', 'warn'); load();
+          } catch (ex) { toast(ex.message, 'error'); }
+        } else {
+          toast(e.message, 'error');
+        }
+      }
+    }
+
+    listEl.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
       const id = t.dataset.id; const act = t.dataset.act;
       try {
-        if (act === 'browse') {
-          await openVolumeBrowser(id);
-        } else if (act === 'inspect') {
-          const data = await api(`/api/volumes/${encodeURIComponent(id)}`);
-          await modal({ title: `Inspect volume`, body: jsonView(data), size: 'xl' });
-        } else if (act === 'remove') {
-          const ok = await confirmModal('Remove this volume? Data will be lost.', { danger: true, confirmLabel: 'Remove' });
-          if (!ok) return;
-          await api(`/api/volumes/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
-          toast('Volume removed', 'success'); load();
-        }
+        if (act === 'browse') await openVolumeBrowser(id);
+        else if (act === 'inspect') await openVolumeInspect(id, () => load());
+        else if (act === 'remove') await removeVolume(id);
       } catch (ex) { toast(ex.message, 'error'); }
     });
 
-    document.getElementById('refresh').onclick = load;
-    document.getElementById('prune-vols').onclick = async () => {
+    // #14: 'Refresh' polls without sizes (fast); 'Sizes' explicitly
+    // re-fetches WITH /system/df so admins can see current disk usage
+    // when they care.
+    document.getElementById('refresh').onclick = () => { loadSizesNext = false; load(); };
+    document.getElementById('load-sizes').onclick = () => { loadSizesNext = true; load(); };
+    const pruneBtn = document.getElementById('prune-vols');
+    if (pruneBtn) pruneBtn.onclick = async () => {
       const ok = await confirmModal('Prune unused volumes? Data will be lost.', { danger: true, confirmLabel: 'Prune' });
       if (!ok) return;
       try { const r = await api('/api/volumes/prune', { method: 'POST' }); toast(`Reclaimed ${fmtBytes(r.SpaceReclaimed || 0)}`, 'success'); load(); }
       catch (e) { toast(e.message, 'error'); }
     };
-    document.getElementById('create-vol').onclick = async () => {
+    const createBtn = document.getElementById('create-vol');
+    if (createBtn) createBtn.onclick = async () => {
+      // Discover the daemon's actually-installed volume drivers so we
+      // can render a useful dropdown instead of a free-text input.
+      // `docker info` always reports `Plugins.Volume = ["local", ...]`
+      // (built-in `local` plus any plugin-installed volume drivers).
+      // We deduplicate, sort, and fall back to `["local"]` if the
+      // call fails or the daemon returns an empty list — `local` is
+      // always available because it's compiled into the daemon.
+      let drivers = ['local'];
+      try {
+        const info = await api('/api/system/info');
+        const reported = (info && info.Plugins && Array.isArray(info.Plugins.Volume))
+          ? info.Plugins.Volume.filter(Boolean)
+          : [];
+        const merged = new Set(['local', ...reported]);
+        drivers = [...merged].sort((a, b) => {
+          // Always show the built-in `local` first; other plugins
+          // sorted alphabetically below.
+          if (a === 'local') return -1;
+          if (b === 'local') return 1;
+          return a.localeCompare(b);
+        });
+      } catch { /* fall back to ['local'] */ }
+
       const wrap = document.createElement('div');
+      const driverOptions = drivers.map((d) =>
+        `<option value="${escapeHtml(d)}">${escapeHtml(d)}${d === 'local' ? ' (built-in)' : ''}</option>`
+      ).join('');
       wrap.innerHTML = `
         <div class="grid gap-3 md:grid-cols-2">
           <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Name *</span>
             <input id="v-name" required class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
-          <label class="block"><span class="text-xs text-slate-400">Driver</span>
-            <input id="v-driver" value="local" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Driver</span>
+            <select id="v-driver" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+              ${driverOptions}
+              <option value="__custom__">Other (specify…)</option>
+            </select>
+            <input id="v-driver-custom" placeholder="my-custom-driver"
+                   class="mt-2 hidden w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+            <span class="block mt-1 text-[11px] text-slate-500">
+              Loaded from <code>docker info</code> · <code>Plugins.Volume</code>.
+              Install a volume plugin (<code>docker plugin install &lt;name&gt;</code>) to see it here.
+            </span>
+          </label>
+          <label class="block"><span class="text-xs text-slate-400">Driver options (KEY=VALUE per line)</span>
+            <textarea id="v-driveropts" rows="3" placeholder="type=nfs&#10;o=addr=1.2.3.4,rw&#10;device=:/exports/data"
+                      class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
+          <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Labels (KEY=VALUE per line)</span>
+            <textarea id="v-labels" rows="3" placeholder="owner=team-a&#10;tier=prod"
+                      class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea></label>
         </div>`;
+
+      // Toggle the custom-driver text field based on the dropdown:
+      // hidden whenever a known driver is picked, revealed and focused
+      // when the user picks "Other (specify…)".
+      const driverSelect = wrap.querySelector('#v-driver');
+      const driverCustom = wrap.querySelector('#v-driver-custom');
+      driverSelect.addEventListener('change', () => {
+        const custom = driverSelect.value === '__custom__';
+        driverCustom.classList.toggle('hidden', !custom);
+        if (custom) setTimeout(() => driverCustom.focus(), 0);
+      });
+
+      function parseKv(text) {
+        const out = {};
+        for (const raw of (text || '').split(/\r?\n/)) {
+          const line = raw.trim();
+          if (!line || line.startsWith('#')) continue;
+          const eq = line.indexOf('=');
+          if (eq <= 0) continue;
+          const k = line.slice(0, eq).trim();
+          const v = line.slice(eq + 1).trim();
+          if (k) out[k] = v;
+        }
+        return out;
+      }
+
+      let created = null;
       const ok = await modal({
         title: 'Create volume', body: wrap, size: 'md',
         actions: [
           { label: 'Cancel', value: false, kind: 'secondary' },
           { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+            const driverChoice = driverSelect.value === '__custom__'
+              ? driverCustom.value.trim()
+              : driverSelect.value;
             const payload = {
               name: wrap.querySelector('#v-name').value.trim(),
-              driver: wrap.querySelector('#v-driver').value.trim() || 'local',
+              driver: driverChoice || 'local',
+              labels: parseKv(wrap.querySelector('#v-labels').value),
+              driver_opts: parseKv(wrap.querySelector('#v-driveropts').value),
             };
-            if (!payload.name) return false;
-            try { await api('/api/volumes', { method: 'POST', body: JSON.stringify(payload) }); toast('Volume created', 'success'); }
-            catch (e) { toast(e.message, 'error'); return false; }
+            // Mirror the server's name regex client-side so users get an
+            // inline error instead of a generic API failure (#13 in the
+            // review). Stays loose — server is the source of truth.
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(payload.name)) {
+              toast('Invalid name: must start with a letter or digit and contain only [A-Za-z0-9_.-]', 'warn');
+              return false;
+            }
+            // If "Other" was picked but left blank, refuse with an
+            // inline error instead of silently falling back to `local`.
+            if (driverSelect.value === '__custom__' && !payload.driver) {
+              toast('Custom driver name is required when "Other" is selected', 'warn');
+              return false;
+            }
+            try {
+              created = await api('/api/volumes', { method: 'POST', body: JSON.stringify(payload) });
+              toast('Volume created', 'success');
+            } catch (e) { toast(e.message, 'error'); return false; }
           }},
         ],
       });
-      if (ok) load();
+      // #28: prepend the enriched row from the server instead of
+      // re-fetching the whole list.
+      if (ok && created) {
+        lastVolumes = [created, ...lastVolumes];
+        renderRows(); renderBulkBar();
+      } else if (ok) {
+        load();
+      }
     };
 
     await load();
@@ -2131,14 +2589,253 @@ import { FitAddon } from '@xterm/addon-fit';
       : d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: '2-digit' });
   }
 
+  /**
+   * Portainer-style tabbed inspect modal.
+   *
+   * Tabs:
+   *   Overview   metadata + Browse / Delete actions
+   *   Mounted by list of containers using it (container -> mount path + rw/ro)
+   *   Labels     display-only — Docker labels are immutable after
+   *              volume creation, so we show them but never edit
+   *   Browse     embeds the file manager
+   *   Raw        the full dockerode inspect payload (jsonView)
+   *
+   * `onChange` is called after a delete so the caller can refresh
+   * its list.
+   */
+  async function openVolumeInspect(name, onChange) {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
+    let data;
+    try { data = await api(`/api/volumes/${encodeURIComponent(name)}`); }
+    catch (e) { toast(e.message, 'error'); return; }
+
+    // VolumeDetail (#10): the inspect endpoint now returns the same
+    // normalised snake_case shape as the list, plus a `raw` field
+    // carrying the verbatim Docker inspect payload for the Raw tab.
+    const labels = { ...(data.labels || {}) };
+    const usedBy = data.used_by || [];
+    const inUse = !!data.in_use;
+    const stack = data.stack || null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'flex flex-col gap-3';
+    // #25: rename the placeholder tab so it's not misleading. The label
+    // now matches the button.
+    wrap.innerHTML = `
+      <div class="flex flex-wrap items-center gap-2 text-xs border-b border-slate-800 pb-2">
+        ${['overview','mounted','labels','browse','raw'].map((t, i) => `
+          <button data-tab="${t}" class="vi-tab rounded px-2 py-1 ${i===0?'bg-sky-500/20 text-sky-300':'text-slate-400 hover:bg-slate-800'}">${
+            {overview:'Overview', mounted:'Mounted by', labels:'Labels', browse:'Open file manager', raw:'Raw'}[t]
+          }</button>
+        `).join('')}
+        <span class="ml-auto flex items-center gap-1">
+          ${inUse ? (() => {
+            const rwN = usedBy.filter((u) => u.rw).length;
+            const roN = usedBy.length - rwN;
+            return `${rwN > 0 ? `<span class="inline-flex items-center rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">rw × ${rwN}</span>` : ''}
+                    ${roN > 0 ? `<span class="inline-flex items-center rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">ro × ${roN}</span>` : ''}`;
+          })() : `<span class="inline-flex items-center rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
+        </span>
+      </div>
+      <div id="vi-panel" class="min-h-[40vh]"></div>`;
+
+    const panel = wrap.querySelector('#vi-panel');
+
+    function fieldRow(label, value, opts = {}) {
+      return `
+        <div class="grid grid-cols-[10rem_1fr] gap-3 py-1.5 border-b border-slate-800/50">
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 self-start mt-0.5">${escapeHtml(label)}</div>
+          <div class="text-sm ${opts.mono ? 'font-mono text-slate-300' : 'text-slate-200'}">${value}</div>
+        </div>`;
+    }
+
+    function copyButton(text, label = 'copy') {
+      const id = `c-${Math.random().toString(36).slice(2, 8)}`;
+      return `<button id="${id}" data-copy="${escapeHtml(text)}" class="ml-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300">${label}</button>`;
+    }
+
+    function renderOverview() {
+      const stackLink = stack
+        ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(stack)}</a>`
+        : '<span class="text-slate-500">—</span>';
+      const optsRows = Object.entries(data.options || {}).map(([k, v]) =>
+        `<tr><td class="pr-3 py-0.5 text-slate-400 font-mono text-[11px]">${escapeHtml(k)}</td><td class="font-mono text-[11px] text-slate-200">${escapeHtml(String(v))}</td></tr>`,
+      ).join('');
+      panel.innerHTML = `
+        <div class="space-y-1">
+          ${fieldRow('Name', `<code class="text-slate-100">${escapeHtml(data.name)}</code>${copyButton(data.name)}`)}
+          ${fieldRow('Driver', escapeHtml(data.driver), { mono: true })}
+          ${fieldRow('Scope', escapeHtml(data.scope || ''))}
+          ${fieldRow('Mountpoint', `<span class="font-mono">${escapeHtml(data.mountpoint || '')}</span>${copyButton(data.mountpoint || '')}`)}
+          ${fieldRow('Stack (owner)', stackLink)}
+          ${fieldRow('Created', escapeHtml(data.created_at || ''))}
+          ${fieldRow('Driver options', optsRows ? `<table>${optsRows}</table>` : '<span class="text-slate-500">none</span>')}
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          ${isAdmin ? `<button id="vi-browse" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">📁 Browse files</button>` : ''}
+          ${isAdmin ? `<button id="vi-delete" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove volume</button>` : ''}
+        </div>`;
+
+      const browseBtn = panel.querySelector('#vi-browse');
+      if (browseBtn) browseBtn.onclick = async () => activate('browse');
+
+      const deleteBtn = panel.querySelector('#vi-delete');
+      if (deleteBtn) deleteBtn.onclick = async () => {
+        // #1: force-false-with-409-fallback. The first request is
+        // safe; if the daemon says "in use", we offer the force path
+        // with extra friction.
+        const warn = inUse
+          ? `<p class="mt-2 text-amber-300 text-xs">⚠ This volume is in use by ${usedBy.length} container(s). The daemon will refuse to delete it unless you also force-remove.</p>`
+          : '';
+        const ok = await confirmModal(
+          `Remove volume <code>${escapeHtml(name)}</code>? Data will be lost.${warn}`,
+          { danger: true, confirmLabel: 'Remove' },
+        );
+        if (!ok) return;
+        try {
+          await api(`/api/volumes/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          toast('Volume removed', 'success');
+          if (onChange) onChange();
+          modalRef.close && modalRef.close(null);
+        } catch (ex) {
+          if (ex.status === 409) {
+            const forceOk = await confirmModal(
+              `<strong>Volume <code>${escapeHtml(name)}</code> is in use.</strong> ` +
+              `Force-removing will detach it from running containers — they will fail their next read/write to this volume.<br><br>` +
+              `Continue with <strong>force=true</strong>?`,
+              { danger: true, confirmLabel: 'Force remove' },
+            );
+            if (!forceOk) return;
+            try {
+              await api(`/api/volumes/${encodeURIComponent(name)}?force=true`, { method: 'DELETE' });
+              toast('Volume force-removed', 'warn');
+              if (onChange) onChange();
+              modalRef.close && modalRef.close(null);
+            } catch (e2) { toast(e2.message, 'error'); }
+          } else { toast(ex.message, 'error'); }
+        }
+      };
+    }
+
+    function renderMounted() {
+      if (!inUse) {
+        panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">Not mounted by any container.</div>`;
+        return;
+      }
+      const rows = usedBy.map((u) => `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-4 py-2"><code class="text-slate-100">${escapeHtml(u.container_name)}</code><div class="text-[11px] text-slate-500 font-mono">${escapeHtml(u.container_id.slice(0, 12))}</div></td>
+          <td class="px-4 py-2 font-mono text-xs text-slate-300">${escapeHtml(u.mount_path)}</td>
+          <td class="px-4 py-2">${u.rw
+            ? `<span class="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">rw</span>`
+            : `<span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-300">ro</span>`}</td>
+        </tr>`).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">${usedBy.length} container${usedBy.length === 1 ? '' : 's'} currently mount${usedBy.length === 1 ? 's' : ''} this volume.</p>
+        <table class="w-full text-left text-sm">
+          <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="px-4 py-2">Container</th><th class="px-4 py-2">Mount path</th><th class="px-4 py-2">Mode</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function renderLabels() {
+      const keys = Object.keys(labels).sort();
+      const rows = keys.map((k) => `
+        <tr class="border-b border-slate-800/60">
+          <td class="px-2 py-1 align-top font-mono text-xs text-slate-300 break-all">${escapeHtml(k)}</td>
+          <td class="px-2 py-1 align-top font-mono text-xs text-slate-200 break-all">${escapeHtml(labels[k])}</td>
+        </tr>
+      `).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">
+          Volume labels are set at create time and are <strong>immutable</strong> — Docker's Engine API has no
+          <code class="text-[11px]">PATCH /volumes/{name}</code> endpoint. To add or change labels (e.g.
+          <code class="text-[11px]">com.docker.compose.project</code>), delete the volume and recreate it with the
+          new label set.
+        </p>
+        <table class="w-full text-left">
+          <thead class="text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="w-1/3 px-2 py-1">Key</th><th class="px-2 py-1">Value</th></tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="2" class="px-2 py-4 text-center text-xs text-slate-500">No labels</td></tr>'}</tbody>
+        </table>`;
+    }
+
+    function renderBrowse() {
+      // #25: the file manager renders in its own dedicated modal — we
+      // intentionally don't embed it here (it expects to be the only
+      // modal in the stack and uses the full-screen toggle), so the
+      // Browse tab is a launcher. Tab label matches the action.
+      panel.innerHTML = `
+        <div class="rounded border border-slate-800 bg-slate-950/40 p-6 text-center text-sm text-slate-300">
+          <p class="mb-3">The volume file manager opens as its own modal.</p>
+          <button id="vi-browse-open" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-2 font-medium">📁 Open file manager</button>
+        </div>`;
+      panel.querySelector('#vi-browse-open').onclick = async () => {
+        modalRef.close && modalRef.close(null);
+        await openVolumeBrowser(name);
+      };
+    }
+
+    function renderRaw() {
+      panel.innerHTML = '';
+      // #10: the inspect endpoint carries the verbatim Docker payload
+      // under `raw`, so we just display that — no need to strip our
+      // enrichment fields one by one.
+      panel.appendChild(jsonView(data.raw || {}));
+    }
+
+    const renderers = {
+      overview: renderOverview,
+      mounted: renderMounted,
+      labels: renderLabels,
+      browse: renderBrowse,
+      raw: renderRaw,
+    };
+
+    function activate(t) {
+      for (const b of wrap.querySelectorAll('.vi-tab')) {
+        const on = b.dataset.tab === t;
+        b.className = 'vi-tab rounded px-2 py-1 ' + (on ? 'bg-sky-500/20 text-sky-300' : 'text-slate-400 hover:bg-slate-800');
+      }
+      renderers[t]();
+    }
+
+    wrap.addEventListener('click', (e) => {
+      const t = e.target.closest('.vi-tab'); if (t) activate(t.dataset.tab);
+      // Copy buttons
+      const c = e.target.closest('button[data-copy]');
+      if (c) {
+        const txt = c.dataset.copy;
+        navigator.clipboard?.writeText(txt).then(() => {
+          c.textContent = 'copied'; setTimeout(() => { c.textContent = 'copy'; }, 1200);
+        }).catch(() => toast('Copy failed (clipboard unavailable)', 'warn'));
+      }
+    });
+
+    activate('overview');
+
+    const modalRef = {};
+    await modal({
+      title: `Inspect: ${name}`, body: wrap, size: 'xl', ref: modalRef,
+    });
+  }
+
   async function openVolumeBrowser(volumeName) {
+    // Grid template kept in one place so header + rows can't drift apart.
+    const GRID_COLS = 'grid-cols-[1.75rem_1fr_5.5rem_8rem_8rem_6.25rem_6.75rem]';
+    const PAGE_SIZES = [50, 100, 250, 500, 1000];
+
     const wrap = document.createElement('div');
     wrap.innerHTML = `
       <div class="mb-3 flex flex-wrap items-center gap-2">
         <div id="vb-crumbs" class="flex flex-1 min-w-[280px] flex-wrap items-center gap-1 rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs"></div>
         <button id="vb-mkdir" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="New folder">+ Folder</button>
-        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer" title="Upload file">⤒ Upload
-          <input id="vb-upload" type="file" class="hidden"/>
+        <label class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-2 py-1 text-xs cursor-pointer" title="Upload file(s)">⤒ Upload
+          <input id="vb-upload" type="file" class="hidden" multiple/>
         </label>
         <button id="vb-dl-folder" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Download current folder as tar">⤓ tar</button>
         <select id="vb-sort" class="rounded border-slate-700 bg-slate-950 px-1 py-1 text-xs" title="Sort order">
@@ -2146,11 +2843,23 @@ import { FitAddon } from '@xterm/addon-fit';
           <option value="size">Sort: Size</option>
           <option value="mtime">Sort: Modified</option>
         </select>
-        <button id="vb-stop" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Stop the sidecar container">Stop sidecar</button>
+        <button id="vb-refresh" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 text-xs border border-slate-700" title="Reload current directory">⟳</button>
       </div>
+
+      <div id="vb-bulk" class="mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs">
+        <span><span id="vb-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
+        <div class="flex items-center gap-2">
+          <button id="vb-bulk-chmod" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-200" title="Change mode and/or ownership">🔒 Permissions…</button>
+          <button id="vb-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>
+          <button id="vb-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
+        </div>
+      </div>
+
       <div id="vb-status" class="mb-2 hidden rounded px-3 py-2 text-xs"></div>
-      <div class="rounded border border-slate-800 bg-slate-950/60 overflow-hidden">
-        <div class="grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-400">
+
+      <div id="vb-table" class="relative rounded border border-slate-800 bg-slate-950/60 overflow-hidden">
+        <div class="grid ${GRID_COLS} gap-2 border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-400">
+          <div><input id="vb-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all on this page"/></div>
           <div>Name</div>
           <div class="text-right">Size</div>
           <div>Owner</div>
@@ -2159,16 +2868,40 @@ import { FitAddon } from '@xterm/addon-fit';
           <div class="text-right">Actions</div>
         </div>
         <div id="vb-list" class="max-h-[55vh] overflow-auto scroll-thin"></div>
+        <div id="vb-drop" class="pointer-events-none absolute inset-0 hidden items-center justify-center bg-sky-500/15 backdrop-blur-sm">
+          <div class="rounded-lg border-2 border-dashed border-sky-300 bg-slate-950/70 px-6 py-4 text-sm text-sky-200">
+            Drop file(s) to upload to <code class="text-sky-100" id="vb-drop-path">/</code>
+          </div>
+        </div>
       </div>
-      <div id="vb-foot" class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+
+      <div id="vb-foot" class="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
         <span id="vb-count">0 items</span>
+        <div id="vb-pager" class="flex items-center gap-1">
+          <label class="text-slate-400">Per page
+            <select id="vb-pagesize" class="ml-1 rounded border-slate-700 bg-slate-950 px-1 py-0.5 text-[11px]">
+              ${PAGE_SIZES.map((n) => `<option value="${n}">${n}</option>`).join('')}
+            </select>
+          </label>
+          <button id="vb-first" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="First page">«</button>
+          <button id="vb-prev"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Previous page">‹</button>
+          <span id="vb-page-info" class="px-2 text-slate-400">—</span>
+          <button id="vb-next"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Next page">›</button>
+          <button id="vb-last"  class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-slate-300" title="Last page">»</button>
+        </div>
         <span>Volume: <code class="text-slate-400">${escapeHtml(volumeName)}</code></span>
       </div>`;
 
+    // ---------- State ----------
     let cur = '/';
-    let lastEntries = [];
+    let lastEntries = [];        // page entries from the latest /list call
+    let total = 0;               // server-reported full directory count
+    let offset = 0;              // current page offset (entries-aligned)
+    let pageSize = 100;          // entries-per-page, see PAGE_SIZES
     let sortMode = 'name';
+    const selected = new Set();  // names selected on the current page
 
+    // ---------- Helpers ----------
     function setStatus(msg, kind = 'info') {
       const el = wrap.querySelector('#vb-status');
       if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
@@ -2201,17 +2934,20 @@ import { FitAddon } from '@xterm/addon-fit';
       }
       host.onclick = (e) => {
         const b = e.target.closest('button[data-path]');
-        if (b) load(b.dataset.path);
+        if (b) { offset = 0; selected.clear(); load(b.dataset.path); }
       };
     }
 
     function sortEntries(entries) {
+      // Local sort within the current page only. The page itself is whatever
+      // the server returned at (offset, offset+limit); sorting across pages
+      // would require asking the API for a stable ordering, which it doesn't
+      // currently support.
       const cmp = {
         name: (a, b) => a.name.localeCompare(b.name),
         size: (a, b) => (a.size || 0) - (b.size || 0),
         mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
-      }[sortMode] || ((a, b) => 0);
-      // Directories first, then symlinks, then files; secondary by chosen column.
+      }[sortMode] || (() => 0);
       return entries.slice().sort((a, b) => {
         const w = (e) => e.is_dir ? 0 : (e.is_link ? 1 : 2);
         return (w(a) - w(b)) || cmp(a, b);
@@ -2229,26 +2965,71 @@ import { FitAddon } from '@xterm/addon-fit';
       const nameCls = entry.is_dir
         ? 'text-sky-300 cursor-pointer'
         : (entry.is_link ? 'text-violet-300' : 'text-slate-200');
+      // #29: explain why symlink names aren't clickable. Hovering tells
+      // the admin what a click would do (or wouldn't); the per-row
+      // Download/Rename/Permissions/Delete actions still work.
+      const nameTitle = entry.is_link
+        ? `Symlink → ${entry.link_target || '?'} — not followed in the UI to avoid escaping the volume; use Download to fetch the link's target contents`
+        : (entry.is_dir ? 'Open folder' : 'View / edit file');
 
       const isText = !entry.is_dir && !entry.is_link;
+      const isChecked = selected.has(entry.name) ? 'checked' : '';
       return `
         <div data-name="${escapeHtml(entry.name)}" data-kind="${entry.is_dir ? 'dir' : (entry.is_link ? 'link' : 'file')}"
-             class="vb-row grid grid-cols-[1fr_5.5rem_8rem_8rem_6.5rem_4.5rem] gap-2 items-center border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+             class="vb-row grid ${GRID_COLS} gap-2 items-center border-b border-slate-800/70 px-3 py-1.5 text-xs hover:bg-slate-900/60">
+          <div><input type="checkbox" class="vb-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-act="select" ${isChecked}/></div>
           <div class="flex items-center gap-2 min-w-0">
             <span>${_fileIcon(entry)}</span>
-            <span class="${nameCls} truncate" data-act="navigate">${nameCell}</span>
+            <span class="${nameCls} truncate" data-act="navigate" title="${escapeHtml(nameTitle)}">${nameCell}</span>
           </div>
           <div class="text-right text-slate-400 font-mono">${sizeCol}</div>
           <div class="text-slate-400 truncate" title="${escapeHtml(entry.user)}:${escapeHtml(entry.group)}">${owner}</div>
           <div class="text-slate-500">${date}</div>
           <div class="text-slate-400 font-mono text-[11px]">${escapeHtml(perms)}</div>
-          <div class="flex justify-end gap-1 opacity-60 group-hover:opacity-100">
-            ${isText ? `<button data-act="view" title="View" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
-            <button data-act="dl" title="Download" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
-            <button data-act="rename" title="Rename" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
-            <button data-act="rm" title="Delete" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
+          <div class="flex justify-end gap-1">
+            ${isText ? `<button data-act="view"   title="View"    class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">👁</button>` : ''}
+            <button data-act="dl"     title="Download"     class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">⤓</button>
+            <button data-act="rename" title="Rename"       class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">✎</button>
+            <button data-act="chmod"  title="Permissions (mode + owner)" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5">🔒</button>
+            <button data-act="rm"     title="Delete"       class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-1.5">✕</button>
           </div>
         </div>`;
+    }
+
+    function renderPager() {
+      const pages = Math.max(1, Math.ceil(total / pageSize));
+      const cur1 = Math.floor(offset / pageSize) + 1;
+      const start = total === 0 ? 0 : offset + 1;
+      const end = Math.min(offset + lastEntries.length, total);
+      wrap.querySelector('#vb-page-info').textContent =
+        `${start}–${end} of ${total} (page ${cur1}/${pages})`;
+      wrap.querySelector('#vb-first').disabled = offset === 0;
+      wrap.querySelector('#vb-prev').disabled  = offset === 0;
+      wrap.querySelector('#vb-next').disabled  = end >= total;
+      wrap.querySelector('#vb-last').disabled  = end >= total;
+      // Disabled state styling
+      for (const id of ['vb-first', 'vb-prev', 'vb-next', 'vb-last']) {
+        const b = wrap.querySelector('#' + id);
+        b.classList.toggle('opacity-40', b.disabled);
+        b.classList.toggle('cursor-not-allowed', b.disabled);
+      }
+      wrap.querySelector('#vb-pagesize').value = String(pageSize);
+    }
+
+    function renderBulkToolbar() {
+      const bar = wrap.querySelector('#vb-bulk');
+      if (selected.size === 0) { bar.classList.add('hidden'); bar.classList.remove('flex'); return; }
+      bar.classList.remove('hidden'); bar.classList.add('flex');
+      wrap.querySelector('#vb-bulk-count').textContent = String(selected.size);
+    }
+
+    function syncSelectAllCheckbox() {
+      const cb = wrap.querySelector('#vb-select-all');
+      const total = lastEntries.length;
+      if (total === 0) { cb.checked = false; cb.indeterminate = false; return; }
+      const onPage = lastEntries.filter((e) => selected.has(e.name)).length;
+      cb.checked = onPage === total;
+      cb.indeterminate = onPage > 0 && onPage < total;
     }
 
     function render() {
@@ -2259,24 +3040,39 @@ import { FitAddon } from '@xterm/addon-fit';
       } else {
         host.innerHTML = sorted.map(rowFor).join('');
       }
-      wrap.querySelector('#vb-count').textContent = `${sorted.length} item${sorted.length === 1 ? '' : 's'}`;
+      const itemWord = `${sorted.length} item${sorted.length === 1 ? '' : 's'}`;
+      wrap.querySelector('#vb-count').textContent =
+        total > sorted.length ? `${itemWord} (of ${total})` : itemWord;
+      renderPager();
+      syncSelectAllCheckbox();
+      renderBulkToolbar();
     }
 
     async function load(path) {
-      cur = path || '/';
+      cur = path || cur || '/';
       renderCrumbs(cur);
       const host = wrap.querySelector('#vb-list');
       host.innerHTML = '<div class="px-3 py-3 text-xs text-slate-400">Loading…</div>';
       setStatus('');
       try {
-        const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?path=${encodeURIComponent(cur)}`);
+        const qs = new URLSearchParams({ path: cur, limit: String(pageSize), offset: String(offset) });
+        const data = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/list?${qs.toString()}`);
         cur = data.path || cur;
         renderCrumbs(cur);
         lastEntries = data.entries || [];
-        render();
-        if (data.total > lastEntries.length) {
-          setStatus(`Showing first ${lastEntries.length} of ${data.total} entries.`, 'info');
+        total = typeof data.total === 'number' ? data.total : lastEntries.length;
+        // Server clamps an out-of-range offset (e.g. user changes pageSize on
+        // page 7 of a small dir). If we asked beyond the end, rewind and reload.
+        if (offset >= total && total > 0) {
+          offset = Math.floor((total - 1) / pageSize) * pageSize;
+          return load(cur);
         }
+        // Drop selections that aren't on this page anymore (we don't track
+        // selections across pages — each page selection is independent).
+        for (const n of [...selected]) {
+          if (!lastEntries.some((e) => e.name === n)) selected.delete(n);
+        }
+        render();
       } catch (e) {
         host.innerHTML = '';
         setStatus(e.message, 'err');
@@ -2288,16 +3084,12 @@ import { FitAddon } from '@xterm/addon-fit';
     }
 
     async function downloadUrl(p, endpoint = 'file') {
-      // Use fetch + blob (Authorization header can't go on <a href=>).
-      const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`, {
-        headers: { Authorization: authHeader() },
-      });
-      if (!res.ok) {
-        let det = res.statusText;
-        try { det = (await res.json()).detail || det; } catch {}
-        throw new Error(`Download failed: ${det}`);
-      }
-      return res.blob();
+      // Routes through api() (#21) so 401 triggers auto-logout and
+      // server-side error details surface uniformly.
+      return api(
+        `/api/volumes/${encodeURIComponent(volumeName)}/browse/${endpoint}?path=${encodeURIComponent(p)}`,
+        { responseType: 'blob' },
+      );
     }
 
     function triggerDownload(blob, filename) {
@@ -2307,47 +3099,245 @@ import { FitAddon } from '@xterm/addon-fit';
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     }
 
-    async function openViewer(name, p) {
+    /**
+     * Inline file editor backed by CodeMirror 6.
+     *
+     * Read pass:
+     *   GET /browse/view  →  JSON envelope (text + encoding + mtime/size)
+     *   We capture the mtime from the directory listing entry (lastEntries)
+     *   and send it back on save as `if_mtime` for optimistic concurrency.
+     *
+     * Save pass:
+     *   PUT /browse/file  →  body { content, if_mtime } → 200 / 409 / 400
+     *   On 409 the server returns the current mtime; we show a conflict
+     *   dialog with [Reload] / [Overwrite anyway] / [Cancel].
+     *
+     * Binary files and 1 MB-truncated files are read-only.
+     */
+    async function openEditor(name, p, entry) {
       let payload;
       try {
         payload = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/view?path=${encodeURIComponent(p)}`);
       } catch (e) { toast(e.message, 'error'); return; }
-      const view = document.createElement('div');
+
+      // Binary preview — unchanged from the old viewer.
       if (payload.is_binary) {
-        view.innerHTML = `
+        const v = document.createElement('div');
+        v.innerHTML = `
           <div class="rounded border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">
-            <p>This file looks binary (contains null bytes in the first 8 KB) — preview unavailable.</p>
+            <p>This file looks binary (contains null bytes in the first 8 KB) — inline editing unavailable.</p>
             <p class="mt-2">Size: <span class="font-mono">${fmtBytes(payload.size)}</span></p>
           </div>`;
-      } else {
-        view.innerHTML = `
-          <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
-            <span>${fmtBytes(payload.size)} · encoding: ${escapeHtml(payload.encoding || 'utf-8')}${payload.truncated ? ' · <span class="text-amber-400">truncated to 1 MB</span>' : ''}</span>
-          </div>
-          <pre class="log-pane h-[60vh] overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-200"></pre>`;
-        view.querySelector('pre').textContent = payload.content || '';
-      }
-      await modal({
-        title: `View: ${name}`,
-        body: view, size: 'xl',
-        actions: [
-          { label: 'Download', kind: 'secondary', value: 'dl' },
-          { label: 'Close', value: null, kind: 'secondary' },
-        ],
-      }).then(async (action) => {
+        const action = await modal({
+          title: `View: ${name}`, body: v, size: 'md',
+          actions: [
+            { label: 'Download', kind: 'secondary', value: 'dl' },
+            { label: 'Close', value: null, kind: 'secondary' },
+          ],
+        });
         if (action === 'dl') {
           try { triggerDownload(await downloadUrl(p), name); }
           catch (e) { toast(e.message, 'error'); }
         }
+        return;
+      }
+
+      const canEdit = !payload.truncated;
+      const original = payload.content || '';
+      let mtimeCursor = entry ? entry.mtime : null;
+      let dirty = false;
+      let isFullScreen = false;
+      let editor = null;
+
+      const view = document.createElement('div');
+      view.className = 'flex flex-col gap-2';
+      view.innerHTML = `
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+          <span id="ed-meta">${fmtBytes(payload.size)} · ${escapeHtml(payload.encoding || 'utf-8')}${
+            payload.truncated ? ' · <span class="text-amber-400">truncated to 1 MB — read-only</span>' : ''
+          }</span>
+          <div class="flex items-center gap-1">
+            <button id="ed-reload" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700" title="Reload from disk (discards unsaved changes)">⟳ Reload</button>
+            <button id="ed-diff"   class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 ${canEdit?'':'hidden'}" title="Preview the diff between original and current buffer">≷ Diff</button>
+            <button id="ed-fs"     class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700" title="Toggle full-screen">⛶ Full-screen</button>
+          </div>
+        </div>
+        <div id="ed-host" class="rounded border border-slate-800 bg-slate-950/70 overflow-hidden" style="height:60vh"></div>`;
+
+      const ref = {};
+      const modalRef = ref;
+
+      function updateTitle() {
+        if (!ref.titleEl) return;
+        // Build the title via DOM so the file name (attacker-controlled
+        // text inside a volume) can NEVER reach innerHTML. The dirty
+        // bullet is a separate span element.
+        ref.titleEl.replaceChildren();
+        if (dirty) {
+          const bullet = document.createElement('span');
+          bullet.className = 'text-amber-400';
+          bullet.textContent = '● ';
+          ref.titleEl.appendChild(bullet);
+        }
+        ref.titleEl.appendChild(document.createTextNode(`Edit: ${name}`));
+      }
+
+      async function reload() {
+        if (dirty && !(await confirmModal('Discard unsaved changes and reload from disk?', { danger: true, confirmLabel: 'Reload' }))) return;
+        let fresh;
+        try {
+          fresh = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/view?path=${encodeURIComponent(p)}`);
+        } catch (e) { toast(e.message, 'error'); return; }
+        editor.dispatch({
+          changes: { from: 0, to: editor.state.doc.length, insert: fresh.content || '' },
+        });
+        // Capture the new mtime so subsequent saves use it.
+        const newEntry = (lastEntries.find((x) => x.name === name)) || entry;
+        mtimeCursor = newEntry ? newEntry.mtime : mtimeCursor;
+        dirty = false; updateTitle();
+        toast('Reloaded from disk', 'success');
+      }
+
+      async function showDiff() {
+        const current = editor.state.doc.toString();
+        if (current === original) { toast('No changes yet', 'info'); return; }
+        const cmModule = await import(/* webpackChunkName: "editor" */ './editor.js');
+        const host = document.createElement('div');
+        host.style.height = '70vh';
+        host.className = 'overflow-hidden rounded border border-slate-800';
+        const mv = cmModule.mountDiff(host, original, current, { filename: name });
+        await modal({
+          title: `Diff: ${name}`, body: host, size: 'xl',
+          actions: [{ label: 'Close', value: null, kind: 'secondary' }],
+        });
+        mv.destroy();
+      }
+
+      // The actual save call. Returns true if we should close the modal.
+      // #21: routes through api() so 401 triggers auto-logout.
+      async function save({ overrideConflict = false } = {}) {
+        if (!canEdit) return false;
+        const content = editor.state.doc.toString();
+        const body = { content };
+        if (mtimeCursor != null && !overrideConflict) body.if_mtime = mtimeCursor;
+        try {
+          const out = await api(
+            `/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(p)}`,
+            { method: 'PUT', body: JSON.stringify(body) },
+          );
+          mtimeCursor = out.mtime;
+          dirty = false; updateTitle();
+          toast('Saved', 'success');
+          load(cur); // refresh the listing so size/mtime update
+          return true;
+        } catch (e) {
+          // 409 → optimistic-concurrency conflict. The server returns
+          // the current mtime so we can offer Reload / Overwrite paths.
+          if (e.status === 409) {
+            const serverMtime = e.body && e.body.server_mtime;
+            const wrapEl = document.createElement('div');
+            wrapEl.innerHTML = `
+              <p class="text-sm text-slate-300"></p>
+              <p class="mt-2 text-xs text-slate-500">Server mtime: <code></code> — your edit was based on <code></code>.</p>
+              <p class="mt-2 text-xs text-slate-400">Reload discards your edits and re-reads the file. Overwrite forces your version onto the new one.</p>`;
+            wrapEl.querySelector('p:nth-child(1)').textContent = (e.body && e.body.detail) || 'Conflict';
+            wrapEl.querySelector('code:nth-of-type(1)').textContent = String(serverMtime);
+            wrapEl.querySelector('code:nth-of-type(2)').textContent = String(mtimeCursor);
+            const action = await modal({
+              title: 'File changed on disk', size: 'md', body: wrapEl,
+              actions: [
+                { label: 'Reload',   kind: 'secondary', value: 'reload' },
+                { label: 'Overwrite anyway', kind: 'danger', value: 'force' },
+                { label: 'Cancel',   kind: 'secondary', value: null },
+              ],
+            });
+            if (action === 'reload') { await reload(); return false; }
+            if (action === 'force')  { return save({ overrideConflict: true }); }
+            return false;
+          }
+          toast(e.message, 'error');
+          return false;
+        }
+      }
+
+      // ---- Wire up controls ----
+      view.querySelector('#ed-reload').onclick = reload;
+      view.querySelector('#ed-diff').onclick = showDiff;
+      view.querySelector('#ed-fs').onclick = () => {
+        isFullScreen = !isFullScreen;
+        if (modalRef.resize) modalRef.resize(isFullScreen ? 'full' : 'xl');
+        view.querySelector('#ed-host').style.height = isFullScreen ? 'calc(96vh - 12rem)' : '60vh';
+      };
+
+      // Lazy-load CodeMirror — webpack splits this into its own chunk
+      // so the editor cost is paid only when a user opens a file.
+      const cmModule = await import(/* webpackChunkName: "editor" */ './editor.js');
+      editor = cmModule.mountEditor(view.querySelector('#ed-host'), original, {
+        filename: name,
+        readOnly: !canEdit,
+        onChange: (text) => {
+          const wasDirty = dirty;
+          dirty = text !== original;
+          if (wasDirty !== dirty) updateTitle();
+        },
+        onSave: () => { if (canEdit) save(); },
       });
+
+      // Save and Download stay in the modal (return false from onClick) —
+      // matches every desktop editor: Ctrl+S / clicking Save updates the
+      // file on disk but leaves the editor open. Closing is its own action.
+      const actions = canEdit
+        ? [
+            { label: 'Save', kind: 'primary', value: 'save',
+              onClick: async () => { await save(); return false; } },
+            { label: 'Download', kind: 'secondary', value: 'dl',
+              onClick: async () => { try { triggerDownload(await downloadUrl(p), name); } catch (e) { toast(e.message, 'error'); } return false; } },
+            { label: 'Close', value: null, kind: 'secondary', confirmBeforeClose: true },
+          ]
+        : [
+            { label: 'Download', kind: 'secondary', value: 'dl',
+              onClick: async () => { try { triggerDownload(await downloadUrl(p), name); } catch (e) { toast(e.message, 'error'); } return false; } },
+            { label: 'Close', value: null, kind: 'secondary' },
+          ];
+
+      const opening = modal({
+        title: `Edit: ${name}`, body: view, size: 'xl',
+        actions, ref,
+        onBeforeClose: async () => {
+          if (!dirty) return true;
+          return await confirmModal(
+            'Discard unsaved changes? Your edits to <code>' + escapeHtml(name) + '</code> will be lost.',
+            { danger: true, confirmLabel: 'Discard' },
+          );
+        },
+      });
+      updateTitle();
+      await opening;
+      try { editor.destroy(); } catch {}
     }
 
+
+    // #24: replace window.prompt with a real modal — gives us validation,
+    // proper keyboard handling, consistent styling, and works in browsers
+    // that block prompts.
     async function renameAt(oldName) {
-      const next = window.prompt(`Rename "${oldName}" to:`, oldName);
-      if (!next || next === oldName) return;
-      if (next.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
+      const next = await inputModal({
+        title: `Rename`,
+        label: `Rename "${oldName}" to:`,
+        initial: oldName,
+        okLabel: 'Rename',
+        validate: (v) => {
+          const t = (v || '').trim();
+          if (!t) return 'Name is required';
+          if (t.includes('/')) return 'Name cannot contain "/"';
+          if (t === '.' || t === '..') return 'Reserved name';
+          if (t === oldName) return 'New name must be different';
+          return null;
+        },
+      });
+      if (next == null || next.trim() === oldName) return;
       const from = childPath(oldName);
-      const to = childPath(next);
+      const to = childPath(next.trim());
       try {
         await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/rename`, {
           method: 'POST',
@@ -2357,7 +3347,229 @@ import { FitAddon } from '@xterm/addon-fit';
       } catch (e) { toast(e.message, 'error'); }
     }
 
-    // Row click delegation: navigate (folder click), or per-row action.
+    // ---------- Permissions modal (chmod + chown) ----------
+    // Combined editor: octal mode kept in sync with rwx triplets, plus an
+    // optional owner section that sets numeric UID / GID. Either piece can
+    // be edited independently; on Apply we issue /chmod and/or /chown
+    // depending on which side actually changed.
+    async function openPermissionsEditor(names, { hasDir = false, entries = [] } = {}) {
+      // Pre-populate from the first entry's existing mode/uid/gid when we
+      // know them (single-row case, or bulk-select where all entries
+      // happen to match). Falls back to 0644 / 0:0 if we don't.
+      const seed = entries.find(Boolean);
+      const seedModeOctal = seed && seed.mode != null
+        ? '0' + ((seed.mode & 0o777).toString(8)).padStart(3, '0')
+        : '0644';
+      const seedUid = seed && seed.uid != null ? seed.uid : 0;
+      const seedGid = seed && seed.gid != null ? seed.gid : 0;
+      const seedUser = seed ? seed.user : '';
+      const seedGroup = seed ? seed.group : '';
+
+      const view = document.createElement('div');
+      const targetsLabel = names.length === 1
+        ? `<code class="text-slate-200">${escapeHtml(names[0])}</code>`
+        : `${names.length} items`;
+      view.innerHTML = `
+        <div class="space-y-4 text-xs text-slate-300">
+          <div>Target: ${targetsLabel}</div>
+
+          <!-- Mode -->
+          <fieldset class="rounded border border-slate-800 p-3 space-y-2">
+            <legend class="px-1 text-[10px] uppercase tracking-wider text-slate-500">Mode (chmod)</legend>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1">
+                <input id="perm-mode-enabled" type="checkbox" class="h-3.5 w-3.5" checked/>
+                Change mode
+              </label>
+              <input id="perm-mode" type="text" value="${seedModeOctal}" maxlength="4"
+                     class="ml-2 w-24 rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono text-sm uppercase tracking-wider"/>
+              <span class="text-slate-500" id="perm-symbol">-rw-r--r--</span>
+            </div>
+            <table class="text-[11px]">
+              <thead><tr class="text-slate-500"><th></th><th class="px-2">read</th><th class="px-2">write</th><th class="px-2">exec</th></tr></thead>
+              <tbody>
+                ${['Owner','Group','Other'].map((label, i) => `
+                  <tr><td class="pr-2 text-slate-400">${label}</td>
+                    ${['r','w','x'].map((perm) => `
+                      <td class="px-2 text-center"><input type="checkbox" class="perm-bit h-3.5 w-3.5" data-who="${i}" data-perm="${perm}"/></td>
+                    `).join('')}
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </fieldset>
+
+          <!-- Owner -->
+          <fieldset class="rounded border border-slate-800 p-3 space-y-2">
+            <legend class="px-1 text-[10px] uppercase tracking-wider text-slate-500">Owner (chown)</legend>
+            <label class="flex items-center gap-1">
+              <input id="perm-own-enabled" type="checkbox" class="h-3.5 w-3.5"/>
+              Change ownership
+            </label>
+            <div class="grid grid-cols-2 gap-3 mt-1">
+              <label class="block">
+                <span class="text-slate-400">UID${seedUser ? ` <span class="text-slate-500">(was: ${escapeHtml(String(seedUid))} / ${escapeHtml(seedUser)})</span>` : ''}</span>
+                <input id="perm-uid" type="number" min="-1" value="${seedUid}" disabled
+                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono"/>
+              </label>
+              <label class="block">
+                <span class="text-slate-400">GID${seedGroup ? ` <span class="text-slate-500">(was: ${escapeHtml(String(seedGid))} / ${escapeHtml(seedGroup)})</span>` : ''}</span>
+                <input id="perm-gid" type="number" min="-1" value="${seedGid}" disabled
+                       class="mt-1 w-full rounded border-slate-700 bg-slate-950 px-2 py-1 font-mono"/>
+              </label>
+            </div>
+            <p class="text-[11px] text-slate-500">Use <code>-1</code> in a field to leave that side unchanged. Numeric IDs only — name lookup inside the helper container doesn't match the volume's user database.</p>
+          </fieldset>
+
+          ${hasDir ? `
+            <label class="flex items-center gap-2 text-slate-300">
+              <input id="perm-recursive" type="checkbox" class="h-3.5 w-3.5"/>
+              Apply recursively (<code>-R</code>) — required to descend into folders.
+            </label>` : ''}
+        </div>`;
+
+      const PERM_BIT = { r: 4, w: 2, x: 1 };
+      const modeInput = view.querySelector('#perm-mode');
+      const symbol = view.querySelector('#perm-symbol');
+      const bits = view.querySelectorAll('.perm-bit');
+      const modeEnabled = view.querySelector('#perm-mode-enabled');
+      const ownEnabled = view.querySelector('#perm-own-enabled');
+      const uidInput = view.querySelector('#perm-uid');
+      const gidInput = view.querySelector('#perm-gid');
+
+      function modeToTriplets(octal) {
+        const digits = octal.padStart(4, '0').slice(-3);
+        return [...digits].map((d) => parseInt(d, 10) & 7);
+      }
+      function tripletsToSymbol(trips) {
+        const t = (d) => ((d & 4) ? 'r' : '-') + ((d & 2) ? 'w' : '-') + ((d & 1) ? 'x' : '-');
+        return '-' + trips.map(t).join('');
+      }
+      function syncFromMode() {
+        const raw = modeInput.value.trim();
+        if (!/^0?[0-7]{3,4}$/.test(raw)) { symbol.textContent = 'invalid'; symbol.className = 'text-rose-300'; return; }
+        symbol.className = 'text-slate-500';
+        const trips = modeToTriplets(raw);
+        for (const cb of bits) {
+          const w = +cb.dataset.who, p = cb.dataset.perm;
+          cb.checked = !!(trips[w] & PERM_BIT[p]);
+        }
+        symbol.textContent = tripletsToSymbol(trips);
+      }
+      function syncFromBits() {
+        const trips = [0, 0, 0];
+        for (const cb of bits) {
+          const w = +cb.dataset.who, p = cb.dataset.perm;
+          if (cb.checked) trips[w] |= PERM_BIT[p];
+        }
+        modeInput.value = '0' + trips.join('');
+        symbol.textContent = tripletsToSymbol(trips);
+      }
+      modeInput.addEventListener('input', syncFromMode);
+      for (const cb of bits) cb.addEventListener('change', syncFromBits);
+      syncFromMode();
+
+      // Enable/disable the input groups based on the checkboxes.
+      function refreshEnabled() {
+        modeInput.disabled = !modeEnabled.checked;
+        for (const b of bits) b.disabled = !modeEnabled.checked;
+        uidInput.disabled = !ownEnabled.checked;
+        gidInput.disabled = !ownEnabled.checked;
+      }
+      modeEnabled.addEventListener('change', refreshEnabled);
+      ownEnabled.addEventListener('change', refreshEnabled);
+      refreshEnabled();
+
+      const action = await modal({
+        title: names.length === 1 ? `Permissions: ${names[0]}` : `Permissions (${names.length} items)`,
+        body: view, size: 'md',
+        actions: [
+          { label: 'Apply', kind: 'primary', value: 'ok' },
+          { label: 'Cancel', kind: 'secondary', value: null },
+        ],
+      });
+      if (action !== 'ok') return false;
+
+      const doMode = modeEnabled.checked;
+      const doOwn = ownEnabled.checked;
+      if (!doMode && !doOwn) { toast('Nothing to apply', 'info'); return false; }
+
+      const mode = modeInput.value.trim();
+      if (doMode && !/^0?[0-7]{3,4}$/.test(mode)) { toast('Invalid mode', 'warn'); return false; }
+      const uid = parseInt(uidInput.value, 10);
+      const gid = parseInt(gidInput.value, 10);
+      if (doOwn && (Number.isNaN(uid) || Number.isNaN(gid))) {
+        toast('UID/GID must be numeric (use -1 to leave unchanged)', 'warn');
+        return false;
+      }
+      if (doOwn && uid === -1 && gid === -1) {
+        toast('chown: at least one of UID / GID must be set (use -1 only for the side you want unchanged)', 'warn');
+        return false;
+      }
+
+      const recursive = !!(view.querySelector('#perm-recursive') && view.querySelector('#perm-recursive').checked);
+      const paths = names.map(childPath);
+      const single = names.length === 1;
+
+      // #20: single atomic endpoint. The server applies mode and/or
+      // owner in one container — no more "chmod succeeded but chown
+      // failed and now the file is in a half-applied state".
+      const body = { recursive };
+      if (doMode) body.mode = mode;
+      if (doOwn)  { body.uid = uid; body.gid = gid; }
+
+      let okAll = true;
+      try {
+        if (single) {
+          await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/permissions`, {
+            method: 'POST', body: JSON.stringify({ path: paths[0], ...body }),
+          });
+        } else {
+          const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/permissions/bulk`, {
+            method: 'POST', body: JSON.stringify({ paths, ...body }),
+          });
+          okAll = (out.failed === 0);
+          for (const r of out.results || []) {
+            if (!r.ok) toast(`${r.path}: ${r.error || 'failed'}`, 'error');
+          }
+        }
+      } catch (e) {
+        toast(`Permissions failed: ${e.message}`, 'error');
+        return false;
+      }
+
+      const what = [doMode && 'mode', doOwn && 'owner'].filter(Boolean).join(' + ');
+      toast(
+        `${what} applied to ${names.length} item${names.length === 1 ? '' : 's'}${okAll ? '' : ' (partial)'}`,
+        okAll ? 'success' : 'warn',
+      );
+      await load(cur);
+      return okAll;
+    }
+
+    // ---------- Upload ----------
+    async function uploadFiles(files) {
+      if (!files || !files.length) return;
+      let ok = 0, fail = 0;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setStatus(`Uploading ${file.name} (${i + 1}/${files.length})…`);
+        const fd = new FormData(); fd.append('file', file);
+        try {
+          // #21: route through api() so 401 triggers auto-logout and
+          // server-side validation errors surface consistently.
+          await api(
+            `/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`,
+            { method: 'POST', body: fd },
+          );
+          ok += 1;
+        } catch (ex) { fail += 1; toast(`${file.name}: ${ex.message}`, 'error'); }
+      }
+      setStatus('');
+      if (ok) toast(`Uploaded ${ok} file${ok === 1 ? '' : 's'}${fail ? ` (${fail} failed)` : ''}`, fail ? 'warn' : 'success');
+      await load(cur);
+    }
+
+    // ---------- Row interactions ----------
     wrap.querySelector('#vb-list').addEventListener('click', async (e) => {
       const row = e.target.closest('.vb-row');
       if (!row) return;
@@ -2367,6 +3579,12 @@ import { FitAddon } from '@xterm/addon-fit';
       const actEl = e.target.closest('[data-act]');
       const act = actEl?.dataset.act;
       try {
+        if (act === 'select') {
+          // Checkbox handles its own state via the change event; intercept the
+          // click so it doesn't bubble up and trigger navigate.
+          e.stopPropagation();
+          return;
+        }
         if (act === 'rm') {
           const ok = await confirmModal(`Delete <code>${escapeHtml(name)}</code>? This cannot be undone.`, { danger: true, confirmLabel: 'Delete' });
           if (!ok) return;
@@ -2379,51 +3597,112 @@ import { FitAddon } from '@xterm/addon-fit';
           triggerDownload(blob, kind === 'dir' ? `${name}.tar` : name);
           return;
         }
-        if (act === 'view') {
-          return openViewer(name, child);
-        }
-        if (act === 'rename') {
-          return renameAt(name);
-        }
+        const entry = lastEntries.find((x) => x.name === name);
+        if (act === 'view') return openEditor(name, child, entry);
+        if (act === 'rename') return renameAt(name);
+        if (act === 'chmod') return openPermissionsEditor([name], { hasDir: kind === 'dir', entries: [entry].filter(Boolean) });
         if (act === 'navigate' || !act) {
-          // Name-cell click: navigate into folders; preview text files.
-          if (kind === 'dir') return load(child);
-          if (kind === 'file') return openViewer(name, child);
+          if (kind === 'dir') { offset = 0; selected.clear(); return load(child); }
+          if (kind === 'file') return openEditor(name, child, entry);
           // Symlinks: stay put; user has to click an action explicitly.
         }
       } catch (ex) { toast(ex.message, 'error'); }
     });
 
-    wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
-      sortMode = e.target.value;
+    // Selection: per-row checkbox change updates the set + bulk toolbar.
+    wrap.querySelector('#vb-list').addEventListener('change', (e) => {
+      const cb = e.target.closest('input.vb-check');
+      if (!cb) return;
+      const row = cb.closest('.vb-row');
+      if (!row) return;
+      const name = row.dataset.name;
+      if (cb.checked) selected.add(name); else selected.delete(name);
+      syncSelectAllCheckbox();
+      renderBulkToolbar();
+    });
+
+    wrap.querySelector('#vb-select-all').addEventListener('change', (e) => {
+      if (e.target.checked) {
+        for (const ent of lastEntries) selected.add(ent.name);
+      } else {
+        for (const ent of lastEntries) selected.delete(ent.name);
+      }
+      // Re-render rows so their checkbox states match (cheaper than per-row).
       render();
     });
 
-    wrap.querySelector('#vb-mkdir').onclick = async () => {
-      const name = window.prompt('New folder name:');
-      if (!name) return;
-      if (name.includes('/')) { toast('Name cannot contain "/"', 'warn'); return; }
+    // ---------- Bulk actions ----------
+    wrap.querySelector('#vb-bulk-clear').onclick = () => { selected.clear(); render(); };
+
+    wrap.querySelector('#vb-bulk-rm').onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const ok = await confirmModal(
+        `Delete <strong>${names.length}</strong> selected item${names.length === 1 ? '' : 's'}? This cannot be undone.`,
+        { danger: true, confirmLabel: 'Delete all' },
+      );
+      if (!ok) return;
+      // One bulk request = one container round-trip on the server, instead
+      // of N. Per-entry failures come back in `results` and are surfaced
+      // as individual toasts so the user knows which ones didn't go.
       try {
-        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(childPath(name))}`, { method: 'POST' });
+        const out = await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/delete/bulk`, {
+          method: 'POST',
+          body: JSON.stringify({ paths: names.map(childPath) }),
+        });
+        for (const r of out.results || []) {
+          if (!r.ok) toast(`${r.path}: ${r.error || 'delete failed'}`, 'error');
+        }
+        if (out.succeeded) {
+          toast(`Deleted ${out.succeeded}${out.failed ? ` of ${names.length}` : ''}`, out.failed ? 'warn' : 'success');
+        }
+      } catch (e) {
+        toast(`Bulk delete failed: ${e.message}`, 'error');
+      }
+      selected.clear();
+      load(cur);
+    };
+
+    wrap.querySelector('#vb-bulk-chmod').onclick = async () => {
+      const names = [...selected];
+      if (!names.length) return;
+      const hasDir = lastEntries.some((e) => names.includes(e.name) && e.is_dir);
+      const entries = names.map((n) => lastEntries.find((x) => x.name === n)).filter(Boolean);
+      await openPermissionsEditor(names, { hasDir, entries });
+    };
+
+    // ---------- Toolbar / sort / refresh ----------
+    wrap.querySelector('#vb-sort').addEventListener('change', (e) => {
+      sortMode = e.target.value; render();
+    });
+
+    wrap.querySelector('#vb-refresh').onclick = () => load(cur);
+
+    wrap.querySelector('#vb-mkdir').onclick = async () => {
+      // #24: modal prompt with inline validation.
+      const name = await inputModal({
+        title: 'New folder',
+        label: `New folder name (under ${cur})`,
+        placeholder: 'subdir',
+        okLabel: 'Create',
+        validate: (v) => {
+          const t = (v || '').trim();
+          if (!t) return 'Name is required';
+          if (t.includes('/')) return 'Name cannot contain "/"';
+          if (t === '.' || t === '..') return 'Reserved name';
+          return null;
+        },
+      });
+      if (name == null) return;
+      try {
+        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/mkdir?path=${encodeURIComponent(childPath(name.trim()))}`, { method: 'POST' });
         toast('Folder created', 'success'); load(cur);
       } catch (ex) { toast(ex.message, 'error'); }
     };
 
     wrap.querySelector('#vb-upload').addEventListener('change', async (e) => {
-      const file = e.target.files[0]; if (!file) return;
-      setStatus(`Uploading ${file.name}…`);
-      const fd = new FormData();
-      fd.append('file', file);
-      try {
-        const res = await fetch(`/api/volumes/${encodeURIComponent(volumeName)}/browse/file?path=${encodeURIComponent(cur)}`, {
-          method: 'POST',
-          headers: { Authorization: authHeader() },
-          body: fd,
-        });
-        if (!res.ok) { let det = res.statusText; try { det = (await res.json()).detail || det; } catch {} throw new Error(det); }
-        toast(`Uploaded ${file.name}`, 'success'); setStatus('');
-        load(cur);
-      } catch (ex) { setStatus(ex.message, 'err'); }
+      const files = [...(e.target.files || [])];
+      if (files.length) await uploadFiles(files);
       e.target.value = '';
     });
 
@@ -2435,14 +3714,86 @@ import { FitAddon } from '@xterm/addon-fit';
       } catch (e) { toast(e.message, 'error'); }
     };
 
-    wrap.querySelector('#vb-stop').onclick = async () => {
-      try {
-        await api(`/api/volumes/${encodeURIComponent(volumeName)}/browse/stop`, { method: 'POST' });
-        toast('Sidecar stopped', 'success');
-      } catch (ex) { toast(ex.message, 'error'); }
+    // ---------- Pagination ----------
+    wrap.querySelector('#vb-pagesize').addEventListener('change', (e) => {
+      pageSize = parseInt(e.target.value, 10) || 100;
+      offset = 0;
+      selected.clear();
+      load(cur);
+    });
+    wrap.querySelector('#vb-first').onclick = () => {
+      if (offset === 0) return;
+      offset = 0; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-prev').onclick = () => {
+      const next = Math.max(0, offset - pageSize);
+      if (next === offset) return;
+      offset = next; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-next').onclick = () => {
+      const next = offset + pageSize;
+      if (next >= total) return;
+      offset = next; selected.clear(); load(cur);
+    };
+    wrap.querySelector('#vb-last').onclick = () => {
+      const lastPage = Math.max(0, Math.floor((total - 1) / pageSize)) * pageSize;
+      if (lastPage === offset) return;
+      offset = lastPage; selected.clear(); load(cur);
     };
 
-    setStatus(`A small "${state.config.browser_image}" sidecar will be started with this volume mounted at /target. Click "Stop sidecar" when done.`, 'info');
+    // ---------- Drag-and-drop upload ----------
+    // Highlights the table overlay during drag, and triggers a multi-file
+    // upload on drop. Uses a depth counter so child-element dragenter/leave
+    // pairs don't flicker the overlay.
+    {
+      const table = wrap.querySelector('#vb-table');
+      const drop  = wrap.querySelector('#vb-drop');
+      const dropPath = wrap.querySelector('#vb-drop-path');
+      let depth = 0;
+      const showOverlay = () => {
+        dropPath.textContent = cur;
+        drop.classList.remove('hidden');
+        drop.classList.add('flex');
+      };
+      const hideOverlay = () => {
+        drop.classList.add('hidden');
+        drop.classList.remove('flex');
+      };
+      table.addEventListener('dragenter', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+        depth += 1; if (depth === 1) showOverlay();
+      });
+      table.addEventListener('dragover', (e) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      });
+      table.addEventListener('dragleave', () => {
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) hideOverlay();
+      });
+      table.addEventListener('drop', async (e) => {
+        if (!e.dataTransfer) return;
+        const files = [...(e.dataTransfer.files || [])];
+        if (!files.length) return;
+        e.preventDefault();
+        depth = 0; hideOverlay();
+        await uploadFiles(files);
+      });
+    }
+
+    // ---------- Boot ----------
+    // #27: show the "how it works" banner only the first time. Once
+    // the admin has seen it, they don't need the wall-of-text on every
+    // browse. They can re-show it via localStorage if they ever want.
+    const BANNER_KEY = 'docker-manager.vb-helper-banner-seen';
+    let bannerSeen = false;
+    try { bannerSeen = localStorage.getItem(BANNER_KEY) === '1'; } catch {}
+    if (!bannerSeen) {
+      setStatus(`Each operation runs in a short-lived "${state.config.browser_image}" container with this volume mounted read-only / read-write at /target.`, 'info');
+      try { localStorage.setItem(BANNER_KEY, '1'); } catch {}
+    }
     load('/');
 
     await modal({ title: `Browse: ${volumeName}`, body: wrap, size: 'xl' });

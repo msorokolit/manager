@@ -70,6 +70,7 @@ r.post(
   {
     summary: 'Pull an image (NDJSON progress stream)',
     admin: true,
+    destructive: true,
     expensive: true,
     body: PullRequest,
     responses: { 200: streamResponse('NDJSON pull progress') },
@@ -104,6 +105,7 @@ r.post(
   {
     summary: 'Prune images',
     admin: true,
+    destructive: true,
     query: PruneQuery,
     responses: { 200: PassThroughObject },
   },
@@ -148,6 +150,7 @@ r.delete(
   {
     summary: 'Remove an image',
     admin: true,
+    destructive: true,
     query: RemoveQuery,
     responses: { 200: Type.Object({ removed: Type.String() }) },
     extra: {

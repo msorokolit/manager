@@ -50,9 +50,29 @@ The stack is intentionally small and easy to audit:
 - **Networks** — list, inspect, create (bridge/overlay/macvlan/ipvlan/host), remove, prune
   - **Connect / disconnect** containers from the network inspect modal
 - **Volumes** — list, inspect, create, remove, prune
-  - **Volume browser**: spins up a small sidecar with the volume mounted at
-    `/target` and lets you list directories, download files, upload files,
-    create folders, and delete entries
+  - **Volume browser** (Portainer-style file manager): each operation
+    runs a short-lived container (`docker run --rm` with `AutoRemove`)
+    that has the volume mounted at `/target`. Stateless on the manager
+    side — nothing to leak, nothing to clean up on restart. Features:
+    - Breadcrumb navigation, sort, pagination through large directories
+    - **In-browser editor (CodeMirror 6)** with line numbers, syntax
+      highlighting for ~15 languages (YAML, JSON, Python, JS/TS, HTML,
+      CSS, Markdown, shell, nginx, Dockerfile, ini, toml, xml, lua,
+      ruby, perl), Ctrl+S to save, dirty indicator, full-screen toggle,
+      reload from disk, side-by-side **diff** of pending changes, and
+      **optimistic concurrency** (saves include the mtime you read; the
+      server rejects with 409 if the file changed underneath you)
+    - **Atomic writes** (temp + `os.replace`) that preserve the file's
+      original mode/uid/gid — editing a `0600 root:root` secret can't
+      accidentally widen its perms
+    - **Permissions editor** combining mode (octal + rwx triplets) and
+      ownership (numeric uid/gid, `-1` to leave unchanged), with an
+      optional recursive (`-R`) toggle for directories
+    - Download single files / whole folders as `tar`, upload (button or
+      drag-and-drop, multi-file), rename, mkdir
+    - Multi-select with **single-round-trip** bulk delete / bulk chmod
+      / bulk chown
+    - Browser image pre-pulled at startup so the first browse is snappy
 - **Registries** — store per-registry credentials (Docker Hub, ghcr.io, ECR,
   GitLab Registry, private registries…), test login, then select them from the
   image-pull dialog. Stored at `REGISTRIES_FILE` with file mode `0600`.
@@ -117,7 +137,7 @@ All configuration is via environment variables.
 | `ADMIN_PASSWORD`     | `admin`          | **Change this**                                                       |
 | `VIEWER_USER`        | _(unset)_        | Optional read-only account                                            |
 | `VIEWER_PASSWORD`    | _(unset)_        | Required if `VIEWER_USER` is set                                      |
-| `ALLOW_DESTRUCTIVE`  | `true`           | Set to `false` to deny every state-changing call (read-only mode)     |
+| `ALLOW_DESTRUCTIVE`  | `true`           | Set to `false` to deny **Docker-state-changing** calls (container kill/remove, volume remove, image/network/volume prune, stack down). Filesystem mutations inside a volume (chmod, chown, edit, mkdir) require admin role but are NOT gated by this flag. |
 | `DOCKER_HOST`        | _(auto)_         | E.g. `tcp://docker:2375` or `unix:///var/run/docker.sock`             |
 | `CORS_ORIGINS`       | _(empty)_        | Comma-separated origins to allow if the UI is hosted elsewhere        |
 | `STATIC_DIR`         | `./frontend`     | Path to the SPA assets                                                |
@@ -127,7 +147,9 @@ All configuration is via environment variables.
 | `EXEC_DEFAULT_SHELL` | `/bin/sh`        | Pre-filled command in the in-browser terminal                         |
 | `DATA_DIR`           | `/data`          | Base directory for the registries file                                |
 | `REGISTRIES_FILE`    | `${DATA_DIR}/registries.json` | JSON store of registry credentials (mode `0600`)         |
-| `BROWSER_IMAGE`      | `python:3-alpine`| Sidecar image used by the volume browser (must include `python3`)     |
+| `BROWSER_IMAGE`      | `python:3-alpine`| Image used for the per-operation volume-browser container (must include `python3`). Pre-pulled at startup. |
+| `VOLUME_BROWSER_NO_LIMITS` | _(unset)_   | Set `true` only on nested-VM / sandboxed runners whose root cgroup is in "domain threaded" mode; skips `Memory`/`NanoCpus`/`PidsLimit` on the per-op container. `CapDrop:ALL` stays applied. |
+| `VOLUME_BROWSER_OP_TIMEOUT_MS` | `90000`  | Wall-clock cap on a single volume-browser helper container. The container is force-removed and the request returns 504 if it exceeds this. Set `0` to disable (not recommended). |
 | `JWT_SECRET`         | _(random)_       | HS256 signing key. Set this in production; otherwise a random key is generated on each restart and existing sessions are invalidated. |
 | `JWT_TTL_SECONDS`    | `43200`          | Token lifetime in seconds. Floor 60s, ceiling 30 days.                |
 | `RATE_LIMIT_DISABLED`| `false`          | Turn off the rate limiters entirely (dev only)                        |
@@ -295,7 +317,7 @@ backend-node/
       images.js                 list/inspect/pull (streaming)/remove/prune
       networks.js               list/inspect/create/connect/disconnect/remove/prune
       volumes.js                list/inspect/create/remove/prune
-      volume-browser.js         list/get/upload/mkdir/delete/stop (sidecar-backed)
+      volume-browser.js         list/get/view/edit/upload/mkdir/rename/chmod/chown/delete/archive + bulk chmod/chown/delete (one-shot container per op, AutoRemove)
       stacks.js                 CRUD + up/down/restart/pull/logs/validate + per-service actions
       registries.js             list/upsert/delete/test (file-backed credential store)
       exec.js                   POST /api/exec/ticket + WS /api/containers/:id/exec
@@ -332,7 +354,7 @@ unless an endpoint is admin-only). Mutating endpoints are gated by
 | images       | list / inspect / pull (NDJSON progress) / remove / prune               |
 | networks     | list / inspect / create / connect / disconnect / remove / prune        |
 | volumes      | list / inspect / create / remove / prune                               |
-| volume-browser | list / get / upload / mkdir / delete / stop                          |
+| volume-browser | list (paginated) / get / view / edit (PUT, atomic + mtime check) / archive / upload / mkdir / rename / chmod / chown / delete + bulk chmod / bulk chown / bulk delete |
 | stacks       | list / get / create / update / up / down / restart / pull / logs / validate / delete + per-service `{up,start,stop,restart,pull,rm,logs}` |
 | registries   | list / upsert (POST or PUT) / delete / test                            |
 | exec         | `POST /api/exec/ticket` + `WS /api/containers/:id/exec?ticket=&cmd=&cols=&rows=` |

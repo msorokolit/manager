@@ -43,6 +43,7 @@ r.post(
   {
     summary: 'Create a network',
     admin: true,
+    destructive: true,
     body: CreateNetworkRequest,
     responses: { 200: NetworkSummary },
   },
@@ -61,7 +62,7 @@ r.post(
 
 r.post(
   '/prune',
-  { summary: 'Prune unused networks', admin: true, responses: { 200: PassThroughObject } },
+  { summary: 'Prune unused networks', admin: true, destructive: true, responses: { 200: PassThroughObject } },
   asyncHandler(async (_req, res) => res.json(await getClient().pruneNetworks())),
 );
 
@@ -78,6 +79,7 @@ r.delete(
   {
     summary: 'Remove a network',
     admin: true,
+    destructive: true,
     params: IdParam,
     responses: { 200: Type.Object({ removed: Type.String() }) },
   },
@@ -92,6 +94,7 @@ r.post(
   {
     summary: 'Connect a container to a network',
     admin: true,
+    destructive: true,
     params: IdParam,
     body: ConnectRequest,
     responses: { 200: PassThroughObject },
@@ -118,6 +121,7 @@ r.post(
   {
     summary: 'Disconnect a container from a network',
     admin: true,
+    destructive: true,
     params: IdParam,
     body: DisconnectRequest,
     responses: { 200: PassThroughObject },

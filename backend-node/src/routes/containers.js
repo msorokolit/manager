@@ -105,6 +105,7 @@ r.post(
   {
     summary: 'Prune stopped containers',
     admin: true,
+    destructive: true,
     responses: { 200: PassThroughObject },
   },
   asyncHandler(async (_req, res) => res.json(await getClient().pruneContainers())),
@@ -115,6 +116,7 @@ r.post(
   {
     summary: 'Create and start a container',
     admin: true,
+    destructive: true,
     body: CreateContainerRequest,
     responses: { 200: ContainerSummary },
   },
@@ -230,6 +232,7 @@ for (const verb of ['start', 'stop', 'restart', 'pause', 'unpause', 'kill']) {
     {
       summary: `${verb[0].toUpperCase()}${verb.slice(1)}`,
       admin: true,
+    destructive: true,
       params: IdParam,
       responses: { 200: ContainerSummary },
     },
@@ -250,6 +253,7 @@ r.delete(
   {
     summary: 'Remove a container',
     admin: true,
+    destructive: true,
     params: IdParam,
     query: RemoveQuery,
     responses: { 200: Type.Object({ removed: Type.String() }) },
