@@ -220,6 +220,49 @@ Filters: `since`, `until`, `actor`, `action` (glob: `container.*`, `*.bulk`, etc
 
 For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a path your log shipper watches (`vector` / `fluentbit` / `filebeat`) and disable in-process rotation with `AUDIT_MAX_BYTES=0`. The JSONL format is the lowest-common-denominator input for every aggregator we tested.
 
+## Container editing: live update, recreate, duplicate, rename
+
+Docker containers are largely immutable — once created, most settings can't change without recreating the container. The manager surfaces this honestly via three distinct workflows, each scoped to what's safely possible:
+
+| Action | Backend | What changes | Container ID | Logs |
+|---|---|---|---|---|
+| **Edit live** | `POST /api/containers/:id/update` | CPU / memory / restart policy / cpuset / pids / blkio (cgroup knobs only) | same | preserved |
+| **Rename** | `POST /api/containers/:id/rename` | name | same | preserved |
+| **Duplicate** | `POST /api/containers` | new container created with same settings; **original untouched** | new | n/a (new container) |
+| **Recreate** | `POST /api/containers/:id/recreate` (streamed text) | anything: image, env, ports, volumes, devices, GPUs, runtime, network… | **new** | **lost** |
+| Connect / disconnect networks | `POST /api/networks/:id/{connect,disconnect}` | network membership only | same | preserved |
+
+### Where to find them in the SPA
+
+- **Container row** → `⎘ Duplicate` (admin only).
+- **Container inspect modal** header → `✎ Rename`, `⎘ Duplicate`, `↺ Recreate`.
+  - `↺ Recreate` is disabled with a tooltip for **compose-managed containers** (those carrying `com.docker.compose.project`) — edit the stack file instead, otherwise the next `compose up` would overwrite your changes.
+- **Container inspect modal** → **Resources** tab → `✎ Edit live (no restart)` — opens a small modal prefilled from the current `HostConfig` with the cgroup knobs.
+
+### Recreate trade-offs (surfaced in the dialog banner + confirm modal)
+
+- Container ID **changes** — anything pinned to the ID elsewhere breaks.
+- Logs from the old container are **lost** (Docker drops them with the container).
+- Stats and uptime reset to 0.
+- **Named volumes survive** (`docker rm` without `-v`); anonymous volumes don't.
+- If `create` fails after `remove` succeeded, the original is gone. The dialog stays open with the form populated so you can fix and retry, and the backend streams the error inline.
+
+### Duplicate
+
+Identical to Run, except prefilled from another container's `inspect()`. The name is suggested as `<original>-copy` and is mandatory to edit (Docker rejects duplicate names). Compose project labels (`com.docker.compose.*`) are **stripped** from the prefill so the new container is a standalone — duplicating a compose-managed container shouldn't silently rejoin the stack.
+
+### Stack duplicate
+
+Stacks have a `⎘ Duplicate` button on the row (admin, managed stacks only) that opens the New Stack dialog prefilled with the existing `docker-compose.yml` + `.env`, name suggested as `<original>-copy`. Same CodeMirror editor with YAML highlighting that PR #10 added.
+
+### Lossy round-trip caveats
+
+When prefilling Recreate / Duplicate from inspect, a few fields don't round-trip perfectly:
+
+- **Env** includes the image's ENV defaults merged with run-time env vars. The dialog shows everything; editing them sets the new env explicitly (locking in the value even if the image is later updated). Trim aggressively if you want the image defaults to keep applying.
+- **Hostname** defaults to the container's short ID when not explicitly set on create. The prefill carries the old ID verbatim — clear it to let the new container get its own.
+- **NetworkSettings endpoint config** (per-network `DriverOpts`, `Aliases`, IPv4/IPv6 hints set via `/connect`) doesn't fully round-trip. Use the **Networks** tab on the inspect modal to reconnect with full control after recreate.
+
 ## GPUs & host devices
 
 **Any host device under `/dev` can be passed through to a container** — GPUs, audio, USB, serial, V4L2 cameras, ML accelerators, TPM, watchdog, block devices, framebuffers — the same surface as `docker run --device`. The Run dialog and System tab make the common targets discoverable so the operator doesn't need to SSH into the host to find paths.

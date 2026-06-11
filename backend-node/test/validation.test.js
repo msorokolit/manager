@@ -727,3 +727,76 @@ describe('Network schemas', () => {
     })).toBe(false);
   });
 });
+
+// ---------- ContainerLiveUpdateRequest ----------
+describe('ContainerLiveUpdateRequest', () => {
+  const v = (p) => valid(S.ContainerLiveUpdateRequest, p);
+
+  it('accepts every field individually', () => {
+    expect(v({ cpus: 1.5 })).toBe(true);
+    expect(v({ cpu_shares: 1024 })).toBe(true);
+    expect(v({ cpuset_cpus: '0-3' })).toBe(true);
+    expect(v({ mem_limit: '512m' })).toBe(true);
+    expect(v({ mem_limit: 67108864 })).toBe(true);
+    expect(v({ pids_limit: 100 })).toBe(true);
+    expect(v({ pids_limit: -1 })).toBe(true); // -1 = unlimited
+    expect(v({ blkio_weight: 500 })).toBe(true);
+    expect(v({ restart_policy: 'unless-stopped' })).toBe(true);
+    expect(v({ memswap_limit: -1 })).toBe(true);
+  });
+
+  it('empty body validates (route enforces "at least one field" itself)', () => {
+    expect(v({})).toBe(true);
+  });
+
+  it('rejects unknown fields (additionalProperties: false)', () => {
+    expect(v({ cpus: 1, image: 'nginx' })).toBe(false);   // can't change image live
+    expect(v({ env: { K: 'v' } })).toBe(false);
+    expect(v({ ports: { '80/tcp': 8080 } })).toBe(false);
+  });
+
+  it('rejects out-of-range cgroup values', () => {
+    expect(v({ cpu_shares: 1 })).toBe(false);       // minimum 2
+    expect(v({ cpu_shares: 300000 })).toBe(false);  // > 262144
+    expect(v({ blkio_weight: 9 })).toBe(false);     // minimum 10
+    expect(v({ blkio_weight: 1001 })).toBe(false);  // maximum 1000
+    expect(v({ pids_limit: -2 })).toBe(false);
+  });
+
+  it('cpuset_cpus regex rejects shell injection / non-digit/comma/dash', () => {
+    expect(v({ cpuset_cpus: '0-3' })).toBe(true);
+    expect(v({ cpuset_cpus: '0,2,4-7' })).toBe(true);
+    expect(v({ cpuset_cpus: '$(reboot)' })).toBe(false);
+    expect(v({ cpuset_cpus: '0; rm -rf /' })).toBe(false);
+  });
+
+  it('restart_policy is enum-bounded', () => {
+    expect(v({ restart_policy: 'no' })).toBe(true);
+    expect(v({ restart_policy: 'always' })).toBe(true);
+    expect(v({ restart_policy: 'never' })).toBe(false);
+    expect(v({ restart_policy: 'on-failure:5' })).toBe(false); // colon variant: use create instead
+  });
+});
+
+// ---------- ContainerRenameRequest ----------
+describe('ContainerRenameRequest', () => {
+  const v = (p) => valid(S.ContainerRenameRequest, p);
+
+  it('accepts Docker-shaped names', () => {
+    expect(v({ name: 'web-1' })).toBe(true);
+    expect(v({ name: 'my_app.v2' })).toBe(true);
+    expect(v({ name: '1starts-with-digit' })).toBe(true);
+  });
+
+  it('rejects empty / leading-dash / shell metachars', () => {
+    expect(v({ name: '' })).toBe(false);
+    expect(v({ name: '-bad' })).toBe(false);
+    expect(v({ name: 'has space' })).toBe(false);
+    expect(v({ name: 'has/slash' })).toBe(false);
+    expect(v({ name: '$(reboot)' })).toBe(false);
+  });
+
+  it('rejects extra fields (additionalProperties: false)', () => {
+    expect(v({ name: 'x', force: true })).toBe(false);
+  });
+});

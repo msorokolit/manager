@@ -18,7 +18,7 @@ vi.mock('../src/docker-client.js', () => ({
 }));
 
 const { _internals } = await import('../src/routes/containers.js');
-const { buildCreateOptions } = _internals;
+const { buildCreateOptions, buildUpdateOptions, memBytes } = _internals;
 
 describe('buildCreateOptions — devices', () => {
   it('translates host:container:perms strings into Devices entries', () => {
@@ -109,5 +109,75 @@ describe('buildCreateOptions — runtime', () => {
   it('omits Runtime when not specified (daemon picks DefaultRuntime)', () => {
     const out = buildCreateOptions({ image: 'cuda' });
     expect(out.HostConfig.Runtime).toBeUndefined();
+  });
+});
+
+// ============================================================
+// memBytes — used by both create and live-update paths
+// ============================================================
+
+describe('memBytes', () => {
+  it('parses k / m / g / t suffixes (case-insensitive)', () => {
+    expect(memBytes('512m')).toBe(512 * 1024 ** 2);
+    expect(memBytes('1g')).toBe(1024 ** 3);
+    expect(memBytes('2G')).toBe(2 * 1024 ** 3);
+    expect(memBytes('1.5g')).toBe(Math.floor(1.5 * 1024 ** 3));
+    expect(memBytes('512')).toBe(512); // plain bytes
+    expect(memBytes('1t')).toBe(1024 ** 4);
+  });
+
+  it('passes numbers through verbatim (already bytes)', () => {
+    expect(memBytes(67108864)).toBe(67108864);
+    expect(memBytes(0)).toBe(0);
+  });
+
+  it('returns undefined for empty / null / garbage so the field is skipped', () => {
+    expect(memBytes(null)).toBeUndefined();
+    expect(memBytes('')).toBeUndefined();
+    expect(memBytes(undefined)).toBeUndefined();
+    expect(memBytes('lol')).toBeUndefined();
+    expect(memBytes('$(echo 100)')).toBeUndefined();
+  });
+});
+
+// ============================================================
+// buildUpdateOptions — live-update translation
+// ============================================================
+
+describe('buildUpdateOptions', () => {
+  it('translates every supported knob to PascalCase', () => {
+    const out = buildUpdateOptions({
+      cpus: 1.5, cpu_shares: 1024, cpuset_cpus: '0-3',
+      mem_limit: '512m', mem_reservation: '256m', memswap_limit: '1g',
+      pids_limit: 200, blkio_weight: 500,
+      restart_policy: 'unless-stopped',
+    });
+    expect(out).toEqual({
+      NanoCpus: 1_500_000_000,
+      CpuShares: 1024,
+      CpusetCpus: '0-3',
+      Memory: 512 * 1024 ** 2,
+      MemoryReservation: 256 * 1024 ** 2,
+      MemorySwap: 1024 ** 3,
+      PidsLimit: 200,
+      BlkioWeight: 500,
+      RestartPolicy: { Name: 'unless-stopped' },
+    });
+  });
+
+  it('omits unset fields (daemon then leaves them untouched)', () => {
+    const out = buildUpdateOptions({ cpus: 2 });
+    expect(out).toEqual({ NanoCpus: 2_000_000_000 });
+    expect(out.Memory).toBeUndefined();
+    expect(out.RestartPolicy).toBeUndefined();
+  });
+
+  it('honours memswap_limit: -1 as "unlimited" (Docker convention)', () => {
+    const out = buildUpdateOptions({ memswap_limit: -1 });
+    expect(out.MemorySwap).toBe(-1);
+  });
+
+  it('empty body → empty payload (the route turns this into a 400)', () => {
+    expect(buildUpdateOptions({})).toEqual({});
   });
 });
