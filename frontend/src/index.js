@@ -1490,186 +1490,839 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Networks ----------
+  // ---------- Networks (Portainer-parity) ----------
+  //
+  // The list view enriches the daemon's bare `listNetworks` with stack
+  // ownership, IPAM subnets/gateways, attached containers (count and
+  // identity), and a `system` flag for predefined networks the user
+  // can't remove. Buttons that mutate are gated by the admin role.
   views.networks = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Networks',
       'Manage docker networks',
-      `${btn('+ Create network', { kind: 'primary', id: 'create-net' })}
-       ${btn('Prune unused', { kind: 'secondary', id: 'prune-nets' })}
+      `${isAdmin ? btn('+ Create network', { kind: 'primary', id: 'create-net' }) : ''}
+       ${isAdmin ? btn('Prune unused', { kind: 'secondary', id: 'prune-nets' }) : ''}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     );
-    const list = document.createElement('div'); root.appendChild(list);
 
-    async function load() {
-      list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
-      try {
-        const items = await api('/api/networks');
-        const rows = items.map((n) => `
+    // Controls bar: search + driver filter + system-toggle.
+    const controls = document.createElement('div');
+    controls.className = 'mb-3 flex flex-wrap items-center gap-2 text-xs';
+    controls.innerHTML = `
+      <input id="nets-search" type="text" placeholder="🔎 Search by name, subnet, stack, driver…"
+             class="flex-1 min-w-[240px] rounded border-slate-700 bg-slate-950 text-sm"/>
+      <select id="nets-driver" class="rounded border-slate-700 bg-slate-950 text-sm">
+        <option value="">All drivers</option>
+        <option value="bridge">bridge</option>
+        <option value="overlay">overlay</option>
+        <option value="macvlan">macvlan</option>
+        <option value="ipvlan">ipvlan</option>
+        <option value="host">host</option>
+        <option value="null">null</option>
+      </select>
+      <label class="flex items-center gap-2 text-slate-300">
+        <input id="nets-system" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"/>
+        Show system networks (bridge / host / none)
+      </label>
+      <span id="nets-count" class="text-slate-500 ml-auto"></span>
+    `;
+    root.appendChild(controls);
+
+    const bulk = document.createElement('div');
+    bulk.id = 'nets-bulk';
+    bulk.className = 'mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs';
+    bulk.innerHTML = `
+      <span><span id="nets-bulk-count" class="font-semibold text-sky-200">0</span> selected</span>
+      <div class="flex items-center gap-2">
+        ${isAdmin ? `<button id="nets-bulk-rm" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1">✕ Delete selected</button>` : ''}
+        <button id="nets-bulk-clear" class="rounded bg-slate-800 hover:bg-slate-700 px-2 py-1 border border-slate-700 text-slate-300">Clear</button>
+      </div>`;
+    root.appendChild(bulk);
+
+    const listEl = document.createElement('div'); root.appendChild(listEl);
+
+    let lastNetworks = [];
+    // System networks are off by default — they're the noisy ones the
+    // operator usually doesn't care about.
+    let showSystem = false;
+    // Selection survives filter changes. Only dropped when a network
+    // actually disappears from the underlying list (e.g. after a
+    // successful delete).
+    const selected = new Set();
+
+    function visibleNetworks() {
+      const q = controls.querySelector('#nets-search').value.trim().toLowerCase();
+      const driverFilter = controls.querySelector('#nets-driver').value;
+      return lastNetworks.filter((n) => {
+        if (!showSystem && n.system) return false;
+        if (driverFilter && n.driver !== driverFilter) return false;
+        if (q) {
+          const hay = (n.name + ' ' + (n.driver || '') + ' ' + (n.stack || '') + ' ' +
+                       (n.subnets || []).join(' ')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function renderBulkBar() {
+      if (selected.size === 0) {
+        bulk.classList.add('hidden'); bulk.classList.remove('flex'); return;
+      }
+      bulk.classList.remove('hidden'); bulk.classList.add('flex');
+      bulk.querySelector('#nets-bulk-count').textContent = String(selected.size);
+    }
+
+    function renderRows() {
+      const nets = visibleNetworks();
+      controls.querySelector('#nets-count').textContent =
+        `${nets.length} of ${lastNetworks.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+
+      if (lastNetworks.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No networks on this host.</div>`;
+        return;
+      }
+      if (nets.length === 0) {
+        listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">No networks match the current filters.</div>`;
+        return;
+      }
+
+      const rows = nets.map((n) => {
+        const subnetCell = n.subnets && n.subnets.length
+          ? n.subnets.map((s) => `<code class="text-[11px] text-slate-300 font-mono">${escapeHtml(s)}</code>`).join('<br>')
+          : '<span class="text-slate-600">—</span>';
+        const stackCell = n.stack
+          ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(n.stack)}</a>`
+          : '<span class="text-slate-600">—</span>';
+        // System-network row: greyed out + no checkbox (can't be
+        // bulk-deleted) + a "system" badge so it's obvious why.
+        const sysBadge = n.system
+          ? `<span class="ml-1 inline-flex items-center rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">system</span>`
+          : '';
+        const inUseBadge = n.in_use
+          ? `<span class="ml-1 inline-flex items-center rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300" title="${escapeHtml(n.used_by.map((u) => u.container_name + ' · ' + (u.ipv4 || u.ipv6 || '?')).join(', '))}">${n.containers_count} attached</span>`
+          : `<span class="ml-1 inline-flex items-center rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">unused</span>`;
+        const isChecked = selected.has(n.id) ? 'checked' : '';
+        const canCheck = isAdmin && !n.system;
+        return `
           <tr class="hover:bg-slate-900/60">
-            <td class="px-4 py-2">
-              <div class="font-medium">${escapeHtml(n.name)}</div>
-              <div class="text-[11px] text-slate-500 font-mono">${shortId(n.id)}</div>
+            <td class="px-3 py-2 w-8">
+              ${canCheck ? `<input type="checkbox" class="nets-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-id="${escapeHtml(n.id)}" ${isChecked}/>` : ''}
             </td>
-            <td class="px-4 py-2 text-slate-300">${escapeHtml(n.driver || '')}</td>
-            <td class="px-4 py-2 text-slate-300">${escapeHtml(n.scope || '')}</td>
-            <td class="px-4 py-2 text-slate-400">${n.containers.length}</td>
+            <td class="px-4 py-2">
+              <div class="font-medium">${escapeHtml(n.name)}${sysBadge}${inUseBadge}</div>
+              <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(n.short_id)}</div>
+            </td>
+            <td class="px-4 py-2 text-slate-300">${escapeHtml(n.driver)} <span class="text-[10px] text-slate-500">(${escapeHtml(n.scope)})</span></td>
+            <td class="px-4 py-2 text-slate-300">${stackCell}</td>
+            <td class="px-4 py-2 text-slate-300 align-top">${subnetCell}</td>
+            <td class="px-4 py-2 text-slate-400">${n.containers_count}</td>
+            <td class="px-4 py-2 text-slate-400">${fmtDate(n.created)}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                <button data-act="inspect" data-id="${n.id}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
-                <button data-act="remove" data-id="${n.id}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                <button data-act="inspect" data-id="${escapeHtml(n.id)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
+                ${isAdmin && !n.system ? `<button data-act="remove" data-id="${escapeHtml(n.id)}" data-name="${escapeHtml(n.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = table(['Name', 'Driver', 'Scope', 'Containers', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      listEl.innerHTML = table(
+        [
+          `<input id="nets-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all visible"/>`,
+          'Name', 'Driver', 'Stack', 'Subnet', 'Containers', 'Created', '',
+        ],
+        rows,
+      );
+
+      const cb = listEl.querySelector('#nets-select-all');
+      if (cb) {
+        const eligible = nets.filter((n) => !n.system);
+        const onPage = eligible.filter((n) => selected.has(n.id)).length;
+        cb.checked = eligible.length > 0 && onPage === eligible.length;
+        cb.indeterminate = onPage > 0 && onPage < eligible.length;
+        cb.addEventListener('change', (e) => {
+          if (e.target.checked) for (const n of eligible) selected.add(n.id);
+          else for (const n of eligible) selected.delete(n.id);
+          renderRows(); renderBulkBar();
+        });
       }
     }
 
-    list.addEventListener('click', async (e) => {
+    async function load() {
+      listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        lastNetworks = await api('/api/networks');
+        for (const id of [...selected]) {
+          if (!lastNetworks.some((n) => n.id === id)) selected.delete(id);
+        }
+        renderRows(); renderBulkBar();
+      } catch (e) {
+        listEl.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // ---- Event wiring ----
+    controls.querySelector('#nets-search').addEventListener('input', () => renderRows());
+    controls.querySelector('#nets-driver').addEventListener('change', () => renderRows());
+    controls.querySelector('#nets-system').addEventListener('change', (e) => {
+      showSystem = e.target.checked; renderRows();
+    });
+
+    listEl.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.nets-check');
+      if (!cb) return;
+      if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+      renderBulkBar();
+      controls.querySelector('#nets-count').textContent =
+        `${visibleNetworks().length} of ${lastNetworks.length} shown` +
+        (selected.size ? ` · ${selected.size} selected` : '');
+      const all = listEl.querySelector('#nets-select-all');
+      if (all) {
+        const nets = visibleNetworks().filter((n) => !n.system);
+        const onPage = nets.filter((n) => selected.has(n.id)).length;
+        all.checked = nets.length > 0 && onPage === nets.length;
+        all.indeterminate = onPage > 0 && onPage < nets.length;
+      }
+    });
+
+    bulk.querySelector('#nets-bulk-clear').onclick = () => { selected.clear(); renderRows(); renderBulkBar(); };
+    const bulkRmBtn = bulk.querySelector('#nets-bulk-rm');
+    if (bulkRmBtn) bulkRmBtn.onclick = async () => {
+      const ids = [...selected];
+      if (!ids.length) return;
+      const ok = await confirmModal(
+        `Delete <strong>${ids.length}</strong> network${ids.length === 1 ? '' : 's'}? Containers connected to any of them will lose connectivity on the next reconnect.`,
+        { danger: true, confirmLabel: 'Delete all' },
+      );
+      if (!ok) return;
+      try {
+        const out = await api('/api/networks/delete/bulk', {
+          method: 'POST', body: JSON.stringify({ ids }),
+        });
+        for (const r of out.results || []) {
+          if (!r.ok) toast(`${r.id.slice(0, 12)}: ${r.error || 'failed'}`, 'error');
+        }
+        if (out.succeeded) {
+          toast(`Deleted ${out.succeeded}${out.failed ? ` of ${ids.length}` : ''}`, out.failed ? 'warn' : 'success');
+        }
+      } catch (e) { toast(`Bulk delete failed: ${e.message}`, 'error'); }
+      selected.clear();
+      load();
+    };
+
+    async function removeNetwork(id, name) {
+      const ok = await confirmModal(
+        `Remove network <code>${escapeHtml(name || id.slice(0, 12))}</code>?`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!ok) return;
+      try {
+        await api(`/api/networks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        toast('Network removed', 'success'); load();
+      } catch (e) {
+        // The backend translates the daemon's 403 ("in use") to 409.
+        // We don't offer a force-remove for networks because Docker
+        // doesn't have one — the path forward is "disconnect the
+        // containers first", so we surface that as part of the error.
+        toast(e.message, 'error');
+      }
+    }
+
+    listEl.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
       const id = t.dataset.id; const act = t.dataset.act;
       try {
-        if (act === 'inspect') {
-          await openNetworkDialog(id);
-          load();
-        } else if (act === 'remove') {
-          const ok = await confirmModal('Remove this network?', { danger: true, confirmLabel: 'Remove' });
-          if (!ok) return;
-          await api(`/api/networks/${id}`, { method: 'DELETE' });
-          toast('Network removed', 'success'); load();
-        }
+        if (act === 'inspect') await openNetworkInspect(id, () => load());
+        else if (act === 'remove') await removeNetwork(id, t.dataset.name);
       } catch (ex) { toast(ex.message, 'error'); }
     });
 
     document.getElementById('refresh').onclick = load;
-    document.getElementById('prune-nets').onclick = async () => {
-      const ok = await confirmModal('Prune unused networks?', { danger: true, confirmLabel: 'Prune' });
+    const pruneBtn = document.getElementById('prune-nets');
+    if (pruneBtn) pruneBtn.onclick = async () => {
+      const ok = await confirmModal('Prune unused networks (no containers attached)?', { danger: true, confirmLabel: 'Prune' });
       if (!ok) return;
-      try { await api('/api/networks/prune', { method: 'POST' }); toast('Pruned', 'success'); load(); }
-      catch (e) { toast(e.message, 'error'); }
+      try {
+        const r = await api('/api/networks/prune', { method: 'POST' });
+        const n = (r.NetworksDeleted || []).length;
+        toast(`Pruned ${n} network${n === 1 ? '' : 's'}`, 'success');
+        load();
+      } catch (e) { toast(e.message, 'error'); }
     };
-    document.getElementById('create-net').onclick = async () => {
-      const wrap = document.createElement('div');
-      wrap.innerHTML = `
-        <div class="grid gap-3 md:grid-cols-2">
-          <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Name *</span>
-            <input id="n-name" required class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
-          <label class="block"><span class="text-xs text-slate-400">Driver</span>
-            <select id="n-driver" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
-              <option value="bridge">bridge</option><option value="overlay">overlay</option>
-              <option value="macvlan">macvlan</option><option value="ipvlan">ipvlan</option><option value="host">host</option>
-            </select></label>
-          <label class="flex items-center gap-2 text-xs text-slate-300 mt-6">
-            <input id="n-internal" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Internal
-          </label>
-        </div>`;
-      const ok = await modal({
-        title: 'Create network',
-        body: wrap, size: 'md',
-        actions: [
-          { label: 'Cancel', value: false, kind: 'secondary' },
-          { label: 'Create', kind: 'primary', value: true, onClick: async () => {
-            const payload = {
-              name: wrap.querySelector('#n-name').value.trim(),
-              driver: wrap.querySelector('#n-driver').value,
-              internal: wrap.querySelector('#n-internal').checked,
-            };
-            if (!payload.name) return false;
-            try { await api('/api/networks', { method: 'POST', body: JSON.stringify(payload) }); toast('Network created', 'success'); }
-            catch (e) { toast(e.message, 'error'); return false; }
-          }},
-        ],
-      });
-      if (ok) load();
+
+    const createBtn = document.getElementById('create-net');
+    if (createBtn) createBtn.onclick = async () => {
+      const created = await openCreateNetworkDialog();
+      // #28-style: prepend the enriched echo when we have it; otherwise
+      // fall back to a list reload.
+      if (created) {
+        lastNetworks = [created, ...lastNetworks];
+        renderRows(); renderBulkBar();
+      }
     };
 
     await load();
   };
 
-  async function openNetworkDialog(networkId) {
-    let data;
-    try { data = await api(`/api/networks/${networkId}`); }
-    catch (e) { toast(e.message, 'error'); return; }
-
-    const containers = Object.entries(data.Containers || {});
+  /**
+   * Create-network wizard. Mirrors Portainer's add-network screen:
+   * basic fields + multiple IPAM configs + driver options + labels.
+   * Returns the enriched NetworkSummary the backend echoed on success,
+   * or null on cancel / failure.
+   */
+  async function openCreateNetworkDialog() {
     const wrap = document.createElement('div');
     wrap.innerHTML = `
-      <div class="grid gap-4 md:grid-cols-2">
-        <div>
-          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Connected containers</h4>
-          <div id="conn-list" class="space-y-2"></div>
-          <div class="mt-4 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
-            <h5 class="mb-2 text-xs font-semibold text-slate-300">Connect a container</h5>
-            <div class="grid gap-2">
-              <label class="block"><span class="text-[11px] text-slate-400">Container ID or name</span>
-                <input id="cn-cont" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
-              <label class="block"><span class="text-[11px] text-slate-400">Aliases (comma-separated, optional)</span>
-                <input id="cn-aliases" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
-              <label class="block"><span class="text-[11px] text-slate-400">IPv4 address (optional)</span>
-                <input id="cn-ipv4" placeholder="172.20.0.10" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
-              <button id="cn-go" class="mt-1 rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-xs font-medium">Connect</button>
-            </div>
-          </div>
+      <div class="grid gap-3">
+        <div class="grid gap-3 md:grid-cols-2">
+          <label class="md:col-span-2 block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">Name *</span>
+            <input id="n-name" required class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"
+                   placeholder="my-app-net" />
+            <span class="block mt-1 text-[11px] text-slate-500">Letters / digits / <code>_</code> <code>-</code> <code>.</code>; must start with a letter or digit.</span>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">Driver</span>
+            <select id="n-driver" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+              <option value="bridge">bridge (default; single-host)</option>
+              <option value="overlay">overlay (swarm; multi-host)</option>
+              <option value="macvlan">macvlan</option>
+              <option value="ipvlan">ipvlan</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">Scope</span>
+            <input value="local" disabled class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm text-slate-500" />
+            <span class="block mt-1 text-[11px] text-slate-500">Scope is inferred from the driver (overlay → swarm).</span>
+          </label>
         </div>
+
+        <div class="flex flex-wrap gap-4 rounded border border-slate-800 bg-slate-900/40 p-3 text-xs">
+          <label class="flex items-center gap-2 text-slate-300">
+            <input id="n-attachable" type="checkbox" checked class="rounded border-slate-700 bg-slate-950 text-sky-500"/>
+            Attachable
+            <span class="text-slate-500">(let standalone containers connect)</span>
+          </label>
+          <label class="flex items-center gap-2 text-slate-300">
+            <input id="n-internal" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/>
+            Internal
+            <span class="text-slate-500">(no external connectivity)</span>
+          </label>
+          <label class="flex items-center gap-2 text-slate-300">
+            <input id="n-ipv6" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/>
+            Enable IPv6
+          </label>
+        </div>
+
         <div>
-          <h4 class="mb-2 text-xs uppercase tracking-wider text-slate-400">Inspect</h4>
-          <div id="inspect-host"></div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs uppercase tracking-wider text-slate-400">IPAM configurations</span>
+            <button type="button" id="n-add-ipam" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">+ Add subnet</button>
+          </div>
+          <p class="mb-2 text-[11px] text-slate-500">Optional. Leave empty to let Docker auto-assign. One row per subnet — typical use is one IPv4 row, plus one IPv6 row when "Enable IPv6" is on.</p>
+          <div id="n-ipam-list" class="space-y-2"></div>
+        </div>
+
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-400">Driver options</span>
+          <textarea id="n-driveropts" rows="3" placeholder="parent=eth0&#10;com.docker.network.bridge.name=br-myapp"
+                    class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea>
+          <span class="block mt-1 text-[11px] text-slate-500"><code>KEY=VALUE</code> per line; driver-specific.</span>
+        </label>
+
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-400">Labels</span>
+          <textarea id="n-labels" rows="3" placeholder="owner=team-a&#10;tier=prod"
+                    class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"></textarea>
+          <span class="block mt-1 text-[11px] text-slate-500"><code>KEY=VALUE</code> per line; freely-chosen metadata.</span>
+        </label>
+      </div>`;
+
+    function parseKv(text) {
+      const out = {};
+      for (const raw of (text || '').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        const k = line.slice(0, eq).trim();
+        const v = line.slice(eq + 1).trim();
+        if (k) out[k] = v;
+      }
+      return out;
+    }
+
+    const ipamListEl = wrap.querySelector('#n-ipam-list');
+    function addIpamRow(initial = {}) {
+      const row = document.createElement('div');
+      row.className = 'grid grid-cols-12 gap-2 rounded border border-slate-800 bg-slate-950/40 p-2 text-xs';
+      row.innerHTML = `
+        <label class="col-span-4 block">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">Subnet (CIDR)</span>
+          <input data-f="subnet" placeholder="172.20.0.0/16" class="mt-0.5 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono" />
+        </label>
+        <label class="col-span-3 block">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">Gateway</span>
+          <input data-f="gateway" placeholder="172.20.0.1" class="mt-0.5 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono" />
+        </label>
+        <label class="col-span-3 block">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">IP range</span>
+          <input data-f="ip_range" placeholder="172.20.10.0/24" class="mt-0.5 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono" />
+        </label>
+        <div class="col-span-2 flex items-end justify-end">
+          <button type="button" data-f="rm" class="rounded bg-slate-800 hover:bg-rose-500 hover:text-white border border-slate-700 px-2 py-1 text-slate-300">Remove</button>
+        </div>`;
+      for (const k of ['subnet', 'gateway', 'ip_range']) {
+        const inp = row.querySelector(`[data-f="${k}"]`);
+        if (initial[k]) inp.value = initial[k];
+      }
+      row.querySelector('[data-f="rm"]').onclick = () => row.remove();
+      ipamListEl.appendChild(row);
+    }
+    wrap.querySelector('#n-add-ipam').onclick = () => addIpamRow();
+
+    function collectIpamConfig() {
+      const rows = [...ipamListEl.querySelectorAll(':scope > div')];
+      return rows
+        .map((row) => ({
+          subnet: row.querySelector('[data-f="subnet"]').value.trim(),
+          gateway: row.querySelector('[data-f="gateway"]').value.trim(),
+          ip_range: row.querySelector('[data-f="ip_range"]').value.trim(),
+        }))
+        .filter((c) => c.subnet || c.gateway || c.ip_range)
+        .map((c) => {
+          const out = {};
+          if (c.subnet) out.subnet = c.subnet;
+          if (c.gateway) out.gateway = c.gateway;
+          if (c.ip_range) out.ip_range = c.ip_range;
+          return out;
+        });
+    }
+
+    let created = null;
+    const ok = await modal({
+      title: 'Create network', body: wrap, size: 'lg',
+      actions: [
+        { label: 'Cancel', value: false, kind: 'secondary' },
+        { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+          const name = wrap.querySelector('#n-name').value.trim();
+          if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(name)) {
+            toast('Invalid name: must start with a letter or digit and contain only [A-Za-z0-9_.-]', 'warn');
+            return false;
+          }
+          const ipamConfig = collectIpamConfig();
+          const payload = {
+            name,
+            driver: wrap.querySelector('#n-driver').value,
+            internal: wrap.querySelector('#n-internal').checked,
+            attachable: wrap.querySelector('#n-attachable').checked,
+            enable_ipv6: wrap.querySelector('#n-ipv6').checked,
+            driver_opts: parseKv(wrap.querySelector('#n-driveropts').value),
+            labels: parseKv(wrap.querySelector('#n-labels').value),
+          };
+          // Only attach the `ipam` field when the user actually filled
+          // something in; otherwise the daemon picks defaults.
+          if (ipamConfig.length) payload.ipam = { config: ipamConfig };
+          try {
+            created = await api('/api/networks', {
+              method: 'POST', body: JSON.stringify(payload),
+            });
+            toast('Network created', 'success');
+          } catch (e) { toast(e.message, 'error'); return false; }
+        }},
+      ],
+    });
+    return (ok && created) ? created : null;
+  }
+
+  /**
+   * Tabbed inspect modal: Overview / Containers / IPAM / Options /
+   * Labels / Raw. Mirrors the volume inspect's structure so the SPA's
+   * inspect UX is consistent across resource types.
+   */
+  async function openNetworkInspect(networkId, onChange) {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
+    let data;
+    try { data = await api(`/api/networks/${encodeURIComponent(networkId)}`); }
+    catch (e) { toast(e.message, 'error'); return; }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'flex flex-col gap-3';
+    wrap.innerHTML = `
+      <div class="flex flex-wrap items-center gap-2 text-xs border-b border-slate-800 pb-2">
+        ${['overview','containers','ipam','options','labels','raw'].map((t, i) => `
+          <button data-tab="${t}" class="ni-tab rounded px-2 py-1 ${i===0?'bg-sky-500/20 text-sky-300':'text-slate-400 hover:bg-slate-800'}">${
+            {overview:'Overview', containers:`Containers (${data.containers_count})`, ipam:'IPAM', options:'Options', labels:'Labels', raw:'Raw'}[t]
+          }</button>
+        `).join('')}
+        <span class="ml-auto flex items-center gap-1">
+          ${data.system ? `<span class="rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">system</span>` : ''}
+          ${data.in_use
+            ? `<span class="rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">${data.containers_count} attached</span>`
+            : `<span class="rounded bg-slate-700/40 px-2 py-0.5 text-[11px] font-medium text-slate-400">unused</span>`}
+        </span>
+      </div>
+      <div id="ni-panel" class="min-h-[40vh]"></div>`;
+
+    const panel = wrap.querySelector('#ni-panel');
+
+    function fieldRow(label, value, opts = {}) {
+      return `
+        <div class="grid grid-cols-[10rem_1fr] gap-3 py-1.5 border-b border-slate-800/50">
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 self-start mt-0.5">${escapeHtml(label)}</div>
+          <div class="text-sm ${opts.mono ? 'font-mono text-slate-300' : 'text-slate-200'}">${value}</div>
+        </div>`;
+    }
+    function copyButton(text, label = 'copy') {
+      return `<button data-copy="${escapeHtml(text)}" class="ml-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300">${label}</button>`;
+    }
+    function flagBadge(on, onText, offText) {
+      return on
+        ? `<span class="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">${onText}</span>`
+        : `<span class="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">${offText}</span>`;
+    }
+
+    function renderOverview() {
+      const stackLink = data.stack
+        ? `<a href="#stacks" class="text-sky-300 hover:underline">${escapeHtml(data.stack)}</a>`
+        : '<span class="text-slate-500">—</span>';
+      panel.innerHTML = `
+        <div class="space-y-1">
+          ${fieldRow('Name', `<code class="text-slate-100">${escapeHtml(data.name)}</code>${copyButton(data.name)}`)}
+          ${fieldRow('ID', `<code class="text-slate-300 font-mono text-[11px]">${escapeHtml(data.id)}</code>${copyButton(data.id, 'copy full')}`)}
+          ${fieldRow('Driver', `${escapeHtml(data.driver)} <span class="text-[11px] text-slate-500">(${escapeHtml(data.scope)})</span>`, { mono: true })}
+          ${fieldRow('Stack (owner)', stackLink)}
+          ${fieldRow('Created', escapeHtml(fmtDate(data.created)))}
+          ${fieldRow('Flags', `
+            ${flagBadge(data.internal, 'internal', 'external')}
+            ${flagBadge(data.attachable, 'attachable', 'not attachable')}
+            ${flagBadge(data.enable_ipv6, 'IPv6 on', 'IPv6 off')}
+            ${data.system ? `<span class="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400">system</span>` : ''}
+          `)}
+          ${fieldRow('IPAM driver', `<code class="text-slate-300">${escapeHtml(data.ipam_driver)}</code>`)}
+          ${fieldRow('Subnets', data.subnets.length
+            ? data.subnets.map((s, i) => `<code class="text-slate-300 font-mono text-[12px]">${escapeHtml(s)}</code>${data.gateways[i] ? ` <span class="text-slate-500 text-[11px]">→ ${escapeHtml(data.gateways[i])}</span>` : ''}`).join('<br>')
+            : '<span class="text-slate-500">—</span>')}
+        </div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          ${isAdmin && !data.system ? `<button id="ni-connect" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-1.5 text-sm font-medium">+ Connect container</button>` : ''}
+          ${isAdmin && !data.system ? `<button id="ni-remove" class="rounded bg-rose-500 hover:bg-rose-400 text-white px-3 py-1.5 text-sm font-medium">Remove network</button>` : ''}
+          ${data.system ? `<p class="text-xs text-slate-500">Predefined daemon network — Docker does not allow removal.</p>` : ''}
+        </div>`;
+
+      const conn = panel.querySelector('#ni-connect');
+      if (conn) conn.onclick = async () => {
+        const ok = await openConnectContainerDialog(networkId, data.name);
+        if (ok) await refresh(); // reflect the new attachment
+      };
+      const rm = panel.querySelector('#ni-remove');
+      if (rm) rm.onclick = async () => {
+        const ok = await confirmModal(
+          `Remove network <code>${escapeHtml(data.name)}</code>?` +
+          (data.in_use ? `<br><br><span class="text-amber-300">⚠ ${data.containers_count} container(s) are currently attached and will lose connectivity.</span>` : ''),
+          { danger: true, confirmLabel: 'Remove' },
+        );
+        if (!ok) return;
+        try {
+          await api(`/api/networks/${encodeURIComponent(networkId)}`, { method: 'DELETE' });
+          toast('Network removed', 'success');
+          if (onChange) onChange();
+          modalRef.close && modalRef.close(null);
+        } catch (ex) { toast(ex.message, 'error'); }
+      };
+    }
+
+    function renderContainers() {
+      if (!data.used_by || !data.used_by.length) {
+        panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">No containers attached.</div>`;
+        return;
+      }
+      const rows = data.used_by.map((u) => `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-4 py-2">
+            <div class="font-medium"><code class="text-slate-100">${escapeHtml(u.container_name)}</code></div>
+            <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(u.container_id.slice(0, 12))}</div>
+          </td>
+          <td class="px-4 py-2 font-mono text-xs text-slate-300">${escapeHtml(u.ipv4 || '—')}</td>
+          <td class="px-4 py-2 font-mono text-xs text-slate-300">${escapeHtml(u.ipv6 || '—')}</td>
+          <td class="px-4 py-2 font-mono text-xs text-slate-400">${escapeHtml(u.mac || '—')}</td>
+          <td class="px-4 py-2 text-xs text-slate-400">${u.aliases && u.aliases.length ? u.aliases.map((a) => `<code class="text-slate-300">${escapeHtml(a)}</code>`).join(', ') : '<span class="text-slate-600">—</span>'}</td>
+          <td class="px-4 py-2 text-right">
+            ${isAdmin ? `<button data-act="disconnect" data-cid="${escapeHtml(u.container_id)}" data-cname="${escapeHtml(u.container_name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Disconnect</button>` : ''}
+          </td>
+        </tr>`).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">${data.containers_count} container${data.containers_count === 1 ? '' : 's'} attached.</p>
+        <table class="w-full text-left text-sm">
+          <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="px-4 py-2">Container</th><th class="px-4 py-2">IPv4</th><th class="px-4 py-2">IPv6</th><th class="px-4 py-2">MAC</th><th class="px-4 py-2">Aliases</th><th class="px-4 py-2 text-right">Actions</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+      panel.querySelectorAll('[data-act="disconnect"]').forEach((b) => {
+        b.onclick = () => disconnectContainer(b.dataset.cid, b.dataset.cname);
+      });
+    }
+
+    function renderIpam() {
+      const cfg = data.ipam && Array.isArray(data.ipam.config) ? data.ipam.config : [];
+      const optRows = Object.entries((data.ipam && data.ipam.options) || {}).map(([k, v]) =>
+        `<tr><td class="pr-3 py-0.5 text-slate-400 font-mono text-[11px]">${escapeHtml(k)}</td><td class="font-mono text-[11px] text-slate-200">${escapeHtml(String(v))}</td></tr>`,
+      ).join('');
+      if (!cfg.length && !optRows) {
+        panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">No IPAM configuration. Docker auto-assigned this network's subnet.</div>`;
+        return;
+      }
+      const cfgRows = cfg.map((c) => {
+        const aux = c.aux_addresses && Object.keys(c.aux_addresses).length
+          ? Object.entries(c.aux_addresses).map(([k, v]) => `<code class="text-[11px] text-slate-300">${escapeHtml(k)}=${escapeHtml(v)}</code>`).join(', ')
+          : '<span class="text-slate-600">—</span>';
+        return `
+          <tr class="hover:bg-slate-900/60">
+            <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.subnet || '—')}</td>
+            <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.gateway || '—')}</td>
+            <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.ip_range || '—')}</td>
+            <td class="px-4 py-2">${aux}</td>
+          </tr>`;
+      }).join('');
+      panel.innerHTML = `
+        <div class="mb-3 text-xs text-slate-400">IPAM driver: <code class="text-slate-200">${escapeHtml(data.ipam_driver)}</code></div>
+        ${cfg.length ? `
+          <table class="w-full text-left text-sm mb-4">
+            <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+              <tr><th class="px-4 py-2">Subnet</th><th class="px-4 py-2">Gateway</th><th class="px-4 py-2">IP range</th><th class="px-4 py-2">Auxiliary addresses</th></tr>
+            </thead>
+            <tbody>${cfgRows}</tbody>
+          </table>` : ''}
+        ${optRows ? `
+          <div class="mb-1 text-[11px] uppercase tracking-wider text-slate-500">IPAM driver options</div>
+          <table class="rounded border border-slate-800 bg-slate-950/40 p-2"><tbody>${optRows}</tbody></table>` : ''}`;
+    }
+
+    function renderOptions() {
+      const entries = Object.entries(data.options || {});
+      if (!entries.length) {
+        panel.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">No driver-specific options.</div>`;
+        return;
+      }
+      const rows = entries.map(([k, v]) => `
+        <tr class="border-b border-slate-800/60">
+          <td class="px-3 py-1 align-top font-mono text-xs text-slate-300 break-all">${escapeHtml(k)}</td>
+          <td class="px-3 py-1 align-top font-mono text-xs text-slate-200 break-all">${escapeHtml(String(v))}</td>
+        </tr>`).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">Driver-specific options applied at create time. These can't be changed once the network exists.</p>
+        <table class="w-full text-left">
+          <thead class="text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="w-1/3 px-3 py-1">Key</th><th class="px-3 py-1">Value</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function renderLabels() {
+      const keys = Object.keys(data.labels || {}).sort();
+      const rows = keys.map((k) => `
+        <tr class="border-b border-slate-800/60">
+          <td class="px-3 py-1 align-top font-mono text-xs text-slate-300 break-all">${escapeHtml(k)}</td>
+          <td class="px-3 py-1 align-top font-mono text-xs text-slate-200 break-all">${escapeHtml(data.labels[k])}</td>
+        </tr>`).join('');
+      panel.innerHTML = `
+        <p class="mb-2 text-xs text-slate-500">Network labels are set at create time and can only be replaced by re-creating the network.</p>
+        <table class="w-full text-left">
+          <thead class="text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="w-1/3 px-3 py-1">Key</th><th class="px-3 py-1">Value</th></tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="2" class="px-3 py-4 text-center text-xs text-slate-500">No labels</td></tr>'}</tbody>
+        </table>`;
+    }
+
+    function renderRaw() {
+      panel.innerHTML = '';
+      panel.appendChild(jsonView(data.raw || {}));
+    }
+
+    const renderers = {
+      overview: renderOverview, containers: renderContainers, ipam: renderIpam,
+      options: renderOptions, labels: renderLabels, raw: renderRaw,
+    };
+    function activate(tab) {
+      wrap.querySelectorAll('.ni-tab').forEach((b) => {
+        const active = b.dataset.tab === tab;
+        b.classList.toggle('bg-sky-500/20', active);
+        b.classList.toggle('text-sky-300', active);
+        b.classList.toggle('text-slate-400', !active);
+      });
+      (renderers[tab] || renderOverview)();
+    }
+    wrap.addEventListener('click', (e) => {
+      const t = e.target.closest('.ni-tab');
+      if (t) activate(t.dataset.tab);
+      const copy = e.target.closest('[data-copy]');
+      if (copy) {
+        try { navigator.clipboard.writeText(copy.dataset.copy); toast('Copied', 'success'); }
+        catch { /* ignore */ }
+      }
+    });
+
+    async function disconnectContainer(cid, cname) {
+      const ok = await confirmModal(
+        `Disconnect <code>${escapeHtml(cname || cid.slice(0, 12))}</code> from <code>${escapeHtml(data.name)}</code>?`,
+        { danger: true, confirmLabel: 'Disconnect' },
+      );
+      if (!ok) return;
+      try {
+        await api(`/api/networks/${encodeURIComponent(networkId)}/disconnect`, {
+          method: 'POST', body: JSON.stringify({ container: cid, force: false }),
+        });
+        toast('Disconnected', 'success');
+        await refresh();
+      } catch (e) {
+        // 409 = stuck endpoint; offer the force path.
+        if (e.status === 409) {
+          const forceOk = await confirmModal(
+            `Disconnect failed: <code>${escapeHtml(e.message)}</code>.<br><br>` +
+            `Force-disconnect drops the endpoint without asking the container — the container will see a network error on its next packet. Continue with <strong>force=true</strong>?`,
+            { danger: true, confirmLabel: 'Force disconnect' },
+          );
+          if (!forceOk) return;
+          try {
+            await api(`/api/networks/${encodeURIComponent(networkId)}/disconnect`, {
+              method: 'POST', body: JSON.stringify({ container: cid, force: true }),
+            });
+            toast('Force-disconnected', 'warn');
+            await refresh();
+          } catch (ex) { toast(ex.message, 'error'); }
+        } else {
+          toast(e.message, 'error');
+        }
+      }
+    }
+
+    async function refresh() {
+      try {
+        const fresh = await api(`/api/networks/${encodeURIComponent(networkId)}`);
+        Object.assign(data, fresh);
+        // Rebuild the Containers tab counter on the tab button itself.
+        const cBtn = wrap.querySelector('.ni-tab[data-tab="containers"]');
+        if (cBtn) cBtn.textContent = `Containers (${data.containers_count})`;
+        // Re-render whichever tab is active.
+        const active = wrap.querySelector('.ni-tab.bg-sky-500\\/20');
+        activate((active && active.dataset.tab) || 'overview');
+        if (onChange) onChange();
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    const modalRef = {};
+    activate('overview');
+    await modal({ title: `Network: ${data.name}`, body: wrap, size: 'xl', ref: modalRef });
+  }
+
+  /**
+   * "Connect container" dialog. The container picker is populated from
+   * /api/containers so the admin doesn't have to remember IDs; manual
+   * entry is still allowed for cases like "container created by an
+   * external tool I didn't list".
+   */
+  async function openConnectContainerDialog(networkId, networkName) {
+    let containers = [];
+    try { containers = await api('/api/containers?all=true'); }
+    catch { /* fall back to manual entry only */ }
+
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div class="grid gap-3">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-400">Container *</span>
+          <select id="cn-pick" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+            <option value="">— pick a container or type below —</option>
+          </select>
+          <input id="cn-manual" placeholder="…or enter a container ID/name"
+                 class="mt-2 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+        </label>
+        <div class="grid md:grid-cols-2 gap-3">
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">IPv4 address (optional)</span>
+            <input id="cn-ipv4" placeholder="172.20.0.10"
+                   class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">IPv6 address (optional)</span>
+            <input id="cn-ipv6" placeholder="2001:db8::10"
+                   class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+          </label>
+          <label class="md:col-span-2 block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">MAC address (optional)</span>
+            <input id="cn-mac" placeholder="02:42:ac:11:00:02"
+                   class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+            <span class="block mt-1 text-[11px] text-slate-500">Six octets separated by <code>:</code> or <code>-</code>.</span>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">Aliases (comma-separated)</span>
+            <input id="cn-aliases" placeholder="db, primary"
+                   class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-400">Links (comma-separated)</span>
+            <input id="cn-links" placeholder="cache:redis"
+                   class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+            <span class="block mt-1 text-[11px] text-slate-500">Legacy bridge-only feature; usually leave blank.</span>
+          </label>
         </div>
       </div>`;
 
-    function renderConns(d) {
-      const host = wrap.querySelector('#conn-list');
-      const conns = Object.entries(d.Containers || {});
-      if (!conns.length) { host.innerHTML = '<div class="text-xs text-slate-500">No containers attached</div>'; return; }
-      host.innerHTML = conns.map(([cid, info]) => `
-        <div class="rounded border border-slate-800 bg-slate-900/50 p-2 text-xs flex items-center justify-between gap-2">
-          <div class="min-w-0">
-            <div class="font-medium text-slate-200 truncate">${escapeHtml(info.Name || cid.slice(0,12))}</div>
-            <div class="text-[10px] text-slate-500 font-mono truncate">${escapeHtml(info.IPv4Address || info.IPv6Address || '')}</div>
-          </div>
-          <button data-disc="${cid}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-[11px]">Disconnect</button>
-        </div>`).join('');
-      host.querySelectorAll('[data-disc]').forEach((b) => {
-        b.onclick = async () => {
-          const cid = b.dataset.disc;
-          const ok = await confirmModal(`Disconnect ${cid.slice(0,12)} from this network?`, { danger: true, confirmLabel: 'Disconnect' });
-          if (!ok) return;
-          try {
-            await api(`/api/networks/${networkId}/disconnect`, {
-              method: 'POST', body: JSON.stringify({ container: cid, force: false }),
-            });
-            toast('Disconnected', 'success');
-            const fresh = await api(`/api/networks/${networkId}`);
-            renderConns(fresh);
-            wrap.querySelector('#inspect-host').replaceChildren(jsonView(fresh));
-          } catch (e) { toast(e.message, 'error'); }
-        };
-      });
+    // Populate the picker. Skip containers already on this network so
+    // the user can't pick something that'll instantly 409.
+    const sel = wrap.querySelector('#cn-pick');
+    const sorted = [...containers].sort((a, b) => {
+      const an = ((a.Names && a.Names[0]) || '').replace(/^\//, '');
+      const bn = ((b.Names && b.Names[0]) || '').replace(/^\//, '');
+      return an.localeCompare(bn);
+    });
+    for (const c of sorted) {
+      const attached = c.NetworkSettings && c.NetworkSettings.Networks
+        && Object.values(c.NetworkSettings.Networks).some((n) => n.NetworkID === networkId);
+      if (attached) continue;
+      const nm = ((c.Names && c.Names[0]) || c.Id).replace(/^\//, '');
+      const opt = document.createElement('option');
+      opt.value = c.Id;
+      opt.textContent = `${nm} · ${c.Image || ''} · ${c.State || c.Status || ''}`;
+      sel.appendChild(opt);
     }
-    renderConns(data);
-    wrap.querySelector('#inspect-host').appendChild(jsonView(data));
 
-    wrap.querySelector('#cn-go').onclick = async () => {
-      const payload = { container: wrap.querySelector('#cn-cont').value.trim() };
-      const aliases = wrap.querySelector('#cn-aliases').value.split(',').map(s => s.trim()).filter(Boolean);
-      const ipv4 = wrap.querySelector('#cn-ipv4').value.trim();
-      if (aliases.length) payload.aliases = aliases;
-      if (ipv4) payload.ipv4_address = ipv4;
-      if (!payload.container) { toast('Container is required', 'warn'); return; }
-      try {
-        await api(`/api/networks/${networkId}/connect`, { method: 'POST', body: JSON.stringify(payload) });
-        toast('Connected', 'success');
-        wrap.querySelector('#cn-cont').value = '';
-        wrap.querySelector('#cn-aliases').value = '';
-        wrap.querySelector('#cn-ipv4').value = '';
-        const fresh = await api(`/api/networks/${networkId}`);
-        renderConns(fresh);
-        wrap.querySelector('#inspect-host').replaceChildren(jsonView(fresh));
-      } catch (e) { toast(e.message, 'error'); }
-    };
-
-    await modal({ title: `Network: ${data.Name}`, body: wrap, size: 'xl' });
+    let ok = false;
+    await modal({
+      title: `Connect container to: ${networkName}`, body: wrap, size: 'md',
+      actions: [
+        { label: 'Cancel', value: false, kind: 'secondary' },
+        { label: 'Connect', kind: 'primary', value: true, onClick: async () => {
+          const picked = sel.value || wrap.querySelector('#cn-manual').value.trim();
+          if (!picked) { toast('Container is required', 'warn'); return false; }
+          const payload = { container: picked };
+          const ipv4 = wrap.querySelector('#cn-ipv4').value.trim();
+          const ipv6 = wrap.querySelector('#cn-ipv6').value.trim();
+          const mac  = wrap.querySelector('#cn-mac').value.trim();
+          const aliases = wrap.querySelector('#cn-aliases').value.split(',').map((s) => s.trim()).filter(Boolean);
+          const links   = wrap.querySelector('#cn-links').value.split(',').map((s) => s.trim()).filter(Boolean);
+          if (ipv4) payload.ipv4_address = ipv4;
+          if (ipv6) payload.ipv6_address = ipv6;
+          if (mac)  payload.mac_address  = mac;
+          if (aliases.length) payload.aliases = aliases;
+          if (links.length)   payload.links = links;
+          try {
+            await api(`/api/networks/${encodeURIComponent(networkId)}/connect`, {
+              method: 'POST', body: JSON.stringify(payload),
+            });
+            toast('Connected', 'success'); ok = true;
+          } catch (e) { toast(e.message, 'error'); return false; }
+        }},
+      ],
+    });
+    return ok;
   }
 
   // ---------- Volumes ----------
