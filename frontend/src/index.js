@@ -1239,13 +1239,35 @@ import { FitAddon } from '@xterm/addon-fit';
         <td class="px-3 py-1 font-mono text-xs">${escapeHtml(dv.PathInContainer || '')}</td>
         <td class="px-3 py-1 font-mono text-xs text-slate-400">${escapeHtml(dv.CgroupPermissions || '')}</td>
       </tr>`);
+    // GPU device requests — surfaced separately from the regular
+    // Devices table because they ride a different daemon mechanism
+    // (DeviceRequests vs bind-style Devices). Each request maps to
+    // one --gpus invocation: either an index list (DeviceIDs) or a
+    // bare count, plus a capabilities list.
+    const gpuReqs = (h.DeviceRequests || []).map(dr => {
+      const ids = (dr.DeviceIDs || []).join(', ');
+      const count = dr.Count != null && dr.Count !== 0
+        ? (dr.Count === -1 ? 'all' : String(dr.Count))
+        : '';
+      const caps = (dr.Capabilities && dr.Capabilities[0]) ? dr.Capabilities[0].join(', ') : '';
+      return `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-3 py-1 font-mono text-xs">${escapeHtml(dr.Driver || '(default)')}</td>
+          <td class="px-3 py-1 font-mono text-xs">${escapeHtml(ids || count || '—')}</td>
+          <td class="px-3 py-1 font-mono text-xs text-slate-400">${escapeHtml(caps)}</td>
+        </tr>`;
+    });
     const sysctls = h.Sysctls || {};
     const logOpts = h.LogConfig?.Config || {};
+    // Slot Runtime into the items list so it shows up under the
+    // resource summary.
+    if (h.Runtime) items.push(['Runtime', h.Runtime, { mono: true }]);
     return `
       <div class="space-y-3">
         ${_defList(items)}
         ${_miniTable('Ulimits', ['Name', 'Soft', 'Hard'], ulimits)}
         ${_miniTable('Devices', ['Host', 'Container', 'Cgroup perms'], devices)}
+        ${_miniTable('GPU device requests', ['Driver', 'Indices / count', 'Capabilities'], gpuReqs)}
         ${_kvTable('Sysctls', sysctls, { mono: true })}
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
@@ -1425,7 +1447,47 @@ import { FitAddon } from '@xterm/addon-fit';
     return s;
   }
 
-  async function runContainerDialog() {
+  /**
+   * Render a small "host hardware" banner at the top of the Resources
+   * section. Tells the operator at a glance whether GPUs were detected
+   * and which runtime to use. Empty when /api/system/devices failed,
+   * so the legacy free-text path still works.
+   */
+  function _renderDevicesBanner(info) {
+    if (!info) return '';
+    const gpuCount = (info.nvidia && info.nvidia.available && info.nvidia.gpus) ? info.nvidia.gpus.length : 0;
+    const hasNvidiaRuntime = !!(info.gpu_runtime);
+    if (gpuCount > 0) {
+      const names = [...new Set(info.nvidia.gpus.map((g) => g.name).filter(Boolean))];
+      return `<div class="rounded border border-emerald-500/30 bg-emerald-500/10 p-2 text-xs text-emerald-200">
+          <strong>${gpuCount} GPU${gpuCount === 1 ? '' : 's'} detected:</strong>
+          ${escapeHtml(names.join(', ') || 'unnamed')}
+          ${hasNvidiaRuntime
+            ? ` · runtime <code>${escapeHtml(info.gpu_runtime)}</code> available`
+            : ` · <span class="text-amber-300">⚠ no nvidia runtime registered</span>`}
+        </div>`;
+    }
+    if (hasNvidiaRuntime) {
+      return `<div class="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-200">
+          Runtime <code>${escapeHtml(info.gpu_runtime)}</code> is registered, but the manager can't enumerate GPUs from inside its container.
+          Pick <strong>All available</strong> or list indices manually below.
+        </div>`;
+    }
+    return `<div class="rounded border border-slate-800 bg-slate-900/60 p-2 text-[11px] text-slate-500">
+        No GPUs detected. ${info.nvidia && info.nvidia.note ? escapeHtml(info.nvidia.note) : ''}
+      </div>`;
+  }
+
+  async function runContainerDialog(prefill = {}) {
+    // Fetch host hardware discovery up-front so the Resources section
+    // can render with the real GPU list + the real runtime select.
+    // Best-effort — if the call fails (older backend, transient
+    // error) we fall back to free-text inputs identical to the
+    // previous behaviour.
+    let devicesInfo = null;
+    try { devicesInfo = await api('/api/system/devices'); }
+    catch { /* fall back to free-text */ }
+
     const form = document.createElement('div');
     form.className = 'space-y-3';
     form.innerHTML = `
@@ -1522,10 +1584,76 @@ import { FitAddon } from '@xterm/addon-fit';
           <input name="shm_size" placeholder="64m" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/></label>
         <label class="md:col-span-2 block"><span class="text-xs text-slate-400">ulimits (NAME=soft[:hard] per line)</span>
           <textarea name="ulimits" rows="2" placeholder="nofile=1024:4096&#10;nproc=512" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
-        <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Devices (one per line: <span class="kbd">/host/dev:/container/dev[:rwm]</span>)</span>
-          <textarea name="devices" rows="2" placeholder="/dev/dri:/dev/dri" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"></textarea></label>
-        <label class="block"><span class="text-xs text-slate-400">GPUs</span>
-          <input name="gpus" placeholder='"all", "-1" or a count' class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+        <div class="md:col-span-2">
+          ${_renderDevicesBanner(devicesInfo)}
+        </div>
+
+        <!-- Devices: structured row editor, [Add device] adds a new row. -->
+        <div class="md:col-span-2">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs text-slate-400">Host devices to expose (Host path / Container path / Perms)</span>
+            <button type="button" id="dev-add" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">+ Add device</button>
+          </div>
+          <div id="dev-rows" class="space-y-1.5"></div>
+          <p class="mt-1 text-[11px] text-slate-500">Common: <code>/dev/dri</code> (Intel/AMD VAAPI), <code>/dev/snd</code> (audio), <code>/dev/ttyUSB0</code> (serial), <code>/dev/bus/usb</code> (USB).</p>
+        </div>
+
+        <!-- GPUs: radio mode picker. 'Specific' reveals checkboxes of detected GPUs. -->
+        <div class="md:col-span-2 rounded border border-slate-800 bg-slate-950/40 p-3">
+          <div class="mb-2 text-xs uppercase tracking-wider text-slate-500">GPUs</div>
+          <div class="flex flex-wrap items-center gap-4 text-xs">
+            <label class="flex items-center gap-2 text-slate-300">
+              <input type="radio" name="gpu-mode" value="none" checked class="text-sky-500"/> None
+            </label>
+            <label class="flex items-center gap-2 text-slate-300">
+              <input type="radio" name="gpu-mode" value="all" class="text-sky-500"/> All available
+            </label>
+            <label class="flex items-center gap-2 text-slate-300">
+              <input type="radio" name="gpu-mode" value="specific" class="text-sky-500"/> Specific
+            </label>
+          </div>
+          <div id="gpu-specific" class="mt-2 hidden">
+            ${devicesInfo && devicesInfo.nvidia && devicesInfo.nvidia.gpus && devicesInfo.nvidia.gpus.length
+              ? devicesInfo.nvidia.gpus.map((g) => `
+                  <label class="flex items-center gap-2 text-xs text-slate-300 py-0.5">
+                    <input type="checkbox" name="gpu-id" value="${escapeHtml(g.index)}" class="rounded border-slate-700 bg-slate-950 text-sky-500"/>
+                    <span class="font-mono text-slate-200">GPU ${escapeHtml(g.index)}</span>
+                    <span class="text-slate-400">${escapeHtml(g.name || '?')}</span>
+                    ${g.memory_mb != null ? `<span class="text-[10px] text-slate-500">(${g.memory_mb} MiB)</span>` : ''}
+                  </label>
+                `).join('')
+              : `
+                <p class="text-[11px] text-slate-500">No GPUs detected from inside the manager container.</p>
+                <label class="block mt-1">
+                  <span class="text-[11px] text-slate-500">Manual index list (comma-separated):</span>
+                  <input id="gpu-id-manual" placeholder="0,1 or GPU-fef8..." class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono"/>
+                </label>`}
+          </div>
+          <details class="mt-2 text-[11px] text-slate-500">
+            <summary class="cursor-pointer text-slate-400">Capabilities (advanced)</summary>
+            <div class="mt-1 flex flex-wrap gap-3">
+              ${['compute', 'utility', 'video', 'graphics', 'display'].map((c, i) => `
+                <label class="flex items-center gap-1 text-slate-300">
+                  <input type="checkbox" name="gpu-cap" value="${c}" ${(c === 'compute' || c === 'utility') ? 'checked' : ''} class="rounded border-slate-700 bg-slate-950 text-sky-500"/>
+                  <span class="font-mono">${c}</span>
+                </label>
+              `).join('')}
+            </div>
+            <p class="mt-1 text-[10px] text-slate-500">NVIDIA defaults: compute + utility. Add <code>video</code> for NVENC/NVDEC, <code>graphics</code> for Vulkan/OpenGL.</p>
+          </details>
+        </div>
+
+        <!-- Runtime: pulled from docker info Runtimes. -->
+        <label class="block md:col-span-2">
+          <span class="text-xs text-slate-400">Runtime</span>
+          <select name="runtime" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+            <option value="">${devicesInfo && devicesInfo.default_runtime ? `(default: ${escapeHtml(devicesInfo.default_runtime)})` : '(daemon default)'}</option>
+            ${(devicesInfo && devicesInfo.runtimes || []).map((rt) =>
+              `<option value="${escapeHtml(rt.name)}">${escapeHtml(rt.name)}${rt.path ? ` — ${escapeHtml(rt.path)}` : ''}</option>`,
+            ).join('')}
+          </select>
+          <p class="mt-1 text-[11px] text-slate-500">For GPU workloads on NVIDIA hosts, pick <code>nvidia</code> when it appears here (install <code>nvidia-container-toolkit</code> on the host first).</p>
+        </label>
       `)}
 
       ${_section('Security', false, `
@@ -1576,6 +1704,63 @@ import { FitAddon } from '@xterm/addon-fit';
 
       <div id="run-error" class="hidden rounded bg-rose-500/10 px-3 py-2 text-xs text-rose-300"></div>`;
 
+    // ---- Device rows + GPU radio wiring ----
+    //
+    // The Devices section uses a row-editor instead of a textarea so
+    // typos in the colon-separated form get caught at input time, not
+    // at the daemon. Each row is independent; [Remove] yanks one,
+    // [Add device] appends a fresh empty one.
+    const devRowsEl = form.querySelector('#dev-rows');
+    function addDeviceRow(initial = {}) {
+      const row = document.createElement('div');
+      row.className = 'grid grid-cols-12 gap-1.5 text-xs';
+      row.innerHTML = `
+        <input data-f="host" placeholder="/dev/dri" value="${escapeHtml(initial.host || '')}" class="col-span-5 rounded border-slate-700 bg-slate-950 font-mono"/>
+        <input data-f="container" placeholder="(same as host)" value="${escapeHtml(initial.container || '')}" class="col-span-4 rounded border-slate-700 bg-slate-950 font-mono"/>
+        <input data-f="perms" placeholder="rwm" maxlength="3" value="${escapeHtml(initial.perms || '')}" class="col-span-2 rounded border-slate-700 bg-slate-950 font-mono"/>
+        <button type="button" data-f="rm" class="col-span-1 rounded bg-slate-800 hover:bg-rose-500 hover:text-white border border-slate-700 text-slate-300">×</button>`;
+      row.querySelector('[data-f="rm"]').onclick = () => row.remove();
+      devRowsEl.appendChild(row);
+    }
+    form.querySelector('#dev-add').onclick = () => addDeviceRow();
+    // Seed from caller (System tab "Use in container" passes
+    // {prefill: {devices: [...]}}).
+    if (prefill.devices && prefill.devices.length) {
+      for (const d of prefill.devices) {
+        const parts = String(d).split(':');
+        addDeviceRow({ host: parts[0], container: parts[1] || '', perms: parts[2] || '' });
+      }
+    } else {
+      addDeviceRow();
+    }
+
+    // Toggle the Specific-GPUs section based on radio state.
+    const gpuSpecificEl = form.querySelector('#gpu-specific');
+    form.querySelectorAll('input[name="gpu-mode"]').forEach((rb) => {
+      rb.addEventListener('change', () => {
+        gpuSpecificEl.classList.toggle('hidden', rb.value !== 'specific' || !rb.checked);
+      });
+    });
+    // Honour prefill: e.g. opened from "Use in container" on a GPU row.
+    if (prefill.gpu_mode) {
+      const want = form.querySelector(`input[name="gpu-mode"][value="${prefill.gpu_mode}"]`);
+      if (want) { want.checked = true; want.dispatchEvent(new Event('change')); }
+      if (prefill.gpu_device_ids) {
+        for (const id of prefill.gpu_device_ids) {
+          const cb = form.querySelector(`input[name="gpu-id"][value="${CSS.escape(id)}"]`);
+          if (cb) cb.checked = true;
+          else {
+            const manual = form.querySelector('#gpu-id-manual');
+            if (manual) manual.value = prefill.gpu_device_ids.join(',');
+          }
+        }
+      }
+      if (prefill.runtime) {
+        const rsel = form.querySelector('[name="runtime"]');
+        if (rsel) rsel.value = prefill.runtime;
+      }
+    }
+
     const created = await modal({
       title: 'Run a new container',
       body: form,
@@ -1604,7 +1789,29 @@ import { FitAddon } from '@xterm/addon-fit';
           if (text('cpu_shares')) payload.cpu_shares = Number(text('cpu_shares'));
           if (text('pids_limit')) payload.pids_limit = Number(text('pids_limit'));
           if (text('stop_grace_period')) payload.stop_grace_period = Number(text('stop_grace_period'));
-          if (text('gpus')) payload.gpus = isNaN(Number(text('gpus'))) ? text('gpus') : Number(text('gpus'));
+          // GPUs: pulled from the radio + (when specific) the
+          // checkbox list / manual fallback. We send the new
+          // gpu_device_ids / gpu_capabilities fields; the legacy
+          // `gpus` field stays available for old API consumers but
+          // the SPA never uses it any more.
+          const gpuMode = (form.querySelector('input[name="gpu-mode"]:checked') || {}).value || 'none';
+          if (gpuMode === 'all') {
+            payload.gpus = 'all';
+          } else if (gpuMode === 'specific') {
+            const checked = [...form.querySelectorAll('input[name="gpu-id"]:checked')].map((c) => c.value);
+            const manual = form.querySelector('#gpu-id-manual');
+            const manualIds = manual ? manual.value.split(',').map((s) => s.trim()).filter(Boolean) : [];
+            const ids = [...checked, ...manualIds];
+            if (!ids.length) return showErr('Pick at least one GPU index, or switch to "All" / "None"');
+            payload.gpu_device_ids = ids;
+          }
+          const gpuCaps = [...form.querySelectorAll('input[name="gpu-cap"]:checked')].map((c) => c.value);
+          // Only attach capabilities when the user picked a GPU
+          // mode — caps are a no-op without DeviceRequests.
+          if (gpuMode !== 'none' && gpuCaps.length) {
+            payload.gpu_capabilities = gpuCaps;
+          }
+          if (text('runtime')) payload.runtime = text('runtime');
 
           const env = _kvLines(text('env')); if (Object.keys(env).length) payload.env = env;
           const labels = _kvLines(text('labels')); if (Object.keys(labels).length) payload.labels = labels;
@@ -1615,7 +1822,24 @@ import { FitAddon } from '@xterm/addon-fit';
           const dns = _list(text('dns')); if (dns.length) payload.dns = dns;
           const dns_search = _list(text('dns_search')); if (dns_search.length) payload.dns_search = dns_search;
           const sec_opt = _list(text('security_opt')); if (sec_opt.length) payload.security_opt = sec_opt;
-          const devices = _list(text('devices')); if (devices.length) payload.devices = devices;
+          // Devices: walk the row editor. Each row contributes one
+          // string in the regex-validated host[:container[:perms]]
+          // form. Empty rows are skipped silently (the "+ Add"
+          // affordance always shows one blank line so the user can
+          // discover it).
+          const devices = [];
+          for (const row of devRowsEl.querySelectorAll(':scope > div')) {
+            const h = row.querySelector('[data-f="host"]').value.trim();
+            const c = row.querySelector('[data-f="container"]').value.trim();
+            const p = row.querySelector('[data-f="perms"]').value.trim();
+            if (!h) continue;
+            let entry = h;
+            if (c) entry += `:${c}`;
+            else if (p) entry += `:${h}`; // perms supplied but no container — mirror host
+            if (p) entry += `:${p}`;
+            devices.push(entry);
+          }
+          if (devices.length) payload.devices = devices;
           const cap_add = _list(text('cap_add').replace(/,/g, '\n')); if (cap_add.length) payload.cap_add = cap_add;
           const cap_drop = _list(text('cap_drop').replace(/,/g, '\n')); if (cap_drop.length) payload.cap_drop = cap_drop;
 
@@ -5976,15 +6200,24 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- System ----------
   views.system = async (root) => {
-    root.innerHTML = pageHeader('System', 'Engine information and disk usage');
+    root.innerHTML = pageHeader('System', 'Engine information, disk usage, and host hardware');
     try {
-      const [info, version, df] = await Promise.all([
-        api('/api/system/info'), api('/api/system/version'), api('/api/system/df'),
+      const [info, version, df, devices] = await Promise.all([
+        api('/api/system/info'),
+        api('/api/system/version'),
+        api('/api/system/df'),
+        api('/api/system/devices').catch(() => null),
       ]);
       const wrap = document.createElement('div');
       wrap.className = 'grid gap-4 md:grid-cols-2';
       wrap.appendChild(panel('Engine version', jsonView(version)));
       wrap.appendChild(panel('Disk usage summary', dfSummary(df)));
+      if (devices) {
+        // Span both columns so the table doesn't squish.
+        const acc = panel('Accelerators & devices', renderAccelerators(devices));
+        acc.classList.add('md:col-span-2');
+        wrap.appendChild(acc);
+      }
       wrap.appendChild(panel('Engine info', jsonView(info)));
       wrap.appendChild(panel('Disk usage detail', jsonView(df)));
       root.appendChild(wrap);
@@ -5992,6 +6225,109 @@ import { FitAddon } from '@xterm/addon-fit';
       root.innerHTML += `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
     }
   };
+
+  /**
+   * Render the host hardware summary: runtimes, GPUs, /dev/dri.
+   * Includes a "Use in container" button on each GPU and on /dev/dri
+   * that opens the Run Container dialog pre-populated with the
+   * corresponding selection.
+   */
+  function renderAccelerators(d) {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+    const wrap = document.createElement('div');
+    wrap.className = 'space-y-4 text-sm';
+
+    // Runtimes table
+    const rtRows = (d.runtimes || []).map((r) => `
+      <tr class="hover:bg-slate-900/60">
+        <td class="px-3 py-1.5 font-mono text-slate-200">${escapeHtml(r.name)}${r.name === d.default_runtime ? ' <span class="ml-1 rounded bg-sky-500/20 px-1.5 py-0.5 text-[10px] text-sky-300">default</span>' : ''}</td>
+        <td class="px-3 py-1.5 font-mono text-xs text-slate-400">${escapeHtml(r.path || '')}</td>
+      </tr>`).join('');
+    const rtSection = document.createElement('div');
+    rtSection.innerHTML = `
+      <div class="mb-1 text-[11px] uppercase tracking-wider text-slate-500">OCI runtimes (${(d.runtimes || []).length})</div>
+      ${(d.runtimes || []).length
+        ? `<table class="w-full text-sm rounded border border-slate-800 bg-slate-950/40 overflow-hidden">
+             <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+               <tr><th class="px-3 py-1.5 text-left">Name</th><th class="px-3 py-1.5 text-left">Path</th></tr>
+             </thead>
+             <tbody>${rtRows}</tbody>
+           </table>`
+        : `<p class="text-xs text-slate-500">No runtimes reported by the daemon.</p>`}`;
+    wrap.appendChild(rtSection);
+
+    // NVIDIA GPUs
+    const nv = document.createElement('div');
+    if (d.nvidia && d.nvidia.available && d.nvidia.gpus && d.nvidia.gpus.length) {
+      const rows = d.nvidia.gpus.map((g) => `
+        <tr class="hover:bg-slate-900/60">
+          <td class="px-3 py-1.5 font-mono text-slate-200">${escapeHtml(g.index)}</td>
+          <td class="px-3 py-1.5 text-slate-300">${escapeHtml(g.name || '?')}</td>
+          <td class="px-3 py-1.5 text-slate-400 text-xs font-mono">${g.memory_mb != null ? g.memory_mb + ' MiB' : '—'}</td>
+          <td class="px-3 py-1.5 text-slate-400 text-xs font-mono">${escapeHtml(g.driver_version || '—')}</td>
+          <td class="px-3 py-1.5 text-slate-500 text-[11px] font-mono truncate" title="${escapeHtml(g.uuid || '')}">${escapeHtml((g.uuid || '').slice(0, 18))}${(g.uuid || '').length > 18 ? '…' : ''}</td>
+          <td class="px-3 py-1.5 text-right">
+            ${isAdmin ? `<button data-act="use-gpu" data-idx="${escapeHtml(g.index)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs text-slate-200">Use in container</button>` : ''}
+          </td>
+        </tr>`).join('');
+      nv.innerHTML = `
+        <div class="mb-1 mt-3 text-[11px] uppercase tracking-wider text-slate-500">NVIDIA GPUs (${d.nvidia.gpus.length})</div>
+        <table class="w-full text-sm rounded border border-slate-800 bg-slate-950/40 overflow-hidden">
+          <thead class="bg-slate-900/70 text-[10px] uppercase tracking-wider text-slate-400">
+            <tr><th class="px-3 py-1.5 text-left">Index</th><th class="px-3 py-1.5 text-left">Model</th><th class="px-3 py-1.5 text-left">VRAM</th><th class="px-3 py-1.5 text-left">Driver</th><th class="px-3 py-1.5 text-left">UUID</th><th class="px-3 py-1.5"></th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    } else {
+      nv.innerHTML = `
+        <div class="mb-1 mt-3 text-[11px] uppercase tracking-wider text-slate-500">NVIDIA GPUs</div>
+        <p class="text-xs text-slate-500">${escapeHtml((d.nvidia && d.nvidia.note) || 'None detected.')}</p>`;
+    }
+    wrap.appendChild(nv);
+
+    // /dev/dri
+    const dri = document.createElement('div');
+    if (d.dri && d.dri.available) {
+      dri.innerHTML = `
+        <div class="mb-1 mt-3 text-[11px] uppercase tracking-wider text-slate-500">/dev/dri (Intel / AMD VAAPI, ${(d.dri.devices || []).length} devices)</div>
+        <div class="rounded border border-slate-800 bg-slate-950/40 p-2">
+          ${(d.dri.devices || []).map((p) => `<code class="block text-xs text-slate-300 font-mono">${escapeHtml(p)}</code>`).join('')}
+        </div>
+        ${isAdmin ? `<button data-act="use-dri" class="mt-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs text-slate-200">Use /dev/dri in container</button>` : ''}`;
+    } else {
+      dri.innerHTML = `
+        <div class="mb-1 mt-3 text-[11px] uppercase tracking-wider text-slate-500">/dev/dri</div>
+        <p class="text-xs text-slate-500">${escapeHtml((d.dri && d.dri.note) || 'Not present.')}</p>`;
+    }
+    wrap.appendChild(dri);
+
+    wrap.addEventListener('click', (e) => {
+      const t = e.target.closest('[data-act]');
+      if (!t) return;
+      if (t.dataset.act === 'use-gpu') {
+        // Cross-link to the Run Container dialog with the GPU index
+        // pre-selected. The dialog honours the runtime/gpu_device_ids
+        // prefill payload.
+        runContainerDialog({
+          gpu_mode: 'specific',
+          gpu_device_ids: [t.dataset.idx],
+          runtime: d.gpu_runtime || undefined,
+        }).then((c) => { if (c) toast(`Container ${c.name || c.short_id} running`, 'success'); });
+      } else if (t.dataset.act === 'use-dri') {
+        runContainerDialog({
+          devices: ['/dev/dri:/dev/dri:rwm'],
+        }).then((c) => { if (c) toast(`Container ${c.name || c.short_id} running`, 'success'); });
+      }
+    });
+
+    // Footer with cache + refresh hint
+    const foot = document.createElement('div');
+    foot.className = 'mt-3 text-[11px] text-slate-500';
+    foot.innerHTML = `Discovered at ${escapeHtml(d.discovered_at || '?')} · results cached for 30s server-side · reload the page to force a re-probe.`;
+    wrap.appendChild(foot);
+
+    return wrap;
+  }
 
   function panel(title, child) {
     const w = document.createElement('div');
