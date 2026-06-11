@@ -283,6 +283,26 @@ describe('auditMiddleware capture', () => {
     const rows = await waitForAuditCount(1);
     expect(rows[0].request_id).toBe(upstream);
   });
+
+  it('records the session_id from the authenticated session (cross-link to Sessions page)', async () => {
+    // withRole() creates a server-side session AND embeds its id as
+    // the JWT jti. After auth runs, req.sessionId is populated and
+    // the audit middleware should pick it up.
+    const app = buildApp(containersApi);
+    const bearer = withRole('admin');
+    // Pull the session_id (jti) from the JWT payload.
+    const token = bearer.replace(/^Bearer /, '');
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    expect(payload.jti).toBeTruthy();
+
+    await request(app)
+      .post('/api/containers/start/bulk')
+      .set('Authorization', bearer)
+      .send({ ids: ['c1'] });
+
+    const rows = await waitForAuditCount(1);
+    expect(rows[0].session_id).toBe(payload.jti);
+  });
 });
 
 // ============================================================
@@ -295,12 +315,17 @@ describe('GET /api/audit (query API)', () => {
     // assert on filter behaviour without having to drive requests through
     // the router first.
     const base = new Date('2026-06-10T00:00:00Z').getTime();
+    // Three distinct session ids so we can also exercise the
+    // session_id query filter below.
+    const SID_ALICE_A = 'sid-alice-a';
+    const SID_ALICE_B = 'sid-alice-b';
+    const SID_BOB = 'sid-bob';
     const entries = [
-      { ts: new Date(base).toISOString(), action: 'container.start', resource_type: 'container', resource_id: 'c1', actor: { username: 'alice', role: 'admin' }, outcome: 'ok', status: 200, method: 'POST', path: '/api/containers/c1/start', duration_ms: 5 },
-      { ts: new Date(base + 60_000).toISOString(), action: 'container.stop', resource_type: 'container', resource_id: 'c1', actor: { username: 'bob', role: 'admin' }, outcome: 'ok', status: 200, method: 'POST', path: '/api/containers/c1/stop', duration_ms: 7 },
-      { ts: new Date(base + 120_000).toISOString(), action: 'volume.delete', resource_type: 'volume', resource_id: 'v1', actor: { username: 'alice', role: 'admin' }, outcome: 'error', status: 409, error: 'in use', method: 'DELETE', path: '/api/volumes/v1', duration_ms: 12 },
-      { ts: new Date(base + 180_000).toISOString(), action: 'image.remove.bulk', resource_type: 'image', resource_id: '[2 items]', actor: { username: 'bob', role: 'admin' }, outcome: 'ok', status: 200, method: 'POST', path: '/api/images/remove/bulk', duration_ms: 22 },
-      { ts: new Date(base + 240_000).toISOString(), action: 'network.connect', resource_type: 'network', resource_id: 'n1', actor: { username: 'alice', role: 'admin' }, outcome: 'ok', status: 200, method: 'POST', path: '/api/networks/n1/connect', duration_ms: 9 },
+      { ts: new Date(base).toISOString(), action: 'container.start', resource_type: 'container', resource_id: 'c1', actor: { username: 'alice', role: 'admin' }, session_id: SID_ALICE_A, outcome: 'ok', status: 200, method: 'POST', path: '/api/containers/c1/start', duration_ms: 5 },
+      { ts: new Date(base + 60_000).toISOString(), action: 'container.stop', resource_type: 'container', resource_id: 'c1', actor: { username: 'bob', role: 'admin' }, session_id: SID_BOB, outcome: 'ok', status: 200, method: 'POST', path: '/api/containers/c1/stop', duration_ms: 7 },
+      { ts: new Date(base + 120_000).toISOString(), action: 'volume.delete', resource_type: 'volume', resource_id: 'v1', actor: { username: 'alice', role: 'admin' }, session_id: SID_ALICE_B, outcome: 'error', status: 409, error: 'in use', method: 'DELETE', path: '/api/volumes/v1', duration_ms: 12 },
+      { ts: new Date(base + 180_000).toISOString(), action: 'image.remove.bulk', resource_type: 'image', resource_id: '[2 items]', actor: { username: 'bob', role: 'admin' }, session_id: SID_BOB, outcome: 'ok', status: 200, method: 'POST', path: '/api/images/remove/bulk', duration_ms: 22 },
+      { ts: new Date(base + 240_000).toISOString(), action: 'network.connect', resource_type: 'network', resource_id: 'n1', actor: { username: 'alice', role: 'admin' }, session_id: SID_ALICE_A, outcome: 'ok', status: 200, method: 'POST', path: '/api/networks/n1/connect', duration_ms: 9 },
     ];
     await fs.writeFile(AUDIT_TMP_FILE, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
   });
@@ -404,6 +429,26 @@ describe('GET /api/audit (query API)', () => {
   it('rejects unauthenticated requests', async () => {
     const r = await request(buildApp(auditApi)).get('/api/audit');
     expect(r.status).toBe(401);
+  });
+
+  it('filter by session_id: only entries for that session', async () => {
+    const app = buildApp(auditApi);
+    const r = await request(app)
+      .get('/api/audit?session_id=sid-alice-a')
+      .set('Authorization', withRole('admin'));
+    expect(r.body.total).toBe(2);
+    expect(new Set(r.body.entries.map((e) => e.action))).toEqual(
+      new Set(['container.start', 'network.connect']),
+    );
+  });
+
+  it('combine session_id with action glob (intersection of filters)', async () => {
+    const app = buildApp(auditApi);
+    const r = await request(app)
+      .get('/api/audit?session_id=sid-bob&action=container.*')
+      .set('Authorization', withRole('admin'));
+    expect(r.body.total).toBe(1);
+    expect(r.body.entries[0].action).toBe('container.stop');
   });
 
   it('returns an empty result set on a missing audit file (rather than 500)', async () => {

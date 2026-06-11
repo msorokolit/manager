@@ -14,6 +14,7 @@ export const AuditEntry = Type.Object(
   {
     ts: Type.String({ description: 'ISO 8601 timestamp when the request finished' }),
     request_id: Opt(Type.String({ description: 'Correlation ID; matches X-Request-Id and the app log' })),
+    session_id: Opt(Type.String({ description: 'Session id (JWT jti) — cross-links to the Sessions page' })),
     actor: Opt(Type.Object({
       username: Type.String(),
       role: Type.String(),

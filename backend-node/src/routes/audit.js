@@ -36,6 +36,8 @@ const AuditQuery = Type.Object(
     resource_id: Opt(Type.String()),
     outcome: Opt(StringEnum(['ok', 'error'])),
     request_id: Opt(Type.String()),
+    // session_id filter — cross-link from the Sessions page lands here.
+    session_id: Opt(Type.String()),
     limit: Opt(Type.Integer({ minimum: 1, maximum: 1000, default: 100 })),
     offset: Opt(Type.Integer({ minimum: 0, default: 0 })),
     // Newest-first by default — that's what an operator skimming for
@@ -97,6 +99,7 @@ async function queryAudit(q) {
   const resourceId = q.resource_id || null;
   const outcome = q.outcome || null;
   const reqId = q.request_id || null;
+  const sessionId = q.session_id || null;
   const actionMatch = makeActionMatcher(q.action);
 
   function matches(entry) {
@@ -113,6 +116,7 @@ async function queryAudit(q) {
     if (resourceId && entry.resource_id !== resourceId) return false;
     if (outcome && entry.outcome !== outcome) return false;
     if (reqId && entry.request_id !== reqId) return false;
+    if (sessionId && entry.session_id !== sessionId) return false;
     if (!actionMatch(entry.action)) return false;
     return true;
   }
@@ -185,6 +189,7 @@ r.get(
       resource_id: req.query.resource_id,
       outcome: req.query.outcome,
       request_id: req.query.request_id,
+      session_id: req.query.session_id,
       order: req.query.order || 'desc',
       limit: intQuery(req.query.limit, 100, { min: 1, max: 1000 }),
       offset: intQuery(req.query.offset, 0, { min: 0 }),

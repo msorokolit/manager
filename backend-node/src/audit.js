@@ -215,6 +215,7 @@ export function auditMiddleware(routeSpec) {
     // fires, the body parser may have moved on.
     const ctx = currentContext();
     const requestId = (ctx && ctx.requestId) || req.requestId || null;
+    const sessionId = (ctx && ctx.sessionId) || req.sessionId || null;
     const sourceIp = (ctx && ctx.sourceIp) || req.ip || null;
     const resourceId = pickResourceId(req, routeSpec);
 
@@ -233,6 +234,11 @@ export function auditMiddleware(routeSpec) {
       const outcome = status >= 200 && status < 400 ? 'ok' : 'error';
       const record = {
         request_id: requestId,
+        // session_id ties the audit row back to the row in
+        // sessions.json. The Sessions and Audit pages cross-link via
+        // this — click "View activity" on a session and the Audit
+        // page opens pre-filtered by it.
+        session_id: sessionId,
         actor: req.user
           ? { username: req.user.username, role: req.user.role }
           : null,
