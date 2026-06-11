@@ -885,6 +885,7 @@ import { FitAddon } from '@xterm/addon-fit';
               ${isAdmin ? actionButton(c, 'stop', '■ Stop', 'secondary', c.state !== 'running') : ''}
               <button data-act="logs" data-id="${c.id}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Logs</button>
               ${isAdmin ? `<button data-act="exec" data-id="${c.id}" data-name="${escapeHtml(c.name)}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" ${c.state !== 'running' ? 'disabled' : ''} ${c.state !== 'running' ? 'title="Container must be running"' : ''}>⌨ Terminal</button>` : ''}
+              ${isAdmin ? `<button data-act="duplicate" data-id="${c.id}" data-name="${escapeHtml(c.name)}" title="Create a new container with the same settings" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⎘ Duplicate</button>` : ''}
               ${isAdmin ? `<button data-act="remove" data-id="${c.id}" class="rounded-md bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
             </div>
           </td>
@@ -972,6 +973,19 @@ import { FitAddon } from '@xterm/addon-fit';
         if (act === 'inspect') return showContainerInspect(id);
         if (act === 'logs') return showContainerLogs(id);
         if (act === 'exec') return openTerminal(id, t.dataset.name);
+        if (act === 'duplicate') {
+          // Fetch the full inspect for the prefill — the list summary
+          // doesn't carry HostConfig. Best-effort; if it fails we
+          // open the dialog empty so the operator can still create.
+          let insp = null;
+          try { insp = await api(`/api/containers/${encodeURIComponent(id)}`); } catch {}
+          const prefill = insp
+            ? { ...runOptionsFromInspect(insp), name: `${t.dataset.name}-copy` }
+            : { name: `${t.dataset.name}-copy` };
+          await runContainerDialog({ mode: 'duplicate', prefill });
+          await load();
+          return;
+        }
         if (act === 'remove') {
           const ok = await confirmModal('Remove this container? This cannot be undone.', { danger: true, confirmLabel: 'Remove' });
           if (!ok) return;
@@ -1264,6 +1278,10 @@ import { FitAddon } from '@xterm/addon-fit';
     if (h.Runtime) items.push(['Runtime', h.Runtime, { mono: true }]);
     return `
       <div class="space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="text-[11px] uppercase tracking-wider text-slate-400">Resource limits & runtime knobs</div>
+          <button data-act="edit-live" class="rounded bg-sky-500/80 hover:bg-sky-500 text-slate-950 px-2 py-1 text-xs font-medium">✎ Edit live (no restart)</button>
+        </div>
         ${_defList(items)}
         ${_miniTable('Ulimits', ['Name', 'Soft', 'Hard'], ulimits)}
         ${_miniTable('Devices', ['Host', 'Container', 'Cgroup perms'], devices)}
@@ -1288,6 +1306,7 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   async function showContainerInspect(id) {
+    const isAdmin = state.auth && state.auth.role === 'admin';
     let data;
     try { data = await api(`/api/containers/${id}`); }
     catch (e) { toast(e.message, 'error'); return; }
@@ -1304,6 +1323,10 @@ import { FitAddon } from '@xterm/addon-fit';
     const wrap = document.createElement('div');
     const cfg = data.Config || {}, st = data.State || {};
     const titleName = (data.Name || id).replace(/^\//, '');
+    // Refuse the Recreate button on compose-managed containers — the
+    // backend would 409, but it's clearer UX to disable the button
+    // up front with an explanation.
+    const composeProject = (cfg.Labels || {})['com.docker.compose.project'] || null;
     wrap.innerHTML = `
       <div class="mb-4 flex flex-wrap items-center gap-3">
         <div class="min-w-0">
@@ -1313,6 +1336,14 @@ import { FitAddon } from '@xterm/addon-fit';
         ${statusBadge(st.Status)}
         ${st.Health ? `<span class="badge ${_healthTone(st.Health.Status)}">${escapeHtml(st.Health.Status)}</span>` : ''}
         ${st.Status === 'running' ? `<span class="text-xs text-slate-500">up ${_dur(st.StartedAt, null)}</span>` : ''}
+        ${composeProject ? `<span class="badge bg-slate-700/50 text-slate-300 border border-slate-600/40" title="Compose-managed containers should be edited in the stack file">stack: ${escapeHtml(composeProject)}</span>` : ''}
+        ${isAdmin ? `
+          <div class="ml-auto flex flex-wrap gap-1">
+            <button id="ci-rename" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">✎ Rename</button>
+            <button id="ci-duplicate" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⎘ Duplicate</button>
+            <button id="ci-recreate" class="rounded ${composeProject ? 'bg-slate-800 text-slate-500 cursor-not-allowed' : 'bg-amber-500/80 hover:bg-amber-500 text-slate-950'} border border-slate-700 px-2 py-1 text-xs" ${composeProject ? 'disabled title="Compose-managed: edit the stack file instead"' : ''}>↺ Recreate</button>
+          </div>
+        ` : ''}
       </div>
       <div class="border-b border-slate-800 mb-3 flex flex-wrap gap-1 text-xs" id="ci-tabs">
         ${TABS.map((t, i) => `<button data-tab="${t.id}" class="rounded-t px-3 py-2 transition ${i===0 ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}">${escapeHtml(t.label)}</button>`).join('')}
@@ -1336,6 +1367,15 @@ import { FitAddon } from '@xterm/addon-fit';
           }));
         };
       });
+      // Edit-live button (Resources tab only). Opens a small modal
+      // with the cgroup knobs prefilled from the current HostConfig.
+      const editLive = pane.querySelector('[data-act="edit-live"]');
+      if (editLive && isAdmin) editLive.onclick = () => openLiveUpdateDialog(id, data, async () => {
+        // Refresh inspect data + repaint the Resources tab so the
+        // new values are visible immediately.
+        try { data = await api(`/api/containers/${id}`); } catch {}
+        paint('resources');
+      });
       wrap.querySelectorAll('#ci-tabs button').forEach((b) => {
         const active = b.dataset.tab === tab.id;
         b.className = `rounded-t px-3 py-2 transition ${active ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`;
@@ -1346,10 +1386,70 @@ import { FitAddon } from '@xterm/addon-fit';
     });
     paint(TABS[0].id);
 
+    // Wire the header action buttons. Each one closes the inspect
+    // modal first (the popped action opens its own modal) so we
+    // don't stack three modals deep.
+    const modalRef = {};
+    if (isAdmin) {
+      const renameBtn = wrap.querySelector('#ci-rename');
+      const dupBtn = wrap.querySelector('#ci-duplicate');
+      const recBtn = wrap.querySelector('#ci-recreate');
+      if (renameBtn) renameBtn.onclick = async () => {
+        const next = await inputModal({
+          title: 'Rename container',
+          label: `Rename "${titleName}" to:`,
+          initial: titleName,
+          okLabel: 'Rename',
+          validate: (v) => {
+            const t = (v || '').trim();
+            if (!t) return 'Name is required';
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(t)) return 'Must match [a-zA-Z0-9][a-zA-Z0-9_.-]*';
+            if (t === titleName) return 'New name must differ';
+            return null;
+          },
+        });
+        if (next == null) return;
+        try {
+          await api(`/api/containers/${encodeURIComponent(id)}/rename`, {
+            method: 'POST', body: JSON.stringify({ name: next.trim() }),
+          });
+          toast(`Renamed to ${next.trim()}`, 'success');
+          // Refresh the inspect modal so the new name is reflected.
+          modalRef.close && modalRef.close(null);
+          await showContainerInspect(id);
+        } catch (e) { toast(e.message, 'error'); }
+      };
+      if (dupBtn) dupBtn.onclick = async () => {
+        modalRef.close && modalRef.close(null);
+        await runContainerDialog({
+          mode: 'duplicate',
+          prefill: { ...runOptionsFromInspect(data), name: `${titleName}-copy` },
+        });
+      };
+      if (recBtn && !composeProject) recBtn.onclick = async () => {
+        // Two-stage confirm — the destructive consequences (id
+        // change, lost logs) deserve a deliberate click before we
+        // open the recreate dialog.
+        const ok = await confirmModal(
+          `<strong class="text-amber-300">Recreate ${escapeHtml(titleName)}?</strong><br>` +
+          `The original container will be STOPPED, REMOVED, and replaced. Container id changes. Logs from the old container are lost. Named volumes are preserved.`,
+          { danger: true, confirmLabel: 'Continue to editor' },
+        );
+        if (!ok) return;
+        modalRef.close && modalRef.close(null);
+        await runContainerDialog({
+          mode: 'recreate',
+          sourceId: id,
+          prefill: runOptionsFromInspect(data),
+        });
+      };
+    }
+
     await modal({
       title: `Inspect: ${titleName}`,
       body: wrap,
       size: 'xl',
+      ref: modalRef,
       actions: [{ label: 'Close', value: null, kind: 'secondary' }],
     });
   }
@@ -1453,6 +1553,181 @@ import { FitAddon } from '@xterm/addon-fit';
    * and which runtime to use. Empty when /api/system/devices failed,
    * so the legacy free-text path still works.
    */
+  /**
+   * Map a docker inspect() body back to the runContainerDialog
+   * prefill shape (which is essentially CreateContainerRequest).
+   *
+   * Round-tripping is intentionally LOSSY in a few places — we'd
+   * rather skip a field than fabricate one the operator didn't
+   * actually set. Specifically:
+   *   - Env: the docker daemon merges image env + run-time env into
+   *     one array. We pass the whole thing back; users editing a
+   *     dialog mid-recreate will see image defaults populating the
+   *     env editor. Pruning them needs `docker image inspect` to
+   *     compare, which is an extra round-trip we skip.
+   *   - Hostname: the daemon assigns the short container id as the
+   *     default hostname. We surface it as-is; on recreate the new
+   *     container gets the new id as hostname unless the operator
+   *     overrides.
+   *   - DriverOpts on network endpoints don't round-trip (rarely
+   *     used; mention in the dialog's "what didn't round-trip" hint).
+   *
+   * The output is purely advisory — every field is optional in the
+   * Run dialog, so missing/garbled fields just appear blank.
+   */
+  function runOptionsFromInspect(insp) {
+    const cfg = insp.Config || {};
+    const host = insp.HostConfig || {};
+    const net = insp.NetworkSettings || {};
+
+    const out = {
+      image: cfg.Image,
+      // Strip the leading slash docker prefixes container names with.
+      name: (insp.Name || '').replace(/^\//, ''),
+      command: Array.isArray(cfg.Cmd) ? cfg.Cmd.join(' ') : (cfg.Cmd || ''),
+      entrypoint: Array.isArray(cfg.Entrypoint) ? cfg.Entrypoint.join(' ') : (cfg.Entrypoint || ''),
+      user: cfg.User || '',
+      working_dir: cfg.WorkingDir || '',
+      hostname: cfg.Hostname || '',
+      domainname: cfg.Domainname || '',
+      stop_signal: cfg.StopSignal || '',
+      tty: !!cfg.Tty,
+      stdin_open: !!cfg.OpenStdin,
+    };
+
+    // Env: array of "KEY=VAL" → {KEY: 'VAL'}.
+    if (Array.isArray(cfg.Env) && cfg.Env.length) {
+      out.env = {};
+      for (const e of cfg.Env) {
+        const i = e.indexOf('=');
+        if (i > 0) out.env[e.slice(0, i)] = e.slice(i + 1);
+      }
+    }
+
+    // Labels: pass through, except strip compose-internal labels —
+    // those would survive into the new container and confuse compose
+    // tooling that scans for them. We refuse compose-managed
+    // containers in the recreate path anyway, but the prefill is
+    // also used by Duplicate, where it'd be wrong to copy
+    // compose ownership to a new standalone container.
+    if (cfg.Labels && Object.keys(cfg.Labels).length) {
+      out.labels = {};
+      for (const [k, v] of Object.entries(cfg.Labels)) {
+        if (k.startsWith('com.docker.compose.')) continue;
+        out.labels[k] = v;
+      }
+    }
+
+    // Ports: HostConfig.PortBindings is the user's original spec.
+    // Shape: { '80/tcp': [{HostIp, HostPort}] } → { '80/tcp': 8080 }
+    if (host.PortBindings && Object.keys(host.PortBindings).length) {
+      out.ports = {};
+      for (const [containerPort, bindings] of Object.entries(host.PortBindings)) {
+        if (Array.isArray(bindings) && bindings[0]) {
+          const hp = bindings[0].HostPort;
+          if (hp) out.ports[containerPort] = Number(hp) || hp;
+        }
+      }
+    }
+
+    // Volumes: HostConfig.Binds is `host:container[:mode]` strings.
+    if (Array.isArray(host.Binds) && host.Binds.length) {
+      out.volumes = {};
+      for (const bind of host.Binds) {
+        const parts = bind.split(':');
+        if (parts.length >= 2) {
+          out.volumes[parts[0]] = { bind: parts[1], mode: parts[2] || 'rw' };
+        }
+      }
+    }
+
+    // tmpfs
+    if (host.Tmpfs && Object.keys(host.Tmpfs).length) out.tmpfs = host.Tmpfs;
+
+    // Network: prefer the first non-default network attachment for
+    // the `network` field; NetworkMode covers the rest.
+    if (host.NetworkMode && host.NetworkMode !== 'default') out.network_mode = host.NetworkMode;
+    const attachedNetworks = Object.keys((net && net.Networks) || {});
+    if (attachedNetworks.length === 1 && !['bridge', 'host', 'none'].includes(attachedNetworks[0])) {
+      out.network = attachedNetworks[0];
+    }
+
+    // DNS / extra hosts
+    if (Array.isArray(host.Dns) && host.Dns.length) out.dns = host.Dns;
+    if (Array.isArray(host.DnsSearch) && host.DnsSearch.length) out.dns_search = host.DnsSearch;
+    if (Array.isArray(host.DnsOptions) && host.DnsOptions.length) out.dns_opt = host.DnsOptions;
+    if (Array.isArray(host.ExtraHosts) && host.ExtraHosts.length) {
+      out.extra_hosts = {};
+      for (const eh of host.ExtraHosts) {
+        const i = eh.indexOf(':');
+        if (i > 0) out.extra_hosts[eh.slice(0, i)] = eh.slice(i + 1);
+      }
+    }
+
+    // Devices: PathOnHost[:PathInContainer[:CgroupPermissions]]
+    if (Array.isArray(host.Devices) && host.Devices.length) {
+      out.devices = host.Devices.map((d) =>
+        `${d.PathOnHost}:${d.PathInContainer || d.PathOnHost}${d.CgroupPermissions ? ':' + d.CgroupPermissions : ''}`,
+      );
+    }
+
+    // GPU device requests: map first request's DeviceIDs / Count + Capabilities.
+    if (Array.isArray(host.DeviceRequests) && host.DeviceRequests.length) {
+      const dr = host.DeviceRequests[0];
+      if (Array.isArray(dr.DeviceIDs) && dr.DeviceIDs.length) {
+        out.gpu_device_ids = dr.DeviceIDs.map(String);
+      } else if (dr.Count) {
+        out.gpus = dr.Count === -1 ? 'all' : dr.Count;
+      }
+      if (Array.isArray(dr.Capabilities) && dr.Capabilities[0]) {
+        out.gpu_capabilities = dr.Capabilities[0];
+      }
+    }
+
+    // Runtime
+    if (host.Runtime && host.Runtime !== 'runc') out.runtime = host.Runtime;
+
+    // Resource limits
+    if (host.NanoCpus) out.cpus = host.NanoCpus / 1_000_000_000;
+    if (host.CpuShares) out.cpu_shares = host.CpuShares;
+    if (host.CpusetCpus) out.cpuset_cpus = host.CpusetCpus;
+    if (host.Memory) out.mem_limit = host.Memory;
+    if (host.MemoryReservation) out.mem_reservation = host.MemoryReservation;
+    if (host.MemorySwap) out.memswap_limit = host.MemorySwap;
+    if (host.PidsLimit) out.pids_limit = host.PidsLimit;
+    if (host.ShmSize && host.ShmSize !== 67108864) out.shm_size = host.ShmSize; // 64m is daemon default
+
+    // Restart policy
+    if (host.RestartPolicy && host.RestartPolicy.Name && host.RestartPolicy.Name !== 'no') {
+      out.restart_policy = host.RestartPolicy.Name;
+    }
+
+    // Misc HostConfig flags
+    if (host.Privileged) out.privileged = true;
+    if (host.AutoRemove) out.auto_remove = true;
+    if (host.Init) out.init = true;
+    if (host.ReadonlyRootfs) out.read_only = true;
+    if (Array.isArray(host.CapAdd) && host.CapAdd.length) out.cap_add = host.CapAdd;
+    if (Array.isArray(host.CapDrop) && host.CapDrop.length) out.cap_drop = host.CapDrop;
+    if (Array.isArray(host.SecurityOpt) && host.SecurityOpt.length) out.security_opt = host.SecurityOpt;
+    if (host.Sysctls && Object.keys(host.Sysctls).length) out.sysctls = host.Sysctls;
+
+    // ulimits — convert from {Name, Soft, Hard} array.
+    if (Array.isArray(host.Ulimits) && host.Ulimits.length) {
+      out.ulimits = host.Ulimits.map((u) => ({ name: u.Name, soft: u.Soft, hard: u.Hard }));
+    }
+
+    // Log driver
+    if (host.LogConfig && host.LogConfig.Type && host.LogConfig.Type !== 'json-file') {
+      out.log_driver = host.LogConfig.Type;
+      if (host.LogConfig.Config && Object.keys(host.LogConfig.Config).length) {
+        out.log_opts = host.LogConfig.Config;
+      }
+    }
+
+    return out;
+  }
+
   function _renderDevicesBanner(info) {
     if (!info) return '';
     const gpuCount = (info.nvidia && info.nvidia.available && info.nvidia.gpus) ? info.nvidia.gpus.length : 0;
@@ -1478,7 +1753,135 @@ import { FitAddon } from '@xterm/addon-fit';
       </div>`;
   }
 
-  async function runContainerDialog(prefill = {}) {
+  /**
+   * Live cgroup-knob editor. Opens a small modal with the same
+   * fields the backend's /update endpoint accepts (CPU / memory /
+   * restart policy / blkio weight / pids limit). Submits to
+   * POST /api/containers/:id/update — no restart, no recreate.
+   *
+   * Prefilled from the current HostConfig so the operator sees the
+   * existing values rather than blanks.
+   */
+  async function openLiveUpdateDialog(id, inspectData, onUpdated) {
+    const h = (inspectData && inspectData.HostConfig) || {};
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <p class="mb-3 text-xs text-slate-400">
+        These knobs change live — no restart, no recreate. For anything else (image, env, ports, volumes, devices, networks) use <strong>Recreate</strong>.
+      </p>
+      <div class="grid gap-3 md:grid-cols-2">
+        <label class="block">
+          <span class="text-xs text-slate-400">CPUs (e.g. 1.5)</span>
+          <input name="cpus" type="number" step="0.1" min="0" value="${h.NanoCpus ? (h.NanoCpus / 1e9) : ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">CPU shares (relative weight, 2–262144)</span>
+          <input name="cpu_shares" type="number" min="2" max="262144" value="${h.CpuShares || ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">Cpuset CPUs (e.g. 0-3, 0,2,4-7)</span>
+          <input name="cpuset_cpus" pattern="[0-9,\\-]*" value="${escapeHtml(h.CpusetCpus || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">Restart policy</span>
+          <select name="restart_policy" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+            <option value="">(leave unchanged)</option>
+            ${['no','always','unless-stopped','on-failure'].map((p) =>
+              `<option value="${p}" ${h.RestartPolicy?.Name === p ? 'selected' : ''}>${p}</option>`,
+            ).join('')}
+          </select>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">Memory limit</span>
+          <input name="mem_limit" placeholder="e.g. 512m, 2g" value="${h.Memory ? fmtBytes(h.Memory) : ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">Memory reservation</span>
+          <input name="mem_reservation" placeholder="e.g. 256m" value="${h.MemoryReservation ? fmtBytes(h.MemoryReservation) : ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">Memswap limit (-1 = unlimited)</span>
+          <input name="memswap_limit" placeholder="e.g. 1g or -1" value="${h.MemorySwap === -1 ? '-1' : (h.MemorySwap ? fmtBytes(h.MemorySwap) : '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+        </label>
+        <label class="block">
+          <span class="text-xs text-slate-400">PIDs limit (-1 = unlimited)</span>
+          <input name="pids_limit" type="number" min="-1" value="${h.PidsLimit || ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+        </label>
+        <label class="md:col-span-2 block">
+          <span class="text-xs text-slate-400">BlkIO weight (10–1000)</span>
+          <input name="blkio_weight" type="number" min="10" max="1000" value="${h.BlkioWeight || ''}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+        </label>
+      </div>`;
+    await modal({
+      title: 'Edit live resource limits', body: wrap, size: 'md',
+      actions: [
+        { label: 'Cancel', value: false, kind: 'secondary' },
+        { label: 'Apply', kind: 'primary', value: true, onClick: async () => {
+          const t = (n) => (wrap.querySelector(`[name="${n}"]`)?.value || '').trim();
+          const num = (n) => { const v = t(n); return v === '' ? null : Number(v); };
+          const payload = {};
+          // Memory fields stay strings — the backend's memBytes()
+          // accepts both "512m" and a bare integer.
+          for (const f of ['mem_limit', 'mem_reservation', 'memswap_limit', 'cpuset_cpus']) {
+            if (t(f)) payload[f] = t(f);
+          }
+          for (const f of ['cpus', 'cpu_shares', 'pids_limit', 'blkio_weight']) {
+            const v = num(f); if (v != null) payload[f] = v;
+          }
+          if (t('restart_policy')) payload.restart_policy = t('restart_policy');
+          if (!Object.keys(payload).length) {
+            toast('No changes to apply', 'warn');
+            return false;
+          }
+          try {
+            await api(`/api/containers/${encodeURIComponent(id)}/update`, {
+              method: 'POST', body: JSON.stringify(payload),
+            });
+            toast('Live update applied (no restart needed)', 'success');
+            if (onUpdated) await onUpdated();
+          } catch (e) { toast(e.message, 'error'); return false; }
+        }},
+      ],
+    });
+  }
+
+  /**
+   * Open the Run-container dialog. Modes:
+   *
+   *   mode: 'create'    (default) — empty form, POST /api/containers,
+   *                                 creates a fresh container
+   *   mode: 'duplicate' — prefilled from an existing inspect, name
+   *                       cleared so the user must supply a fresh
+   *                       one; POST /api/containers (no deletion of
+   *                       the source). Both containers coexist.
+   *   mode: 'recreate'  — prefilled from an existing inspect, name
+   *                       preserved by default. POST /api/containers/
+   *                       :sourceId/recreate which stops + removes
+   *                       the source then creates the new one. The
+   *                       streaming response is shown in an inline
+   *                       log pane below the form.
+   *
+   * `opts.prefill` may also be supplied directly (the System tab uses
+   * this for "Use in container" shortcuts that don't have a source
+   * container).
+   */
+  async function runContainerDialog(opts = {}) {
+    const mode = opts.mode || 'create';
+    const sourceId = opts.sourceId || null;
+    const prefill = opts.prefill || {};
+
+    // Per-mode UI tweaks. Centralised here so the rest of the
+    // function reads as one form regardless of mode.
+    const ui = {
+      create:    { title: 'Run a new container',       button: 'Run',        banner: '' },
+      duplicate: { title: `Duplicate container${prefill.name ? `: ${prefill.name}` : ''}`,
+                   button: 'Duplicate',
+                   banner: '<strong>Duplicate.</strong> A NEW container will be created with these settings. The original is untouched. Pick a new name below.' },
+      recreate:  { title: `Recreate container${prefill.name ? `: ${prefill.name}` : ''}`,
+                   button: 'Recreate',
+                   banner: '<strong class="text-amber-300">⚠ Recreate.</strong> The original container will be STOPPED and REMOVED, then a new one created with these settings. Container ID changes, logs are lost. Named volumes are preserved.' },
+    }[mode] || { title: 'Run a new container', button: 'Run', banner: '' };
+
     // Fetch host hardware discovery up-front so the Resources section
     // can render with the real GPU list + the real runtime select.
     // Best-effort — if the call fails (older backend, transient
@@ -1491,6 +1894,7 @@ import { FitAddon } from '@xterm/addon-fit';
     const form = document.createElement('div');
     form.className = 'space-y-3';
     form.innerHTML = `
+      ${ui.banner ? `<div class="rounded border ${mode === 'recreate' ? 'border-amber-500/40 bg-amber-500/10 text-amber-200' : 'border-sky-500/30 bg-sky-500/10 text-sky-200'} p-2 text-xs">${ui.banner}</div>` : ''}
       ${_section('Basic', true, `
         <label class="md:col-span-2 block"><span class="text-xs text-slate-400">Image *</span>
           <input name="image" required placeholder="nginx:latest" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
@@ -1813,13 +2217,109 @@ import { FitAddon } from '@xterm/addon-fit';
       }
     }
 
+    // Pre-populate every form field from `prefill` after the modal
+    // mounts. Walks each prefill key and sets the matching named
+    // input / select / checkbox — for the more structured fields
+    // (env, labels, ports, volumes, …) we serialise back to the
+    // textarea formats the existing parsers already understand.
+    // Runs in the same setTimeout as the GPU/device wiring above
+    // so input mutations all happen in one tick.
+    function applyPrefillToForm() {
+      const set = (n, v) => {
+        const el = form.querySelector(`[name="${n}"]`);
+        if (!el) return;
+        if (el.type === 'checkbox') el.checked = !!v;
+        else el.value = v == null ? '' : String(v);
+      };
+      const setText = (n, v) => set(n, v);
+      const setKv = (n, obj) => {
+        if (!obj || typeof obj !== 'object') return;
+        const lines = Object.entries(obj).map(([k, val]) => `${k}=${val}`).join('\n');
+        set(n, lines);
+      };
+      const setList = (n, arr) => {
+        if (!Array.isArray(arr) || !arr.length) return;
+        set(n, arr.join('\n'));
+      };
+
+      // Basic scalars
+      for (const f of [
+        'image', 'name', 'command', 'entrypoint', 'restart_policy',
+        'network', 'network_mode', 'hostname', 'mac_address',
+        'user', 'working_dir', 'stop_signal', 'cpuset_cpus',
+        'shm_size', 'log_driver',
+      ]) if (prefill[f] != null) setText(f, prefill[f]);
+
+      // Numerics
+      for (const f of ['cpus', 'cpu_shares', 'pids_limit', 'stop_grace_period']) {
+        if (prefill[f] != null) setText(f, prefill[f]);
+      }
+      // mem_* may be either bytes (numbers) or strings — pass through.
+      for (const f of ['mem_limit', 'mem_reservation', 'memswap_limit']) {
+        if (prefill[f] != null) setText(f, prefill[f]);
+      }
+
+      // Booleans
+      for (const f of ['init', 'tty', 'stdin_open', 'auto_remove', 'read_only', 'privileged']) {
+        if (prefill[f] != null) set(f, prefill[f]);
+      }
+
+      // KV maps
+      setKv('env', prefill.env);
+      setKv('labels', prefill.labels);
+      setKv('sysctls', prefill.sysctls);
+      setKv('log_opts', prefill.log_opts);
+      setKv('extra_hosts', prefill.extra_hosts);
+      setKv('tmpfs', prefill.tmpfs);
+
+      // Arrays
+      setList('dns', prefill.dns);
+      setList('dns_search', prefill.dns_search);
+      setList('security_opt', prefill.security_opt);
+      setList('cap_add', prefill.cap_add);
+      setList('cap_drop', prefill.cap_drop);
+
+      // Ports object → "host:container/proto" lines
+      if (prefill.ports && Object.keys(prefill.ports).length) {
+        const lines = Object.entries(prefill.ports).map(([containerPort, hostPort]) => {
+          const m = /^(\d+)\/(tcp|udp|sctp)$/.exec(containerPort);
+          if (!m) return `${hostPort}:${containerPort}`;
+          return `${hostPort}:${m[1]}${m[2] !== 'tcp' ? '/' + m[2] : ''}`;
+        });
+        set('ports', lines.join('\n'));
+      }
+
+      // Volumes object → "host:container:mode" lines
+      if (prefill.volumes && Object.keys(prefill.volumes).length) {
+        const lines = Object.entries(prefill.volumes).map(([host, spec]) => {
+          if (typeof spec === 'string') return `${host}:${spec}`;
+          return `${host}:${spec.bind}${spec.mode && spec.mode !== 'rw' ? ':' + spec.mode : ''}`;
+        });
+        set('volumes', lines.join('\n'));
+      }
+
+      // Ulimits array → "name=soft:hard" lines
+      if (Array.isArray(prefill.ulimits) && prefill.ulimits.length) {
+        const lines = prefill.ulimits.map((u) =>
+          `${u.name}=${u.soft}${u.hard != null && u.hard !== u.soft ? ':' + u.hard : ''}`,
+        );
+        set('ulimits', lines.join('\n'));
+      }
+    }
+    // setTimeout(0) lets modal() finish wiring `wrap` into the DOM
+    // before we look up form elements. The GPU/device wiring above
+    // runs in the same tick — sequence: device rows → prefill → GPU
+    // checkboxes (so device rows already exist when prefill adds
+    // more).
+    setTimeout(() => { try { applyPrefillToForm(); } catch (e) { /* best-effort */ } }, 0);
+
     const created = await modal({
-      title: 'Run a new container',
+      title: ui.title,
       body: form,
       size: 'xl',
       actions: [
         { label: 'Cancel', value: false, kind: 'secondary' },
-        { label: 'Run', kind: 'primary', value: true, onClick: async () => {
+        { label: ui.button, kind: 'primary', value: true, onClick: async () => {
           const get = (n) => form.querySelector(`[name="${n}"]`);
           const errBox = form.querySelector('#run-error');
           errBox.classList.add('hidden');
@@ -1942,9 +2442,59 @@ import { FitAddon } from '@xterm/addon-fit';
             payload.healthcheck = hc;
           }
 
+          // Per-mode submit. Plain create + duplicate both POST to
+          // /api/containers and surface a toast. Recreate hits the
+          // streaming endpoint and renders progress inline so the
+          // operator sees stop / remove / create / start as they
+          // happen — and can read the error message immediately when
+          // a step fails.
           try {
-            await api('/api/containers', { method: 'POST', body: JSON.stringify(payload) });
-            toast('Container created', 'success');
+            if (mode === 'recreate') {
+              // Stream the response into a log pane appended to the
+              // dialog body. Reuses the auth-aware api() wrapper
+              // but asks for the raw Response so we can read chunks.
+              let logPane = form.querySelector('#recreate-log');
+              if (!logPane) {
+                logPane = document.createElement('pre');
+                logPane.id = 'recreate-log';
+                logPane.className = 'log-pane mt-3 h-48 overflow-auto scroll-thin rounded border border-slate-800 bg-slate-950/70 p-3 text-slate-300';
+                form.appendChild(logPane);
+              }
+              logPane.textContent = '';
+              const res = await api(
+                `/api/containers/${encodeURIComponent(sourceId)}/recreate`,
+                {
+                  method: 'POST',
+                  body: JSON.stringify(payload),
+                  responseType: 'response',
+                },
+              );
+              const reader = res.body.getReader();
+              const dec = new TextDecoder();
+              let buf = '';
+              while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                logPane.textContent = buf;
+                logPane.scrollTop = logPane.scrollHeight;
+              }
+              // The endpoint marks success with a final "OK new_id=..."
+              // line; anything else means a step failed (with the
+              // line above telling us exactly which one).
+              if (/\[recreate\] OK new_id=/.test(buf)) {
+                toast('Container recreated', 'success');
+              } else {
+                // Don't close the modal on failure — keep the form
+                // populated so the operator can fix + retry.
+                showErr('Recreate failed — see the log below. The dialog stays open so you can adjust and retry.');
+                return false;
+              }
+            } else {
+              const created = await api('/api/containers', { method: 'POST', body: JSON.stringify(payload) });
+              toast(mode === 'duplicate' ? 'Container duplicated' : 'Container created', 'success');
+              return created;
+            }
           } catch (e) {
             return showErr(e.message);
           }
@@ -3692,6 +4242,7 @@ import { FitAddon } from '@xterm/addon-fit';
                 ${isAdmin && s.managed && composeAvail ? `<button data-act="down" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">▼ Down</button>` : ''}
                 ${isAdmin && s.managed && composeAvail ? `<button data-act="restart" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">↻ Restart</button>` : ''}
                 ${isAdmin && s.managed && composeAvail ? `<button data-act="pull" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⤓ Pull</button>` : ''}
+                ${isAdmin && s.managed && composeAvail ? `<button data-act="duplicate" data-name="${escapeHtml(s.name)}" title="Create a new stack from this one's compose.yml + .env" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⎘ Duplicate</button>` : ''}
                 ${isAdmin && s.managed ? `<button data-act="delete" data-name="${escapeHtml(s.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Delete</button>` : ''}
               </div>
             </td>
@@ -3743,6 +4294,20 @@ import { FitAddon } from '@xterm/addon-fit';
       const name = t.dataset.name; const act = t.dataset.act;
       try {
         if (act === 'open') return openStackDialog(name).then((changed) => { if (changed) load(); });
+        if (act === 'duplicate') {
+          // Fetch the full stack detail (compose + env) for prefill.
+          // The list summary omits both — they only ship via inspect.
+          let stack = null;
+          try { stack = await api(`/api/stacks/${encodeURIComponent(name)}`); }
+          catch (e) { toast(e.message, 'error'); return; }
+          const created = await newStackDialog({
+            name: `${name}-copy`,
+            compose: stack.compose || '',
+            env: stack.env || '',
+          });
+          if (created) load();
+          return;
+        }
         if (act === 'delete') {
           const ok = await confirmModal(`Tear down and delete stack "${name}"?`, { danger: true, confirmLabel: 'Delete' });
           if (!ok) return;
@@ -3801,8 +4366,16 @@ import { FitAddon } from '@xterm/addon-fit';
     await promise;
   }
 
-  async function newStackDialog() {
-    const sample = `services:
+  /**
+   * Open the "New stack" dialog.
+   *
+   * When `prefill` is supplied (typically `{name, compose, env}`
+   * from a Duplicate action), the form opens populated with the
+   * provided values; the user can edit before saving. Stack name
+   * stays editable because Docker / compose require it to be unique.
+   */
+  async function newStackDialog(prefill = {}) {
+    const sample = prefill.compose || `services:
   web:
     image: nginx:alpine
     ports:
@@ -3816,7 +4389,7 @@ import { FitAddon } from '@xterm/addon-fit';
     wrap.innerHTML = `
       <div class="grid gap-3">
         <label class="block"><span class="text-xs text-slate-400">Stack name *</span>
-          <input id="s-name" required placeholder="my-app" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
+          <input id="s-name" required placeholder="my-app" value="${escapeHtml(prefill.name || '')}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
 
         <div>
           <div class="mb-1 flex items-center justify-between text-xs text-slate-400">
@@ -3830,7 +4403,7 @@ import { FitAddon } from '@xterm/addon-fit';
         <details>
           <summary class="text-xs text-slate-400 cursor-pointer">Optional .env file</summary>
           <div id="s-env-host" class="mt-1 rounded border border-slate-700 bg-slate-950 overflow-hidden" style="height: 14vh;"></div>
-          <textarea id="s-env-fallback" hidden></textarea>
+          <textarea id="s-env-fallback" hidden>${escapeHtml(prefill.env || '')}</textarea>
         </details>
 
         <label class="flex items-center gap-2 text-xs text-slate-300">
@@ -3867,7 +4440,7 @@ import { FitAddon } from '@xterm/addon-fit';
         );
         envEditor = cm.mountEditor(
           wrap.querySelector('#s-env-host'),
-          '',
+          prefill.env || '',
           { filename: '.env', onSave: triggerSubmit },
         );
       } catch (e) {
