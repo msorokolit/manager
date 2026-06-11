@@ -4,10 +4,12 @@ import path from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, HttpError } from '../util.js';
+import { asyncHandler, HttpError, summariseBulk } from '../util.js';
 import { createApiRouter } from '../route-builder.js';
 import {
+  BulkResponse,
   PassThroughObject,
+  RegistryBulkDeleteRequest,
   RegistryPublic,
   RegistryRequest,
   RegistryUpdateRequest,
@@ -131,6 +133,47 @@ r.delete(
       await save(creds);
     });
     res.json({ removed: req.params.name });
+  }),
+);
+
+// Bulk delete for the registry list's multi-select.
+//
+// Registries live in one JSON file with a write lock, so we don't use
+// runBoundedParallel here — we take the lock once, drop every requested
+// name from the map, and save once. That's atomic from the API surface:
+// every delete in a batch either happens together or not at all on
+// our side (the file rename is atomic).
+//
+// Per-item ok/error is still returned so the SPA renders a row-by-row
+// report; the only per-item failure mode is "name didn't exist".
+r.post(
+  '/delete/bulk',
+  {
+    summary: 'Delete many registry credential sets at once (multi-select)',
+    admin: true,
+    destructive: true,
+    body: RegistryBulkDeleteRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const names = req.body.names;
+    const results = await withLock(async () => {
+      const creds = await load();
+      const out = [];
+      for (const name of names) {
+        if (creds[name]) {
+          delete creds[name];
+          out.push({ name, ok: true });
+        } else {
+          out.push({ name, ok: false, error: 'Not found' });
+        }
+      }
+      // Only write back if at least one row changed; otherwise we'd
+      // touch the file's mtime for nothing.
+      if (out.some((r) => r.ok)) await save(creds);
+      return out;
+    });
+    res.json(summariseBulk(results));
   }),
 );
 

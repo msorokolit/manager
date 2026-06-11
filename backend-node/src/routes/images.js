@@ -1,9 +1,14 @@
 // Image management endpoints.
 import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, boolQuery, HttpError, pipeNdjson } from '../util.js';
+import {
+  asyncHandler, boolQuery, bulkErrorString, HttpError, pipeNdjson,
+  runBoundedParallel, summariseBulk,
+} from '../util.js';
 import { createApiRouter, streamResponse } from '../route-builder.js';
 import {
+  BulkResponse,
+  ImageBulkRemoveRequest,
   ImageIdParam,
   ImageSummary,
   PassThroughObject,
@@ -113,6 +118,47 @@ r.post(
     const danglingOnly = boolQuery(req.query.dangling_only, true);
     const filters = danglingOnly ? { dangling: ['true'] } : {};
     res.json(await getClient().pruneImages({ filters }));
+  }),
+);
+
+// Bulk remove for the image list's multi-select.
+//
+// Registered before the regex route so Express's literal-vs-regex tie-
+// break picks this first (and `IMAGE_REF_REGEX` already excludes the
+// `prune` prefix; we don't need a parallel carve-out because methods
+// differ — bulk is POST, the regex route is GET/DELETE).
+//
+// Per-item results carry the raw ref string back so the SPA can match
+// rows by identity regardless of whether the user submitted IDs or
+// tag references.
+r.post(
+  '/remove/bulk',
+  {
+    summary: 'Bulk remove images (multi-select; optional force + noprune)',
+    admin: true,
+    destructive: true,
+    body: ImageBulkRemoveRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const force = !!req.body.force;
+    const noprune = !!req.body.noprune;
+    const out = await runBoundedParallel(req.body.ids, async (id) => {
+      try {
+        await getClient().getImage(id).remove({ force, noprune });
+        return { id, ok: true };
+      } catch (err) {
+        if (err.statusCode === 404) return { id, ok: false, error: 'Not found' };
+        if (err.statusCode === 409) {
+          return {
+            id, ok: false,
+            error: 'Image is in use by a container (pass force:true to remove anyway)',
+          };
+        }
+        return { id, ok: false, error: bulkErrorString(err) };
+      }
+    });
+    res.json(summariseBulk(out));
   }),
 );
 

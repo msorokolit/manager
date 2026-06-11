@@ -4,12 +4,19 @@ import { getClient } from '../docker-client.js';
 import {
   asyncHandler,
   boolQuery,
+  bulkErrorString,
   intQuery,
   pipeNdjson,
   pipeRaw,
+  runBoundedParallel,
+  summariseBulk,
 } from '../util.js';
 import { createApiRouter, streamResponse, customResponse } from '../route-builder.js';
 import {
+  BulkResponse,
+  ContainerBulkRemoveRequest,
+  ContainerBulkSimpleRequest,
+  ContainerBulkStopRequest,
   ContainerSummary,
   CreateContainerRequest,
   PassThroughObject,
@@ -264,6 +271,102 @@ r.delete(
     const c = getClient().getContainer(req.params.id);
     await c.remove({ force, v });
     res.json({ removed: req.params.id });
+  }),
+);
+
+// ---------- Bulk action endpoints ----------
+//
+// One endpoint per verb so the request body is precisely typed (stop
+// has `timeout`, remove has `force`+`volumes`, the rest take ids only).
+// All run with bounded parallelism (5 in flight) and return a per-item
+// report — never fail the batch because one container was already in
+// the target state.
+//
+// 304 Not Modified from the daemon ("already running" / "already
+// stopped") is treated as success: bulk operators usually want
+// "make sure these are running" semantics, not "fail if any were
+// already running".
+async function runBulkAction(ids, verb, perContainer = () => undefined) {
+  return runBoundedParallel(ids, async (id) => {
+    try {
+      const c = getClient().getContainer(id);
+      const args = perContainer(id);
+      if (args === undefined) await c[verb]();
+      else await c[verb](args);
+      return { id, ok: true };
+    } catch (err) {
+      // 304 = "already in target state" — bulk "start all" should not
+      // count already-running containers as failures.
+      if (err.statusCode === 304) return { id, ok: true };
+      return { id, ok: false, error: bulkErrorString(err) };
+    }
+  });
+}
+
+for (const verb of ['start', 'restart', 'pause', 'unpause', 'kill']) {
+  r.post(
+    `/${verb}/bulk`,
+    {
+      summary: `Bulk ${verb} containers (multi-select)`,
+      admin: true,
+      destructive: true,
+      body: ContainerBulkSimpleRequest,
+      responses: { 200: BulkResponse },
+    },
+    asyncHandler(async (req, res) => {
+      const out = await runBulkAction(req.body.ids, verb);
+      res.json(summariseBulk(out));
+    }),
+  );
+}
+
+r.post(
+  '/stop/bulk',
+  {
+    summary: 'Bulk stop containers (multi-select; optional timeout before SIGKILL)',
+    admin: true,
+    destructive: true,
+    body: ContainerBulkStopRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const t = req.body.timeout == null ? undefined : Number(req.body.timeout);
+    // dockerode signature: stop({ t: seconds }). undefined → daemon default.
+    const out = await runBulkAction(req.body.ids, 'stop', () =>
+      t === undefined ? undefined : { t },
+    );
+    res.json(summariseBulk(out));
+  }),
+);
+
+r.post(
+  '/remove/bulk',
+  {
+    summary: 'Bulk remove containers (multi-select; force + remove-anonymous-volumes flags)',
+    admin: true,
+    destructive: true,
+    body: ContainerBulkRemoveRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const force = !!req.body.force;
+    const v = !!req.body.volumes;
+    const out = await runBoundedParallel(req.body.ids, async (id) => {
+      try {
+        await getClient().getContainer(id).remove({ force, v });
+        return { id, ok: true };
+      } catch (err) {
+        if (err.statusCode === 404) return { id, ok: false, error: 'Not found' };
+        if (err.statusCode === 409) {
+          return {
+            id, ok: false,
+            error: 'Container is running — pass force:true to remove it anyway',
+          };
+        }
+        return { id, ok: false, error: bulkErrorString(err) };
+      }
+    });
+    res.json(summariseBulk(out));
   }),
 );
 

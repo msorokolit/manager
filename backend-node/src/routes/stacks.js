@@ -9,14 +9,19 @@ import { settings } from '../config.js';
 import { getClient } from '../docker-client.js';
 import {
   asyncHandler,
+  bulkErrorString,
   HttpError,
   intQuery,
+  runBoundedParallel,
+  summariseBulk,
   writeWithBackpressure,
 } from '../util.js';
 import { createApiRouter, streamResponse } from '../route-builder.js';
 import {
+  BulkResponse,
   CreateStackRequest,
   PassThroughObject,
+  StackBulkRequest,
   StackDetail,
   StackNameParam,
   StackServiceActionParam,
@@ -163,6 +168,64 @@ function composeArgv(name, ...args) {
   argv.push(...args);
   return { argv, cwd: target };
 }
+/**
+ * Run a compose command without streaming, returning {ok, code, stdout,
+ * stderr}. Used by the bulk endpoints because interleaving 5 compose
+ * processes' real-time output into one HTTP response would be useless
+ * to the operator. Inherits the same wall-clock deadline / SIGTERM →
+ * SIGKILL teardown as streamCompose.
+ */
+function runCompose(name, ...args) {
+  return new Promise((resolve) => {
+    let argv, cwd;
+    try { ({ argv, cwd } = composeArgv(name, ...args)); }
+    catch (err) {
+      return resolve({
+        ok: false, code: -1, stdout: '',
+        stderr: err.detail || err.message || 'compose setup failed',
+      });
+    }
+    let proc;
+    try { proc = spawn(settings.composeBin, argv, { cwd }); }
+    catch (err) {
+      return resolve({ ok: false, code: -1, stdout: '', stderr: err.message });
+    }
+    let stdout = '', stderr = '';
+    let killed = false;
+    const onKill = (reason) => {
+      if (killed) return;
+      killed = true;
+      try { proc.kill('SIGTERM'); } catch {}
+      setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, settings.composeKillGraceMs).unref();
+      stderr += `\n[manager] ${reason}\n`;
+    };
+    let deadlineTimer = null;
+    if (settings.composeDeadlineMs > 0) {
+      deadlineTimer = setTimeout(
+        () => onKill(`compose deadline ${settings.composeDeadlineMs}ms reached`),
+        settings.composeDeadlineMs,
+      );
+      deadlineTimer.unref && deadlineTimer.unref();
+    }
+    proc.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+    proc.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+    proc.on('error', (err) => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      resolve({ ok: false, code: -1, stdout, stderr: stderr + err.message });
+    });
+    proc.on('close', (code, signal) => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      resolve({
+        ok: !killed && code === 0,
+        code: signal ? -1 : code,
+        signal: signal || null,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
 function streamCompose(res, name, ...args) {
   let argv, cwd;
   try { ({ argv, cwd } = composeArgv(name, ...args)); }
@@ -457,7 +520,150 @@ r.delete(
   }),
 );
 
+// ---------- Bulk endpoints ----------
+//
+// Bulk operations on stacks fan out compose processes with bounded
+// parallelism (3 in flight by default — each compose run is itself
+// heavy on the daemon, so 5 was too aggressive). Per-stack failures
+// come back as a row in `results` instead of failing the whole batch.
+//
+// Why not stream interleaved output like the single-stack endpoints?
+// Because watching 3-5 streams of compose progress lines in one
+// response is unreadable; the SPA's bulk bar surfaces the summary,
+// and the operator can drill into individual stacks for full output.
+//
+// Parallelism is intentionally lower than the volume/network bulks
+// because compose itself parallelises across services within one
+// stack, so the daemon is already busy.
+const STACK_BULK_CONCURRENCY = 3;
+
+async function bulkStacks(names, args, { needsManaged = true } = {}) {
+  return runBoundedParallel(
+    names,
+    async (name) => {
+      try {
+        if (!NAME_RE.test(name)) {
+          return { name, ok: false, error: 'invalid stack name' };
+        }
+        if (needsManaged && !isManaged(name)) {
+          return { name, ok: false, error: 'Not found (or not managed)' };
+        }
+        const out = await runCompose(name, ...args);
+        if (out.ok) return { name, ok: true };
+        const tail = (out.stderr || out.stdout || '').trim().slice(-400);
+        return { name, ok: false, error: tail || `compose exited ${out.code}` };
+      } catch (err) {
+        return { name, ok: false, error: bulkErrorString(err) };
+      }
+    },
+    STACK_BULK_CONCURRENCY,
+  );
+}
+
+r.post(
+  '/up/bulk',
+  {
+    summary: 'compose up -d on many stacks (parallel; per-stack results)',
+    admin: true,
+    destructive: true,
+    expensive: true,
+    body: StackBulkRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    await ensureRoot(true);
+    const out = await bulkStacks(req.body.names, ['up', '-d', '--remove-orphans']);
+    res.json(summariseBulk(out));
+  }),
+);
+
+r.post(
+  '/down/bulk',
+  {
+    summary: 'compose down on many stacks (parallel; optional -v to drop volumes)',
+    admin: true,
+    destructive: true,
+    expensive: true,
+    body: StackBulkRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    await ensureRoot(false);
+    const args = ['down', '--remove-orphans'];
+    if (req.body.volumes) args.push('-v');
+    const out = await bulkStacks(req.body.names, args);
+    res.json(summariseBulk(out));
+  }),
+);
+
+r.post(
+  '/restart/bulk',
+  {
+    summary: 'compose restart on many stacks (parallel; per-stack results)',
+    admin: true,
+    destructive: true,
+    expensive: true,
+    body: StackBulkRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    await ensureRoot(false);
+    const out = await bulkStacks(req.body.names, ['restart']);
+    res.json(summariseBulk(out));
+  }),
+);
+
+r.post(
+  '/remove/bulk',
+  {
+    summary: 'Tear down + remove many stacks (compose down + delete files)',
+    admin: true,
+    destructive: true,
+    expensive: true,
+    body: StackBulkRequest,
+    responses: { 200: BulkResponse },
+  },
+  asyncHandler(async (req, res) => {
+    await ensureRoot(false);
+    const results = await runBoundedParallel(
+      req.body.names,
+      async (name) => {
+        try {
+          if (!NAME_RE.test(name)) {
+            return { name, ok: false, error: 'invalid stack name' };
+          }
+          if (!isManaged(name)) {
+            return { name, ok: false, error: 'Not found (or not managed)' };
+          }
+          // Best-effort tear-down; even if compose down fails we still
+          // wipe the stored files (matches the single-stack DELETE
+          // behaviour). The compose error, if any, is captured for the
+          // result so the operator knows the daemon side may need
+          // manual cleanup.
+          const downArgs = ['down', '--remove-orphans'];
+          if (req.body.volumes) downArgs.push('-v');
+          const composeOut = await runCompose(name, ...downArgs);
+          await fs.rm(stackDir(name), { recursive: true, force: true });
+          if (composeOut.ok) return { name, ok: true };
+          // The files are gone but compose down failed (e.g. permission
+          // error on a volume). Treat as a partial: return ok:false so
+          // the operator can investigate.
+          const tail = (composeOut.stderr || composeOut.stdout || '').trim().slice(-400);
+          return {
+            name, ok: false,
+            error: `compose down failed (files removed): ${tail || composeOut.code}`,
+          };
+        } catch (err) {
+          return { name, ok: false, error: bulkErrorString(err) };
+        }
+      },
+      STACK_BULK_CONCURRENCY,
+    );
+    res.json(summariseBulk(results));
+  }),
+);
+
 // Visible-for-testing only.
-export const _internals = { parseCompose };
+export const _internals = { parseCompose, runCompose };
 
 export default r;

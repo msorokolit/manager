@@ -13,6 +13,13 @@ import { VERSION } from './config.js';
 const COMPONENT_SCHEMAS = [
   S.ErrorResponse,
   S.ValidationError,
+  // Shared bulk plumbing (one canonical envelope for every multi-select
+  // operation across containers / images / volumes / networks / stacks /
+  // registries; per-resource request bodies follow it below).
+  S.BulkIdsRequest,
+  S.BulkNamesRequest,
+  S.BulkResult,
+  S.BulkResponse,
   S.LoginRequest,
   S.LoginResponse,
   S.MeResponse,
@@ -22,8 +29,11 @@ const COMPONENT_SCHEMAS = [
   S.TicketResponse,
   S.CreateContainerRequest,
   S.ContainerSummary,
+  S.ContainerBulkStopRequest,
+  S.ContainerBulkRemoveRequest,
   S.PullRequest,
   S.ImageSummary,
+  S.ImageBulkRemoveRequest,
   S.CreateNetworkRequest,
   S.ConnectRequest,
   S.DisconnectRequest,
@@ -59,9 +69,11 @@ const COMPONENT_SCHEMAS = [
   S.UpdateStackRequest,
   S.StackSummary,
   S.StackDetail,
+  S.StackBulkRequest,
   S.ValidateResponse,
   S.RegistryRequest,
   S.RegistryUpdateRequest,
+  S.RegistryBulkDeleteRequest,
   S.RegistryPublic,
 ];
 

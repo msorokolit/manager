@@ -110,3 +110,51 @@ export function boolQuery(v, fallback = false) {
   if (v == null) return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
 }
+
+/**
+ * Run an async `worker(item)` over `items` with bounded parallelism.
+ * Results are returned in request order so the SPA's row-by-row report
+ * lines up with the user's selection.
+ *
+ * Used by every bulk endpoint: containers (start/stop/rm/…), images,
+ * stacks (up/down/rm), volumes (rm), networks (rm), registries (rm).
+ * Centralising this here lets us tune the concurrency cap in one spot
+ * and gives every endpoint the same predictable order semantics.
+ */
+export async function runBoundedParallel(items, worker, concurrency = 5) {
+  const out = new Array(items.length);
+  for (let i = 0; i < items.length; i += concurrency) {
+    const slice = items.slice(i, i + concurrency);
+    const settled = await Promise.all(slice.map((it) => worker(it)));
+    for (let j = 0; j < settled.length; j++) out[i + j] = settled[j];
+  }
+  return out;
+}
+
+/**
+ * Map a dockerode error to a short, action-appropriate user-facing string.
+ * Picks the daemon's `message` when available (it's usually descriptive
+ * — "container is already paused", "Conflict, You cannot remove a
+ * running container" etc.) and shortens it.
+ */
+export function bulkErrorString(err, fallback = 'unknown error') {
+  if (!err) return fallback;
+  if (err.statusCode === 404) return 'Not found';
+  if (err.statusCode === 409) return err.message || 'Conflict';
+  if (err.statusCode === 304) return 'Already in target state';
+  if (err.statusCode === 500) return err.message || 'Daemon error';
+  return err.message || fallback;
+}
+
+/**
+ * Roll a per-item results array into the canonical bulk-response shape
+ * the SPA expects. Every bulk endpoint emits exactly this envelope:
+ *   { succeeded, failed, results: [{id|name, ok, error?}] }
+ */
+export function summariseBulk(results) {
+  return {
+    succeeded: results.filter((x) => x.ok).length,
+    failed: results.filter((x) => !x.ok).length,
+    results,
+  };
+}
