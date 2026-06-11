@@ -30,6 +30,13 @@ import { appendLine, queryLines, createStore } from './jsonl-store.js';
 let store = null;
 let intervalHandle = null;
 let stopping = false;
+// Single-flight guard: a tick takes ~1s × ⌈N/8⌉ + sample gap.
+// On a host with 200 containers a single tick can run ~25s. If
+// the next setInterval fires before we finish, two buildStatsSummary
+// calls would hit the daemon in parallel AND write duplicate rows.
+// We just skip the overlapping tick.
+let tickInflight = false;
+let skippedTicks = 0;
 
 function getStore() {
   if (!store || store.file !== settings.statsHistoryFile) {
@@ -102,6 +109,20 @@ export function start(sampleFn) {
 
 async function _tick(sampleFn) {
   if (stopping) return;
+  if (tickInflight) {
+    // Previous tick still running — skip this one. Log every 10th
+    // skip so a persistently-overlapping sampler is visible without
+    // log spam every interval.
+    skippedTicks++;
+    if (skippedTicks % 10 === 1) {
+      logger.warn({
+        skipped_ticks: skippedTicks,
+        interval_sec: settings.statsHistoryIntervalSec,
+      }, 'stats-history: previous tick still running; interval may be too aggressive');
+    }
+    return;
+  }
+  tickInflight = true;
   try {
     const summary = await sampleFn();
     await recordSample(summary);
@@ -109,6 +130,8 @@ async function _tick(sampleFn) {
     // A single sample failure shouldn't kill the sampler — usually
     // it's a transient daemon hiccup. Log + carry on.
     logger.warn({ err: err.message }, 'stats-history: sample tick failed');
+  } finally {
+    tickInflight = false;
   }
 }
 
@@ -116,6 +139,9 @@ async function _tick(sampleFn) {
 export function stop() {
   stopping = true;
   if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+  // tickInflight may stay true if a tick was mid-flight; that's
+  // fine, the in-progress sample will write its row and complete.
+  // resetForTests clears the flag for clean test isolation.
 }
 
 /**
@@ -147,9 +173,14 @@ export async function queryStats(q = {}) {
 // Visible-for-testing only.
 export const _internals = {
   getStore,
+  getSkippedTicks: () => skippedTicks,
+  getTickInflight: () => tickInflight,
+  tick: _tick,                    // exposed so tests can drive ticks deterministically
   resetForTests() {
     stopping = false;
     if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+    tickInflight = false;
+    skippedTicks = 0;
     store = null;
   },
 };

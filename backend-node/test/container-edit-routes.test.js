@@ -32,6 +32,7 @@ const removeMock = vi.fn();
 const createMock = vi.fn();
 const startMock = vi.fn();
 const pullMock = vi.fn();
+const networkConnectMock = vi.fn();
 
 function makeInspect(name, opts = {}) {
   return {
@@ -47,7 +48,7 @@ function makeInspect(name, opts = {}) {
       Memory: opts.memory || 0,
       RestartPolicy: opts.restart_policy ? { Name: opts.restart_policy } : { Name: 'no' },
     },
-    NetworkSettings: { Networks: {} },
+    NetworkSettings: { Networks: opts.networks || {} },
     State: { Running: !!opts.running, Status: opts.running ? 'running' : 'exited' },
     Created: '2026-06-11T12:00:00Z',
   };
@@ -108,6 +109,11 @@ vi.mock('../src/docker-client.js', () => {
     modem: {
       followProgress: (_stream, cb) => cb(null),
     },
+    getNetwork(name) {
+      return {
+        connect: async (opts) => { networkConnectMock(name, opts); return {}; },
+      };
+    },
   };
   return {
     getClient: () => client,
@@ -136,6 +142,7 @@ beforeEach(() => {
   createMock.mockReset();
   startMock.mockReset();
   pullMock.mockReset();
+  networkConnectMock.mockReset();
 });
 
 // ============================================================
@@ -282,9 +289,120 @@ describe('POST /api/containers/:id/recreate', () => {
     expect(r.text).toMatch(/\[recreate\] OK new_id=new-container-id/);
 
     expect(stopMock).toHaveBeenCalledWith('c1', { t: 10 });
-    expect(removeMock).toHaveBeenCalledWith('c1', expect.objectContaining({ v: false }));
+    // After a clean stop we now prefer force:false (it errors if the
+    // daemon thinks the container is somehow still running, which
+    // would surface stop having silently failed).
+    expect(removeMock).toHaveBeenCalledWith('c1', expect.objectContaining({ v: false, force: false }));
     expect(createMock).toHaveBeenCalledTimes(1);
     expect(startMock).toHaveBeenCalledWith(fakeNewContainerId);
+  });
+
+  it('emits a structured terminal JSON line on success', async () => {
+    fakeContainers.set('c1', makeInspect('c1', { running: true }));
+    const r = await request(buildApp())
+      .post('/api/containers/c1/recreate')
+      .set('Authorization', withRole('admin'))
+      .send({ image: 'nginx:alpine' });
+    // Last non-empty line of the body should be a JSON object with
+    // status:'ok' and the new container id. This is what the SPA
+    // (and any programmatic caller) parses to decide outcome.
+    const last = r.text.trim().split('\n').filter((l) => l.trim()).pop();
+    expect(last[0]).toBe('{');
+    const result = JSON.parse(last);
+    expect(result.status).toBe('ok');
+    expect(result.new_id).toBe(fakeNewContainerId);
+    expect(result.network_errors).toEqual([]);
+  });
+
+  it('emits a structured terminal JSON line on create failure (original gone)', async () => {
+    fakeContainers.set('c1', makeInspect('c1', { running: true }));
+    createMock.mockImplementationOnce(() => { throw new Error('image not found'); });
+    const r = await request(buildApp())
+      .post('/api/containers/c1/recreate')
+      .set('Authorization', withRole('admin'))
+      .send({ image: 'nginx:does-not-exist' });
+    const last = r.text.trim().split('\n').filter((l) => l.trim()).pop();
+    const result = JSON.parse(last);
+    expect(result.status).toBe('error');
+    expect(result.step).toBe('create');
+    expect(result.detail).toMatch(/image not found/);
+    expect(result.original_gone).toBe(true);
+  });
+
+  it('emits a structured terminal JSON line on stop failure (no mutation past stop)', async () => {
+    fakeContainers.set('c1', makeInspect('c1', { running: true }));
+    stopMock.mockImplementationOnce(() => {
+      const e = new Error('container is frozen'); e.statusCode = 500; throw e;
+    });
+    const r = await request(buildApp())
+      .post('/api/containers/c1/recreate')
+      .set('Authorization', withRole('admin'))
+      .send({ image: 'nginx:alpine' });
+    const last = r.text.trim().split('\n').filter((l) => l.trim()).pop();
+    const result = JSON.parse(last);
+    expect(result.status).toBe('error');
+    expect(result.step).toBe('stop');
+    // We should NOT have proceeded to remove / create.
+    expect(removeMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it('reconnects the new container to every non-default source network', async () => {
+    fakeContainers.set('c1', makeInspect('c1', {
+      running: true,
+      networks: {
+        bridge: { IPAddress: '172.17.0.5' },              // default — skipped
+        'app-frontend': { Aliases: ['web', 'frontend'], IPAMConfig: { IPv4Address: '10.5.0.10' } },
+        'app-backend':  { Aliases: ['api'] },
+      },
+    }));
+    const r = await request(buildApp())
+      .post('/api/containers/c1/recreate')
+      .set('Authorization', withRole('admin'))
+      .send({ image: 'nginx:alpine' });
+    expect(r.status).toBe(200);
+    // Default networks (bridge / host / none) are NOT reconnected
+    // explicitly — they ride NetworkMode. We should see one
+    // connect() call per non-default network, with aliases + IPv4
+    // preserved.
+    expect(networkConnectMock).toHaveBeenCalledTimes(2);
+    expect(networkConnectMock).toHaveBeenCalledWith('app-frontend', expect.objectContaining({
+      Container: fakeNewContainerId,
+      EndpointConfig: expect.objectContaining({
+        Aliases: ['web', 'frontend'],
+        IPAMConfig: { IPv4Address: '10.5.0.10' },
+      }),
+    }));
+    expect(networkConnectMock).toHaveBeenCalledWith('app-backend', expect.objectContaining({
+      Container: fakeNewContainerId,
+      EndpointConfig: expect.objectContaining({ Aliases: ['api'] }),
+    }));
+    // Streamed text mentions the preservation up front so the
+    // operator sees what's being done.
+    expect(r.text).toMatch(/preserving 2 extra network attachment\(s\): app-frontend, app-backend/);
+    // Final JSON line has no network errors.
+    const last = r.text.trim().split('\n').filter((l) => l.trim()).pop();
+    expect(JSON.parse(last).network_errors).toEqual([]);
+  });
+
+  it('surfaces per-network reconnect failures in network_errors but still starts the container', async () => {
+    fakeContainers.set('c1', makeInspect('c1', {
+      running: true,
+      networks: { 'bad-net': { Aliases: ['x'] } },
+    }));
+    networkConnectMock.mockImplementationOnce(() => { throw new Error('network bad-net not found'); });
+    const r = await request(buildApp())
+      .post('/api/containers/c1/recreate')
+      .set('Authorization', withRole('admin'))
+      .send({ image: 'nginx:alpine' });
+    expect(r.status).toBe(200);
+    expect(startMock).toHaveBeenCalledWith(fakeNewContainerId);
+    const last = r.text.trim().split('\n').filter((l) => l.trim()).pop();
+    const result = JSON.parse(last);
+    expect(result.status).toBe('ok'); // start succeeded
+    expect(result.network_errors).toHaveLength(1);
+    expect(result.network_errors[0].network).toBe('bad-net');
+    expect(result.network_errors[0].detail).toMatch(/bad-net not found/);
   });
 
   it('preserves the original name when no name is supplied', async () => {

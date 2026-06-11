@@ -93,6 +93,26 @@ describe('computeStats — per-CPU breakdown', () => {
     const s = makeSample();
     expect(computeStats(s).per_cpu_pct).toEqual([]);
   });
+
+  it('per-CPU multiplier is online_cpus, NOT percpu.length (hot-pluggable VM correctness)', () => {
+    // 8 entries in percpu_usage, but only 4 CPUs are currently
+    // online. Cloud VMs (and some bare-metal hot-plug setups)
+    // expose this: percpu_usage covers every CPU the kernel ever
+    // saw, while online_cpus is what's currently usable.
+    //
+    // Before the fix the multiplier was percpu.length=8, so each
+    // per-CPU bar over-reported by 2x. After the fix it uses
+    // online_cpus=4, matching the aggregate cpu_pct.
+    const s = makeSample({
+      percpu: [400, 400, 0, 200, 0, 0, 0, 0],  // last 4 cores offline
+      cpus: 4,                                  // online_cpus
+    });
+    const r = computeStats(s);
+    // Same math as before — but multiplier is cpus (4), not
+    // percpu.length (8). Deltas = [200,200,0,100,0,0,0,0],
+    // sys_delta=500. Each = delta/500 * 4 * 100 = [160,160,0,80,0,0,0,0].
+    expect(r.per_cpu_pct).toEqual([160, 160, 0, 80, 0, 0, 0, 0]);
+  });
 });
 
 describe('computeStats — memory ex-cache', () => {
