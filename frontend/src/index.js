@@ -275,6 +275,151 @@ import { FitAddon } from '@xterm/addon-fit';
     });
   }
 
+  // ---------- Bulk selection + action bar helper ----------
+  //
+  // Every list view in the SPA needs the same multi-select infrastructure:
+  // a Set of keys to track selection, a header checkbox that selects every
+  // visible row, a per-row checkbox, and a sticky action bar that appears
+  // when ≥1 row is selected. Rather than reimplement it 6 times we
+  // centralise the plumbing here. Each view supplies:
+  //
+  //   key(item)         — how to identify a row (id, name, etc.)
+  //   isEligible(item)  — can the row be selected at all? (e.g. system
+  //                       networks aren't bulk-deletable)
+  //   onChange()        — called whenever the selection size changes
+  //
+  // and gets back:
+  //
+  //   selected         — Set<key>
+  //   wireRow(rowEl)   — attaches the row checkbox change handler
+  //   selectAllCheckbox(items) → HTML for the header checkbox + JS to wire
+  //   bulkBar({...})   — the action-bar DOM node (hidden when empty)
+  //   handleBulkResp(out) — common per-item toast surfacing for backend
+  //                        `{succeeded, failed, results: [...]}`
+  //
+  // None of this is mandatory — views that need bespoke behaviour
+  // (e.g. system-network rows hide the checkbox entirely) can opt out
+  // of any individual helper.
+  function createBulkSelection({ key = (x) => x.id, isEligible = () => true, onChange } = {}) {
+    const selected = new Set();
+    return {
+      selected,
+      // Filter the currently-loaded items down to those eligible to
+      // appear in bulk actions. Pages may show ineligible rows but
+      // mustn't put them in the selection.
+      eligibleOf(items) {
+        return (items || []).filter(isEligible);
+      },
+      // Drop any selections whose underlying row has disappeared from
+      // the loaded set — called from each view's refresh handler so
+      // selections survive a redraw but don't accumulate ghosts.
+      pruneAgainst(items) {
+        const live = new Set((items || []).map(key));
+        for (const k of [...selected]) if (!live.has(k)) selected.delete(k);
+      },
+      add(k) { selected.add(k); onChange && onChange(selected); },
+      delete(k) { selected.delete(k); onChange && onChange(selected); },
+      clear() { selected.clear(); onChange && onChange(selected); },
+      has(k) { return selected.has(k); },
+      get size() { return selected.size; },
+      values() { return [...selected]; },
+    };
+  }
+
+  /**
+   * Build the shared bulk action bar DOM. Hidden when selection is empty.
+   *
+   *   actions: [{label, kind, onClick(selected: string[])}]
+   *
+   * onClick is invoked with the current selection array; if it
+   * returns truthy / resolves to truthy, the bar's selection is
+   * cleared after the action (typical for delete-style ops). Each
+   * action button is full-keyboard-accessible (button element, no
+   * <a href>).
+   */
+  function bulkBar(bulkSel, { actions = [], emptyLabel = 'selected' } = {}) {
+    const bar = document.createElement('div');
+    bar.className = 'mb-2 hidden items-center justify-between rounded border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs';
+    const left = document.createElement('span');
+    const count = document.createElement('span');
+    count.className = 'font-semibold text-sky-200';
+    count.textContent = '0';
+    left.appendChild(count);
+    left.appendChild(document.createTextNode(` ${emptyLabel}`));
+    const right = document.createElement('div');
+    right.className = 'flex items-center flex-wrap gap-2';
+
+    const buttons = actions.map((a) => {
+      const b = document.createElement('button');
+      const kinds = {
+        primary:   'bg-sky-500/80 hover:bg-sky-500 text-slate-950',
+        success:   'bg-emerald-500/80 hover:bg-emerald-500 text-white',
+        warn:      'bg-amber-500/80 hover:bg-amber-500 text-slate-950',
+        danger:    'bg-rose-500/80 hover:bg-rose-500 text-white',
+        secondary: 'bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100',
+      };
+      b.className = `rounded ${kinds[a.kind] || kinds.secondary} px-2 py-1 disabled:opacity-50`;
+      b.textContent = a.label;
+      b.onclick = async () => {
+        const ids = bulkSel.values();
+        if (!ids.length) return;
+        b.disabled = true;
+        try {
+          const clearAfter = await a.onClick(ids);
+          if (clearAfter !== false) bulkSel.clear();
+        } finally {
+          b.disabled = false;
+          render();
+        }
+      };
+      right.appendChild(b);
+      return b;
+    });
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-slate-300';
+    clearBtn.textContent = 'Clear';
+    clearBtn.onclick = () => { bulkSel.clear(); render(); };
+    right.appendChild(clearBtn);
+
+    bar.appendChild(left);
+    bar.appendChild(right);
+
+    function render() {
+      if (bulkSel.size === 0) {
+        bar.classList.add('hidden');
+        bar.classList.remove('flex');
+      } else {
+        bar.classList.remove('hidden');
+        bar.classList.add('flex');
+        count.textContent = String(bulkSel.size);
+      }
+    }
+
+    render();
+    return { el: bar, render, buttons };
+  }
+
+  /**
+   * Surface a bulk-response `{succeeded, failed, results}` to the user
+   * uniformly — one toast per failure, one summary toast at the end.
+   * `verb` is used for the summary (e.g. "Started", "Deleted").
+   */
+  function handleBulkResponse(out, verb, idLabel = (r) => r.id || r.name) {
+    for (const r of out.results || []) {
+      if (!r.ok) toast(`${idLabel(r)}: ${r.error || 'failed'}`, 'error');
+    }
+    const total = (out.succeeded || 0) + (out.failed || 0);
+    if (out.succeeded) {
+      toast(
+        `${verb} ${out.succeeded}${out.failed ? ` of ${total}` : ''}`,
+        out.failed ? 'warn' : 'success',
+      );
+    } else if (out.failed) {
+      toast(`${verb} failed for all ${out.failed} item${out.failed === 1 ? '' : 's'}`, 'error');
+    }
+  }
+
   // ---------- Helpers ----------
   function fmtBytes(n) {
     if (n == null) return '—';
@@ -554,11 +699,13 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Containers ----------
   views.containers = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Containers',
       'Manage container lifecycle, view logs, inspect details',
-      `${btn('+ Run container', { kind: 'primary', id: 'new-container' })}
-       ${btn('Prune stopped', { kind: 'secondary', id: 'prune-containers' })}
+      `${isAdmin ? btn('+ Run container', { kind: 'primary', id: 'new-container' }) : ''}
+       ${isAdmin ? btn('Prune stopped', { kind: 'secondary', id: 'prune-containers' }) : ''}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     );
     const list = document.createElement('div');
@@ -570,8 +717,28 @@ import { FitAddon } from '@xterm/addon-fit';
       <input id="search" type="search" placeholder="Search by name or image…" class="w-full sm:w-72 rounded-md border-slate-700 bg-slate-950 text-sm" />
       <label class="flex items-center gap-2 text-xs text-slate-400">
         <input id="show-all" type="checkbox" checked class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Show stopped
-      </label>`;
+      </label>
+      <span id="containers-count" class="text-xs text-slate-500 ml-auto"></span>`;
     root.insertBefore(filterWrap, list);
+
+    // ---- Multi-select + bulk bar ----
+    const bulkSel = createBulkSelection({ key: (c) => c.id });
+    // Bulk actions defined inline so each closes over `bulkSel` + load().
+    // We hide the entire bar from non-admin users (read-only role).
+    const bulkBarObj = isAdmin
+      ? bulkBar(bulkSel, {
+          actions: [
+            { label: '▶ Start',     kind: 'success',   onClick: (ids) => bulkContainerAction('start',    ids, { verb: 'Started' }) },
+            { label: '↻ Restart',   kind: 'secondary', onClick: (ids) => bulkContainerAction('restart',  ids, { verb: 'Restarted' }) },
+            { label: '■ Stop',      kind: 'secondary', onClick: (ids) => bulkContainerAction('stop',     ids, { verb: 'Stopped', body: { timeout: 10 } }) },
+            { label: '⏸ Pause',     kind: 'secondary', onClick: (ids) => bulkContainerAction('pause',    ids, { verb: 'Paused' }) },
+            { label: '▷ Unpause',   kind: 'secondary', onClick: (ids) => bulkContainerAction('unpause',  ids, { verb: 'Unpaused' }) },
+            { label: '⚡ Kill',     kind: 'warn',      onClick: (ids) => bulkContainerAction('kill',     ids, { verb: 'Killed', confirm: true }) },
+            { label: '✕ Remove',    kind: 'danger',    onClick: (ids) => bulkContainerRemove(ids) },
+          ],
+        })
+      : { el: document.createElement('div'), render: () => {} };
+    root.insertBefore(bulkBarObj.el, list);
 
     let containers = [];
     let query = '';
@@ -581,10 +748,66 @@ import { FitAddon } from '@xterm/addon-fit';
       list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
       try {
         containers = await api(`/api/containers?all=${showAll}`);
+        bulkSel.pruneAgainst(containers);
         draw();
       } catch (e) {
         list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
       }
+    }
+
+    async function bulkContainerAction(verb, ids, { body = {}, verb: msg = 'Acted on', confirm: needConfirm = false } = {}) {
+      if (needConfirm) {
+        const ok = await confirmModal(
+          `${msg} <strong>${ids.length}</strong> container${ids.length === 1 ? '' : 's'}?`,
+          { danger: true, confirmLabel: msg },
+        );
+        if (!ok) return false; // keep selection
+      }
+      try {
+        const out = await api(`/api/containers/${verb}/bulk`, {
+          method: 'POST', body: JSON.stringify({ ids, ...body }),
+        });
+        handleBulkResponse(out, msg, (r) => containers.find((c) => c.id === r.id)?.name || r.id.slice(0, 12));
+      } catch (e) { toast(`Bulk ${verb} failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
+    }
+
+    async function bulkContainerRemove(ids) {
+      // Two-stage confirm: first plain confirm. If the daemon refuses
+      // because any container is running (per-item 409 message in
+      // results), we offer a single secondary confirm and retry the
+      // failed ones with force=true + volumes=false.
+      const ok = await confirmModal(
+        `Remove <strong>${ids.length}</strong> container${ids.length === 1 ? '' : 's'}? Running containers will fail; you'll be offered force-remove on those.`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!ok) return false;
+      try {
+        const out = await api('/api/containers/remove/bulk', {
+          method: 'POST', body: JSON.stringify({ ids, force: false, volumes: false }),
+        });
+        const stuck = (out.results || []).filter((r) => !r.ok && /running|force/i.test(r.error || ''));
+        handleBulkResponse(out, 'Removed', (r) => containers.find((c) => c.id === r.id)?.name || r.id.slice(0, 12));
+        if (stuck.length) {
+          const stuckIds = stuck.map((r) => r.id);
+          const forceOk = await confirmModal(
+            `<strong>${stuck.length}</strong> container${stuck.length === 1 ? ' is' : 's are'} still running.<br>` +
+            `Force-remove will SIGKILL them mid-flight (anonymous volumes left intact). Continue?`,
+            { danger: true, confirmLabel: 'Force remove' },
+          );
+          if (forceOk) {
+            try {
+              const out2 = await api('/api/containers/remove/bulk', {
+                method: 'POST', body: JSON.stringify({ ids: stuckIds, force: true, volumes: false }),
+              });
+              handleBulkResponse(out2, 'Force-removed', (r) => containers.find((c) => c.id === r.id)?.name || r.id.slice(0, 12));
+            } catch (e) { toast(`Force remove failed: ${e.message}`, 'error'); }
+          }
+        }
+      } catch (e) { toast(`Bulk remove failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
     }
 
     function draw() {
@@ -592,8 +815,17 @@ import { FitAddon } from '@xterm/addon-fit';
       const items = containers.filter((c) =>
         !q || c.name.toLowerCase().includes(q) || (c.image || '').toLowerCase().includes(q)
       );
-      const rows = items.map((c) => `
+      filterWrap.querySelector('#containers-count').textContent =
+        `${items.length} of ${containers.length} shown` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+
+      const rows = items.map((c) => {
+        const checked = bulkSel.has(c.id) ? 'checked' : '';
+        return `
         <tr class="hover:bg-slate-900/60">
+          <td class="px-3 py-2 w-8">
+            ${isAdmin ? `<input type="checkbox" class="containers-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-id="${c.id}" ${checked}/>` : ''}
+          </td>
           <td class="px-4 py-2">
             <button data-act="inspect" data-id="${c.id}" class="text-left">
               <div class="font-medium text-sky-300 hover:underline">${escapeHtml(c.name)}</div>
@@ -606,19 +838,38 @@ import { FitAddon } from '@xterm/addon-fit';
           <td class="px-4 py-2 text-slate-400">${fmtDate(c.created)}</td>
           <td class="px-4 py-2">
             <div class="flex flex-wrap justify-end gap-1">
-              ${actionButton(c, 'start', '▶ Start', 'primary', c.state === 'running')}
-              ${actionButton(c, 'restart', '↻ Restart', 'secondary', false)}
-              ${actionButton(c, 'stop', '■ Stop', 'secondary', c.state !== 'running')}
+              ${isAdmin ? actionButton(c, 'start', '▶ Start', 'primary', c.state === 'running') : ''}
+              ${isAdmin ? actionButton(c, 'restart', '↻ Restart', 'secondary', false) : ''}
+              ${isAdmin ? actionButton(c, 'stop', '■ Stop', 'secondary', c.state !== 'running') : ''}
               <button data-act="logs" data-id="${c.id}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Logs</button>
-              <button data-act="exec" data-id="${c.id}" data-name="${escapeHtml(c.name)}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" ${c.state !== 'running' ? 'disabled' : ''} ${c.state !== 'running' ? 'title="Container must be running"' : ''}>⌨ Terminal</button>
-              <button data-act="remove" data-id="${c.id}" class="rounded-md bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+              ${isAdmin ? `<button data-act="exec" data-id="${c.id}" data-name="${escapeHtml(c.name)}" class="rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs" ${c.state !== 'running' ? 'disabled' : ''} ${c.state !== 'running' ? 'title="Container must be running"' : ''}>⌨ Terminal</button>` : ''}
+              ${isAdmin ? `<button data-act="remove" data-id="${c.id}" class="rounded-md bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
             </div>
           </td>
-        </tr>`);
+        </tr>`;
+      });
       list.innerHTML = table(
-        ['Name', 'Image', 'Status', 'Ports', 'Created', '<span class="sr-only">Actions</span>'],
+        [
+          isAdmin
+            ? `<input id="containers-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all visible"/>`
+            : '',
+          'Name', 'Image', 'Status', 'Ports', 'Created', '<span class="sr-only">Actions</span>',
+        ],
         rows
       );
+      // Wire the select-all checkbox state — checked only when every
+      // visible row is selected; indeterminate for partial selection.
+      const cb = list.querySelector('#containers-select-all');
+      if (cb) {
+        const onPage = items.filter((c) => bulkSel.has(c.id)).length;
+        cb.checked = items.length > 0 && onPage === items.length;
+        cb.indeterminate = onPage > 0 && onPage < items.length;
+        cb.addEventListener('change', (e) => {
+          if (e.target.checked) for (const c of items) bulkSel.add(c.id);
+          else for (const c of items) bulkSel.delete(c.id);
+          draw(); bulkBarObj.render();
+        });
+      }
     }
 
     function actionButton(c, act, label, kind, disabled) {
@@ -644,6 +895,31 @@ import { FitAddon } from '@xterm/addon-fit';
       }
       return escapeHtml(parts.join(', '));
     }
+
+    list.addEventListener('change', (e) => {
+      // Per-row checkbox — updates the selection Set and refreshes the
+      // header checkbox state + bulk bar.
+      const cb = e.target.closest('input.containers-check');
+      if (!cb) return;
+      if (cb.checked) bulkSel.add(cb.dataset.id);
+      else bulkSel.delete(cb.dataset.id);
+      bulkBarObj.render();
+      // Refresh the count in the filter bar + select-all checkbox without
+      // a full table re-render.
+      const q = query.toLowerCase();
+      const items = containers.filter((c) =>
+        !q || c.name.toLowerCase().includes(q) || (c.image || '').toLowerCase().includes(q)
+      );
+      filterWrap.querySelector('#containers-count').textContent =
+        `${items.length} of ${containers.length} shown` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+      const all = list.querySelector('#containers-select-all');
+      if (all) {
+        const onPage = items.filter((c) => bulkSel.has(c.id)).length;
+        all.checked = items.length > 0 && onPage === items.length;
+        all.indeterminate = onPage > 0 && onPage < items.length;
+      }
+    });
 
     list.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]');
@@ -671,7 +947,8 @@ import { FitAddon } from '@xterm/addon-fit';
     filterWrap.querySelector('#show-all').addEventListener('change', (e) => { showAll = e.target.checked; load(); });
 
     document.getElementById('refresh').onclick = load;
-    document.getElementById('prune-containers').onclick = async () => {
+    const pruneBtn = document.getElementById('prune-containers');
+    if (pruneBtn) pruneBtn.onclick = async () => {
       const ok = await confirmModal('Remove all stopped containers?', { danger: true, confirmLabel: 'Prune' });
       if (!ok) return;
       try {
@@ -680,7 +957,8 @@ import { FitAddon } from '@xterm/addon-fit';
         load();
       } catch (e) { toast(e.message, 'error'); }
     };
-    document.getElementById('new-container').onclick = () => runContainerDialog().then((created) => { if (created) load(); });
+    const newBtn = document.getElementById('new-container');
+    if (newBtn) newBtn.onclick = () => runContainerDialog().then((created) => { if (created) load(); });
 
     await load();
   };
@@ -1360,21 +1638,97 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Images ----------
   views.images = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Images',
       'Pull, inspect, and remove container images',
-      `${btn('⤓ Pull image', { kind: 'primary', id: 'pull-image' })}
-       ${btn('Prune dangling', { kind: 'secondary', id: 'prune-images' })}
+      `${isAdmin ? btn('⤓ Pull image', { kind: 'primary', id: 'pull-image' }) : ''}
+       ${isAdmin ? btn('Prune dangling', { kind: 'secondary', id: 'prune-images' }) : ''}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     );
+
+    const controls = document.createElement('div');
+    controls.className = 'mb-3 flex items-center gap-3 text-xs';
+    controls.innerHTML = `<span id="images-count" class="text-slate-500 ml-auto"></span>`;
+    root.appendChild(controls);
+
+    // Bulk bar — remove only (Docker doesn't have a bulk pull, and prune
+    // is its own thing). Force handled via a second confirm on 409.
+    const bulkSel = createBulkSelection({ key: (i) => i.id });
+    const bulkBarObj = isAdmin
+      ? bulkBar(bulkSel, {
+          actions: [
+            { label: '✕ Remove', kind: 'danger', onClick: (ids) => bulkRemoveImages(ids) },
+          ],
+        })
+      : { el: document.createElement('div'), render: () => {} };
+    root.appendChild(bulkBarObj.el);
+
     const list = document.createElement('div'); root.appendChild(list);
+    let images = [];
+
+    function nameOf(id) {
+      const img = images.find((i) => i.id === id);
+      if (!img) return id.slice(0, 12);
+      return (img.tags && img.tags[0]) || img.short_id || id.slice(0, 12);
+    }
+
+    async function bulkRemoveImages(ids) {
+      const ok = await confirmModal(
+        `Remove <strong>${ids.length}</strong> image${ids.length === 1 ? '' : 's'}? Tags pointing at the same digest will be removed together. In-use images will fail and you'll be offered force-remove.`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!ok) return false;
+      try {
+        const out = await api('/api/images/remove/bulk', {
+          method: 'POST', body: JSON.stringify({ ids, force: false }),
+        });
+        const stuck = (out.results || []).filter((r) => !r.ok && /in use|force/i.test(r.error || ''));
+        handleBulkResponse(out, 'Removed', (r) => nameOf(r.id));
+        if (stuck.length) {
+          const forceOk = await confirmModal(
+            `<strong>${stuck.length}</strong> image${stuck.length === 1 ? ' is' : 's are'} in use by container(s).<br>` +
+            `Force-removing untags them and deletes the layers — running containers keep their copy until they exit. Continue?`,
+            { danger: true, confirmLabel: 'Force remove' },
+          );
+          if (forceOk) {
+            try {
+              const out2 = await api('/api/images/remove/bulk', {
+                method: 'POST',
+                body: JSON.stringify({ ids: stuck.map((r) => r.id), force: true }),
+              });
+              handleBulkResponse(out2, 'Force-removed', (r) => nameOf(r.id));
+            } catch (e) { toast(`Force remove failed: ${e.message}`, 'error'); }
+          }
+        }
+      } catch (e) { toast(`Bulk remove failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
+    }
 
     async function load() {
       list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
       try {
-        const items = await api('/api/images');
-        const rows = items.map((i) => `
+        images = await api('/api/images');
+        bulkSel.pruneAgainst(images);
+        draw();
+      } catch (e) {
+        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function draw() {
+      controls.querySelector('#images-count').textContent =
+        `${images.length} image${images.length === 1 ? '' : 's'}` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+      const rows = images.map((i) => {
+        const checked = bulkSel.has(i.id) ? 'checked' : '';
+        return `
           <tr class="hover:bg-slate-900/60">
+            <td class="px-3 py-2 w-8">
+              ${isAdmin ? `<input type="checkbox" class="images-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-id="${i.id}" ${checked}/>` : ''}
+            </td>
             <td class="px-4 py-2">
               <div class="font-medium">${(i.tags || []).map(escapeHtml).join('<br/>') || '<span class="text-slate-500">(untagged)</span>'}</div>
               <div class="text-[11px] text-slate-500 font-mono">${shortId(i.id)}</div>
@@ -1385,15 +1739,49 @@ import { FitAddon } from '@xterm/addon-fit';
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
                 <button data-act="inspect" data-id="${i.id}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Inspect</button>
-                <button data-act="remove" data-id="${i.id}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                ${isAdmin ? `<button data-act="remove" data-id="${i.id}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = table(['Tags', 'Size', 'Arch / OS', 'Created', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      list.innerHTML = table(
+        [
+          isAdmin
+            ? `<input id="images-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all visible"/>`
+            : '',
+          'Tags', 'Size', 'Arch / OS', 'Created', '',
+        ],
+        rows,
+      );
+      const sa = list.querySelector('#images-select-all');
+      if (sa) {
+        const onPage = images.filter((i) => bulkSel.has(i.id)).length;
+        sa.checked = images.length > 0 && onPage === images.length;
+        sa.indeterminate = onPage > 0 && onPage < images.length;
+        sa.addEventListener('change', (e) => {
+          if (e.target.checked) for (const i of images) bulkSel.add(i.id);
+          else for (const i of images) bulkSel.delete(i.id);
+          draw(); bulkBarObj.render();
+        });
       }
     }
+
+    list.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.images-check');
+      if (!cb) return;
+      if (cb.checked) bulkSel.add(cb.dataset.id);
+      else bulkSel.delete(cb.dataset.id);
+      bulkBarObj.render();
+      controls.querySelector('#images-count').textContent =
+        `${images.length} image${images.length === 1 ? '' : 's'}` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+      const sa = list.querySelector('#images-select-all');
+      if (sa) {
+        const onPage = images.filter((i) => bulkSel.has(i.id)).length;
+        sa.checked = images.length > 0 && onPage === images.length;
+        sa.indeterminate = onPage > 0 && onPage < images.length;
+      }
+    });
 
     list.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
@@ -1412,7 +1800,8 @@ import { FitAddon } from '@xterm/addon-fit';
     });
 
     document.getElementById('refresh').onclick = load;
-    document.getElementById('prune-images').onclick = async () => {
+    const pruneBtn = document.getElementById('prune-images');
+    if (pruneBtn) pruneBtn.onclick = async () => {
       const ok = await confirmModal('Remove dangling (untagged) images?', { danger: true, confirmLabel: 'Prune' });
       if (!ok) return;
       try {
@@ -1420,7 +1809,8 @@ import { FitAddon } from '@xterm/addon-fit';
         toast(`Reclaimed ${fmtBytes(r.SpaceReclaimed || 0)}`, 'success'); load();
       } catch (e) { toast(e.message, 'error'); }
     };
-    document.getElementById('pull-image').onclick = () => pullImageDialog().then((ok) => ok && load());
+    const pullBtn = document.getElementById('pull-image');
+    if (pullBtn) pullBtn.onclick = () => pullImageDialog().then((ok) => ok && load());
 
     await load();
   };
@@ -2843,6 +3233,7 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Stacks ----------
   views.stacks = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
     const composeAvail = state.config.compose_available;
     const warning = composeAvail ? '' : `
       <div class="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
@@ -2851,17 +3242,124 @@ import { FitAddon } from '@xterm/addon-fit';
     root.innerHTML = pageHeader(
       'Stacks',
       'Manage docker-compose projects',
-      `${composeAvail ? btn('+ New stack', { kind: 'primary', id: 'new-stack' }) : ''}
+      `${isAdmin && composeAvail ? btn('+ New stack', { kind: 'primary', id: 'new-stack' }) : ''}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     ) + warning;
+
+    const controls = document.createElement('div');
+    controls.className = 'mb-3 flex items-center gap-3 text-xs';
+    controls.innerHTML = `<span id="stacks-count" class="text-slate-500 ml-auto"></span>`;
+    root.appendChild(controls);
+
+    // Bulk bar — managed-only stacks (the ones with stored compose files
+    // we can drive via the CLI). Discovered-only stacks have no compose
+    // file on disk; bulk operations on them would be no-ops, so they're
+    // not selectable.
+    const bulkSel = createBulkSelection({
+      key: (s) => s.name,
+      isEligible: (s) => !!s.managed,
+    });
+    const bulkBarObj = (isAdmin && composeAvail)
+      ? bulkBar(bulkSel, {
+          actions: [
+            { label: '▲ Up',      kind: 'success',   onClick: (names) => bulkStackAction('up',      names, { verb: 'Started' }) },
+            { label: '▼ Down',    kind: 'secondary', onClick: (names) => bulkStackAction('down',    names, { verb: 'Stopped', askVolumes: true }) },
+            { label: '↻ Restart', kind: 'secondary', onClick: (names) => bulkStackAction('restart', names, { verb: 'Restarted' }) },
+            { label: '✕ Remove',  kind: 'danger',    onClick: (names) => bulkStackRemove(names) },
+          ],
+        })
+      : { el: document.createElement('div'), render: () => {} };
+    root.appendChild(bulkBarObj.el);
+
     const list = document.createElement('div'); root.appendChild(list);
+    let stacks = [];
+
+    async function bulkStackAction(verb, names, { verb: msg, askVolumes = false } = {}) {
+      let body = { names };
+      if (askVolumes) {
+        // For `down`, ask whether to also drop the stacks' volumes.
+        // Defaults to "no" because losing a database volume on a click
+        // would be a very bad day.
+        const choice = await modal({
+          title: `Down ${names.length} stack${names.length === 1 ? '' : 's'}`, size: 'sm',
+          body: `<p class="text-sm text-slate-300">Tear down ${names.length} stack${names.length === 1 ? '' : 's'} with <code>docker compose down</code>. Containers + networks defined by the compose file go away; the file itself stays on disk so you can <code>Up</code> again later.</p>
+            <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+              <input id="down-vols" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-rose-500"/>
+              Also remove anonymous volumes (<code>-v</code>) — <strong class="text-rose-300">data loss</strong>
+            </label>`,
+          actions: [
+            { label: 'Cancel', value: null, kind: 'secondary' },
+            { label: 'Down',   value: 'go', kind: 'danger' },
+          ],
+        });
+        if (choice !== 'go') return false;
+        body.volumes = !!document.querySelector('#down-vols')?.checked;
+      } else if (msg !== 'Started') {
+        // Restart confirms; Up doesn't (already explicit on click).
+        const ok = await confirmModal(
+          `${msg} <strong>${names.length}</strong> stack${names.length === 1 ? '' : 's'}? Output is shown per-stack in the toast log; for full live output, drill into an individual stack.`,
+          { danger: false, confirmLabel: msg },
+        );
+        if (!ok) return false;
+      }
+      try {
+        const out = await api(`/api/stacks/${verb}/bulk`, {
+          method: 'POST', body: JSON.stringify(body),
+        });
+        handleBulkResponse(out, msg, (r) => r.name);
+      } catch (e) { toast(`Bulk ${verb} failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
+    }
+
+    async function bulkStackRemove(names) {
+      const choice = await modal({
+        title: `Delete ${names.length} stack${names.length === 1 ? '' : 's'}`, size: 'sm',
+        body: `<p class="text-sm text-slate-300"><strong class="text-rose-300">Tear down and delete</strong> ${names.length} stack${names.length === 1 ? '' : 's'}: containers + networks defined by the compose file are removed, then the compose file and .env are deleted from the manager host.</p>
+          <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+            <input id="rm-vols" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-rose-500"/>
+            Also remove anonymous volumes (<code>-v</code>) — <strong class="text-rose-300">data loss</strong>
+          </label>`,
+        actions: [
+          { label: 'Cancel', value: null, kind: 'secondary' },
+          { label: 'Delete', value: 'go', kind: 'danger' },
+        ],
+      });
+      if (choice !== 'go') return false;
+      const body = { names, volumes: !!document.querySelector('#rm-vols')?.checked };
+      try {
+        const out = await api('/api/stacks/remove/bulk', {
+          method: 'POST', body: JSON.stringify(body),
+        });
+        handleBulkResponse(out, 'Removed', (r) => r.name);
+      } catch (e) { toast(`Bulk remove failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
+    }
 
     async function load() {
       list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
       try {
-        const items = await api('/api/stacks');
-        const rows = items.map((s) => `
+        stacks = await api('/api/stacks');
+        bulkSel.pruneAgainst(stacks);
+        draw();
+      } catch (e) {
+        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function draw() {
+      controls.querySelector('#stacks-count').textContent =
+        `${stacks.length} stack${stacks.length === 1 ? '' : 's'}` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+      const rows = stacks.map((s) => {
+        const eligible = isAdmin && composeAvail && s.managed;
+        const checked = bulkSel.has(s.name) ? 'checked' : '';
+        return `
           <tr class="hover:bg-slate-900/60">
+            <td class="px-3 py-2 w-8">
+              ${eligible ? `<input type="checkbox" class="stacks-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(s.name)}" ${checked}/>` : ''}
+            </td>
             <td class="px-4 py-2">
               <button data-act="open" data-name="${escapeHtml(s.name)}" class="text-left">
                 <div class="font-medium text-sky-300 hover:underline">${escapeHtml(s.name)}</div>
@@ -2872,19 +3370,55 @@ import { FitAddon } from '@xterm/addon-fit';
             <td class="px-4 py-2 text-slate-400">${s.running}/${s.containers}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                ${s.managed && composeAvail ? `<button data-act="up" data-name="${escapeHtml(s.name)}" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1 text-xs">▲ Up</button>` : ''}
-                ${s.managed && composeAvail ? `<button data-act="down" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">▼ Down</button>` : ''}
-                ${s.managed && composeAvail ? `<button data-act="restart" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">↻ Restart</button>` : ''}
-                ${s.managed && composeAvail ? `<button data-act="pull" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⤓ Pull</button>` : ''}
-                ${s.managed ? `<button data-act="delete" data-name="${escapeHtml(s.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Delete</button>` : ''}
+                ${isAdmin && s.managed && composeAvail ? `<button data-act="up" data-name="${escapeHtml(s.name)}" class="rounded bg-emerald-500/80 hover:bg-emerald-500 text-white px-2 py-1 text-xs">▲ Up</button>` : ''}
+                ${isAdmin && s.managed && composeAvail ? `<button data-act="down" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">▼ Down</button>` : ''}
+                ${isAdmin && s.managed && composeAvail ? `<button data-act="restart" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">↻ Restart</button>` : ''}
+                ${isAdmin && s.managed && composeAvail ? `<button data-act="pull" data-name="${escapeHtml(s.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">⤓ Pull</button>` : ''}
+                ${isAdmin && s.managed ? `<button data-act="delete" data-name="${escapeHtml(s.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Delete</button>` : ''}
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = table(['Name', 'Services', 'Running', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      list.innerHTML = table(
+        [
+          (isAdmin && composeAvail)
+            ? `<input id="stacks-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all managed stacks"/>`
+            : '',
+          'Name', 'Services', 'Running', '',
+        ],
+        rows,
+      );
+      const sa = list.querySelector('#stacks-select-all');
+      if (sa) {
+        const eligible = stacks.filter((s) => s.managed);
+        const onPage = eligible.filter((s) => bulkSel.has(s.name)).length;
+        sa.checked = eligible.length > 0 && onPage === eligible.length;
+        sa.indeterminate = onPage > 0 && onPage < eligible.length;
+        sa.addEventListener('change', (e) => {
+          if (e.target.checked) for (const s of eligible) bulkSel.add(s.name);
+          else for (const s of eligible) bulkSel.delete(s.name);
+          draw(); bulkBarObj.render();
+        });
       }
     }
+
+    list.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.stacks-check');
+      if (!cb) return;
+      if (cb.checked) bulkSel.add(cb.dataset.name);
+      else bulkSel.delete(cb.dataset.name);
+      bulkBarObj.render();
+      controls.querySelector('#stacks-count').textContent =
+        `${stacks.length} stack${stacks.length === 1 ? '' : 's'}` +
+        (bulkSel.size ? ` · ${bulkSel.size} selected` : '');
+      const sa = list.querySelector('#stacks-select-all');
+      if (sa) {
+        const eligible = stacks.filter((s) => s.managed);
+        const onPage = eligible.filter((s) => bulkSel.has(s.name)).length;
+        sa.checked = eligible.length > 0 && onPage === eligible.length;
+        sa.indeterminate = onPage > 0 && onPage < eligible.length;
+      }
+    });
 
     list.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
@@ -2905,7 +3439,7 @@ import { FitAddon } from '@xterm/addon-fit';
     });
 
     document.getElementById('refresh').onclick = load;
-    if (composeAvail) {
+    if (isAdmin && composeAvail) {
       const btnNew = document.getElementById('new-stack');
       if (btnNew) btnNew.onclick = () => newStackDialog().then((created) => { if (created) load(); });
     }
@@ -4454,39 +4988,108 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Registries ----------
   views.registries = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
     root.innerHTML = pageHeader(
       'Registries',
       'Stored credentials used by the image-pull dialog',
-      `${btn('+ Add registry', { kind: 'primary', id: 'add-reg' })}
+      `${isAdmin ? btn('+ Add registry', { kind: 'primary', id: 'add-reg' }) : ''}
        ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`
     );
+
+    const bulkSel = createBulkSelection({ key: (r) => r.name });
+    const bulkBarObj = isAdmin
+      ? bulkBar(bulkSel, {
+          actions: [
+            { label: '✕ Remove', kind: 'danger', onClick: (names) => bulkRemoveRegistries(names) },
+          ],
+        })
+      : { el: document.createElement('div'), render: () => {} };
+    root.appendChild(bulkBarObj.el);
+
     const list = document.createElement('div'); root.appendChild(list);
+    let registries = [];
+
+    async function bulkRemoveRegistries(names) {
+      const ok = await confirmModal(
+        `Remove <strong>${names.length}</strong> registry credential set${names.length === 1 ? '' : 's'}? Image pulls that referenced them will fall back to the daemon's cached login (or fail if there isn't one).`,
+        { danger: true, confirmLabel: 'Remove' },
+      );
+      if (!ok) return false;
+      try {
+        const out = await api('/api/registries/delete/bulk', {
+          method: 'POST', body: JSON.stringify({ names }),
+        });
+        handleBulkResponse(out, 'Removed', (r) => r.name);
+      } catch (e) { toast(`Bulk remove failed: ${e.message}`, 'error'); return false; }
+      await load();
+      return true;
+    }
 
     async function load() {
       list.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
       try {
-        const items = await api('/api/registries');
-        const rows = items.map((r) => `
+        registries = await api('/api/registries');
+        bulkSel.pruneAgainst(registries);
+        draw();
+      } catch (e) {
+        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function draw() {
+      const rows = registries.map((r) => {
+        const checked = bulkSel.has(r.name) ? 'checked' : '';
+        return `
           <tr class="hover:bg-slate-900/60">
+            <td class="px-3 py-2 w-8">
+              ${isAdmin ? `<input type="checkbox" class="registries-check h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" data-name="${escapeHtml(r.name)}" ${checked}/>` : ''}
+            </td>
             <td class="px-4 py-2 font-medium">${escapeHtml(r.name)}</td>
             <td class="px-4 py-2 text-slate-300 font-mono text-xs">${escapeHtml(r.url)}</td>
             <td class="px-4 py-2 text-slate-300">${escapeHtml(r.username)}</td>
             <td class="px-4 py-2 text-slate-400">${escapeHtml(r.email || '')}</td>
             <td class="px-4 py-2 text-right">
               <div class="flex justify-end gap-1">
-                <button data-act="test" data-name="${escapeHtml(r.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Test login</button>
-                <button data-act="edit" data-name="${escapeHtml(r.name)}" data-url="${escapeHtml(r.url)}" data-user="${escapeHtml(r.username)}" data-email="${escapeHtml(r.email || '')}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Edit</button>
-                <button data-act="rm" data-name="${escapeHtml(r.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>
+                ${isAdmin ? `<button data-act="test" data-name="${escapeHtml(r.name)}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Test login</button>` : ''}
+                ${isAdmin ? `<button data-act="edit" data-name="${escapeHtml(r.name)}" data-url="${escapeHtml(r.url)}" data-user="${escapeHtml(r.username)}" data-email="${escapeHtml(r.email || '')}" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">Edit</button>` : ''}
+                ${isAdmin ? `<button data-act="rm" data-name="${escapeHtml(r.name)}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">Remove</button>` : ''}
               </div>
             </td>
-          </tr>`);
-        list.innerHTML = `
-          <p class="mb-3 text-xs text-slate-500">Passwords are stored on the manager host in <code>${escapeHtml(state.config.registries_file || '/data/registries.json')}</code> with mode 0600. Always front this UI with TLS.</p>
-        ` + table(['Name', 'URL', 'Username', 'Email', ''], rows);
-      } catch (e) {
-        list.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+          </tr>`;
+      });
+      list.innerHTML = `
+        <p class="mb-3 text-xs text-slate-500">${registries.length} registry${registries.length === 1 ? '' : ' entries'}${bulkSel.size ? ` · ${bulkSel.size} selected` : ''}. Passwords are stored on the manager host in <code>${escapeHtml(state.config.registries_file || '/data/registries.json')}</code> with mode 0600. Always front this UI with TLS.</p>
+      ` + table(
+        [
+          isAdmin
+            ? `<input id="registries-select-all" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900" title="Select all"/>`
+            : '',
+          'Name', 'URL', 'Username', 'Email', '',
+        ],
+        rows,
+      );
+      const sa = list.querySelector('#registries-select-all');
+      if (sa) {
+        const onPage = registries.filter((r) => bulkSel.has(r.name)).length;
+        sa.checked = registries.length > 0 && onPage === registries.length;
+        sa.indeterminate = onPage > 0 && onPage < registries.length;
+        sa.addEventListener('change', (e) => {
+          if (e.target.checked) for (const r of registries) bulkSel.add(r.name);
+          else for (const r of registries) bulkSel.delete(r.name);
+          draw(); bulkBarObj.render();
+        });
       }
     }
+
+    list.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.registries-check');
+      if (!cb) return;
+      if (cb.checked) bulkSel.add(cb.dataset.name);
+      else bulkSel.delete(cb.dataset.name);
+      bulkBarObj.render();
+      draw();
+    });
 
     list.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-act]'); if (!t) return;
@@ -4508,7 +5111,8 @@ import { FitAddon } from '@xterm/addon-fit';
     });
 
     document.getElementById('refresh').onclick = load;
-    document.getElementById('add-reg').onclick = () => registryDialog().then((ok) => { if (ok) load(); });
+    const addBtn = document.getElementById('add-reg');
+    if (addBtn) addBtn.onclick = () => registryDialog().then((ok) => { if (ok) load(); });
 
     await load();
   };
