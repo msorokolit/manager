@@ -2,11 +2,24 @@
 //
 // `verifyCredentials` is exposed for the /api/auth/login endpoint; everywhere
 // else the bearer middleware (`authenticate`) is what protects routes.
+//
+// Sessions
+// --------
+// Every JWT carries a `jti` claim — the id of a row in the server-side
+// session store (src/sessions.js). On every request we:
+//   1. verify the signature + expiry
+//   2. look the jti up in the store; reject 401 if it's not there
+//      ("Session revoked")
+//   3. touch the session so admins see an accurate "last seen"
+//
+// This is what makes "log out", "log out everywhere", and admin force-
+// kick work despite the underlying tokens being stateless JWTs.
 import { Buffer } from 'node:buffer';
 import { timingSafeEqual } from 'node:crypto';
 import { settings } from './config.js';
 import { verifyToken } from './jwt.js';
 import { patchContext } from './logger.js';
+import { getSession, touchSession } from './sessions.js';
 
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -63,8 +76,13 @@ export function verifyCredentials(username, password) {
 }
 
 /**
- * Pull a Bearer token off a request and validate it. Returns a User on
- * success or null on any failure.
+ * Pull a Bearer token off a request and validate it. Returns
+ *
+ *   { user: {username, role}, jti }
+ *
+ * on success, or null on any failure (bad signature, expired,
+ * malformed). The jti is the session id — caller uses it to look the
+ * session up in the store.
  */
 export function parseBearer(req) {
   const h = req.headers && req.headers.authorization;
@@ -72,16 +90,46 @@ export function parseBearer(req) {
   const token = h.slice(7).trim();
   const claims = verifyToken(token);
   if (!claims || !claims.sub || !claims.role) return null;
-  return { username: claims.sub, role: claims.role };
+  return {
+    user: { username: claims.sub, role: claims.role },
+    jti: claims.jti || null,
+  };
 }
 
 export function authenticate(req, res, next) {
-  const user = parseBearer(req);
-  if (!user) return unauthorized(res, 'Invalid or missing bearer token');
-  req.user = user;
+  const parsed = parseBearer(req);
+  if (!parsed) return unauthorized(res, 'Invalid or missing bearer token');
+  // jti is mandatory for every token issued after sessions shipped.
+  // A token with no jti is either malformed or from an attacker
+  // forging signatures without realising we've added a session
+  // dimension — reject it the same way.
+  if (!parsed.jti) {
+    return unauthorized(res, 'Token missing session id (jti)');
+  }
+  // Look the session up in the server-side store. A missing row means
+  // the session was revoked (or the row was evicted by a per-user cap,
+  // or the process restarted without persistence and the disk file
+  // didn't include this id). All of those should look the same to the
+  // client — please log in again.
+  const session = getSession(parsed.jti);
+  if (!session) {
+    return unauthorized(res, 'Session revoked or expired — please log in again');
+  }
+  // Defensive: the session's user must match the token's claims. They
+  // diverge only if someone is replaying an old token at a recycled
+  // session id, which we shouldn't honour.
+  if (session.user !== parsed.user.username || session.role !== parsed.user.role) {
+    return unauthorized(res, 'Session/token mismatch');
+  }
+
+  req.user = parsed.user;
+  req.sessionId = parsed.jti;
   // Tag the request's ALS context so every downstream log line and the
   // morgan access-log line include the authenticated user/role.
-  patchContext({ user });
+  patchContext({ user: parsed.user, sessionId: parsed.jti });
+  // Update "last seen" for the session pane. Debounced internally so
+  // we don't write every request.
+  touchSession(parsed.jti);
   next();
 }
 

@@ -23,6 +23,8 @@ const COMPONENT_SCHEMAS = [
   S.LoginRequest,
   S.LoginResponse,
   S.MeResponse,
+  S.SessionInfo,
+  S.SessionRevokeResponse,
   S.HealthResponse,
   S.ConfigResponse,
   S.PingResponse,

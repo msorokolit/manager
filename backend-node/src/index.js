@@ -17,6 +17,7 @@ import { buildOpenApiSpec } from './openapi.js';
 import { globalLimiter, loginLimiter } from './rate-limit.js';
 import { logger } from './logger.js';
 import { requestContext } from './request-context.js';
+import { loadFromDisk as loadSessionsFromDisk, _internals as sessionsInternals } from './sessions.js';
 
 import authApi from './routes/auth.js';
 import auditApi from './routes/audit.js';
@@ -337,7 +338,16 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-server.listen(settings.port, settings.host, () => {
+server.listen(settings.port, settings.host, async () => {
+  // Restore the session store from disk so a manager restart doesn't
+  // sign every user out. Sessions whose JWT `exp` has already passed
+  // are dropped during load.
+  await loadSessionsFromDisk();
+  // Sweep expired sessions once an hour. The touchSession() call in
+  // auth.js also opportunistically sweeps on traffic, so this is a
+  // belt-and-suspenders for idle hosts.
+  setInterval(() => sessionsInternals.sweepExpired(), 60 * 60 * 1000).unref();
+
   logger.info({
     host: settings.host,
     port: settings.port,

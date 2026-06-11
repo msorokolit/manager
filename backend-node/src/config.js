@@ -109,6 +109,25 @@ export function settingsFromEnv(env = process.env) {
       1,
       parseInt(env.AUDIT_ROTATE_KEEP || '5', 10),
     ),
+    // ---- Sessions (server-side store; see src/sessions.js) ----
+    // Persistence file. The store flushes here on a debounce so a
+    // restart doesn't sign every user out. Mode 0600 on every write.
+    sessionsFile: env.SESSIONS_FILE || path.join(dataDir, 'sessions.json'),
+    // How often the in-memory store flushes dirty rows to disk.
+    // Higher = less I/O; lower = smaller "session lost on crash"
+    // window. Default 30s splits the difference for an admin tool.
+    sessionsPersistIntervalMs: Math.max(
+      1000,
+      parseInt(env.SESSIONS_PERSIST_INTERVAL_MS || '30000', 10),
+    ),
+    // Cap concurrent sessions per user; oldest is evicted when a new
+    // login would exceed it. 0 = unlimited (the default). Set to 1
+    // for environments that mandate a single active session per
+    // principal (banks / SOC).
+    sessionsMaxPerUser: Math.max(
+      0,
+      parseInt(env.SESSIONS_MAX_PER_USER || '0', 10),
+    ),
     // ---- Volume-browser one-shot containers ----
     // Wall-clock cap on any single helper-container operation. A hung
     // python script or runaway recursive chmod would otherwise pin

@@ -79,6 +79,7 @@ const pinoOptions = {
       out.user = ctx.user.username;
       out.role = ctx.user.role;
     }
+    if (ctx.sessionId) out.session_id = ctx.sessionId;
     if (ctx.sourceIp) out.source_ip = ctx.sourceIp;
     return out;
   },
