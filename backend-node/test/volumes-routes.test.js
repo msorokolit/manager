@@ -17,6 +17,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { signToken } from '../src/jwt.js';
+import { withRole, resetSessions } from './helpers/auth-helper.js';
 
 // ---------- Shared fakes ----------
 const fakeContainers = [];     // listContainers({ all: true }) returns this
@@ -103,11 +104,8 @@ function buildApp() {
   return app;
 }
 
-function withRole(role) {
-  return `Bearer ${signToken({ sub: role, role }).token}`;
-}
-
 beforeEach(() => {
+  resetSessions();
   fakeContainers.length = 0;
   fakeVolumes.clear();
   fakeDfVolumes.length = 0;

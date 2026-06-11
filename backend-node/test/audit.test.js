@@ -50,6 +50,7 @@ const { AUDIT_TMP_FILE, REG_TMP_FILE, STACKS_TMP_DIR } = vi.hoisted(() => {
 });
 
 import { signToken } from '../src/jwt.js';
+import { withRole, resetSessions } from './helpers/auth-helper.js';
 
 // Mock docker-client so route imports don't try to talk to a real daemon.
 vi.mock('../src/docker-client.js', () => {
@@ -94,10 +95,6 @@ function buildApp(...routers) {
   return app;
 }
 
-function withRole(role) {
-  return `Bearer ${signToken({ sub: role, role }).token}`;
-}
-
 // Truncate the audit file between tests so each test starts with a
 // known-empty log. Some tests also wait for the in-process write chain
 // to drain — the middleware schedules audit appends inside
@@ -125,6 +122,11 @@ beforeAll(async () => {
   await fs.mkdir(path.dirname(AUDIT_TMP_FILE), { recursive: true });
 });
 beforeEach(async () => {
+  // Reset the in-memory session store first so withRole() in this
+  // test doesn't collide with sessions left by the previous one
+  // (and so the auth middleware's jti lookups land on freshly-
+  // created rows).
+  resetSessions();
   // Drain any pending writes from the previous test so they don't
   // land in this test's file after we wipe it. Audit writes are
   // queued by res.on('finish'); the in-flight chain may outlast the

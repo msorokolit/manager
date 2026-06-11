@@ -38,6 +38,7 @@ const { REG_TMP_FILE, STACKS_TMP_DIR } = vi.hoisted(() => {
 });
 
 import { signToken } from '../src/jwt.js';
+import { withRole, resetSessions } from './helpers/auth-helper.js';
 
 // ---------- Shared fake docker daemon ----------
 
@@ -156,11 +157,8 @@ function buildApp(...routers) {
   return app;
 }
 
-function withRole(role) {
-  return `Bearer ${signToken({ sub: role, role }).token}`;
-}
-
 beforeEach(() => {
+  resetSessions();
   fakeContainers.clear();
   fakeImages.clear();
   containerActionMock.mockReset(); containerActionMock.mockReturnValue(null);

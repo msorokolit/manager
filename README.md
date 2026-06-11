@@ -168,6 +168,9 @@ All configuration is via environment variables.
 | `AUDIT_FILE`         | `${DATA_DIR}/audit.log` | Path to the audit log. Mode is enforced to `0600` on each write. |
 | `AUDIT_MAX_BYTES`    | `10485760`       | Size cap on the live audit file. When exceeded, `audit.log` rotates to `audit.log.1`, `.1` → `.2`, etc. Set `0` to disable in-process rotation (when an external log shipper / `logrotate` handles it). |
 | `AUDIT_ROTATE_KEEP`  | `5`              | Number of rotated audit files to keep. The oldest is dropped when a new rotation happens. |
+| `SESSIONS_FILE`      | `${DATA_DIR}/sessions.json` | Persistence file for the server-side session store. Mode `0600` is enforced on every write. Restart-survival without forcing every user to re-login. |
+| `SESSIONS_PERSIST_INTERVAL_MS` | `30000` | How often the in-memory session store flushes dirty rows to disk. Higher = less I/O; lower = smaller "sessions lost on crash" window. |
+| `SESSIONS_MAX_PER_USER` | `0`           | Cap concurrent sessions per user. `0` = unlimited. Set to `1` in environments that mandate single-session-per-principal (banks / SOC); the oldest session is evicted when a new login would exceed the cap. |
 
 ## Logging & audit (enterprise)
 
@@ -214,6 +217,34 @@ curl -H "Authorization: Bearer $TOKEN" \
 Filters: `since`, `until`, `actor`, `action` (glob: `container.*`, `*.bulk`, etc.), `resource_type`, `resource_id`, `outcome`, `request_id`, `limit` (max 1000), `offset`, `order` (`asc` / `desc`). The endpoint reads `AUDIT_FILE` plus all rotated siblings (`audit.log.1`, `audit.log.2`, …) so historical entries stay queryable after rotation.
 
 For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a path your log shipper watches (`vector` / `fluentbit` / `filebeat`) and disable in-process rotation with `AUDIT_MAX_BYTES=0`. The JSONL format is the lowest-common-denominator input for every aggregator we tested.
+
+## Sessions
+
+JWTs by themselves are stateless: once signed, they're valid until `exp`. That's fine for a toy, but it means no real "log out" (the token keeps working), no "sign me out everywhere", and no admin force-kick. So every login mints a row in a server-side session store and embeds its UUID into the JWT as `jti`. On every request the auth middleware looks the `jti` up — a missing row is "session revoked, please log in again". Revocation flips from a multi-hour wait for `exp` to a single `Map.delete`.
+
+**What users can do** (any role):
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/auth/logout` | Drop the session backing the current bearer token. |
+| `POST /api/auth/logout-all` | Drop every one of *your* sessions (`?keep_current=true` to spare the calling one). |
+| `GET /api/auth/sessions` | List your active sessions (with the `current` one marked). |
+| `POST /api/auth/sessions/:id/revoke` | Drop one of your own sessions by id. |
+
+**What admins can do additionally:**
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/auth/sessions/all` | List every active session across all users (user / role / source IP / user-agent / `issued_at` / `last_seen` / `expires_at`). |
+| `POST /api/auth/sessions/:id/revoke` | Kill any session by id (not just your own). |
+| `POST /api/auth/sessions/revoke-user/:username` | Kill every session owned by one user (e.g. an offboarded operator). |
+| `POST /api/auth/sessions/revoke-all` | Incident response: kill every active session. Spares the caller's session by default — pass `?include_self=true` to nuke yours too. |
+
+The SPA exposes all of this under the **Sessions** tab: your sessions on top with `Sign out other devices` / `Sign out everywhere`, and (for admins) all users below with per-row `Revoke` and a `Sign out everyone` button.
+
+Every session event (created, revoked, evicted by `SESSIONS_MAX_PER_USER`) lands in the app log with `session_id` and the actor, and every revocation endpoint is itself audited — so the audit log answers "*who signed everyone out at 03:14*" as well as "*when did alice last sign in*".
+
+**Storage notes:** the store is in-memory (one Map) with a debounced atomic write to `SESSIONS_FILE` (mode 0600). Sessions survive a process restart via the file. This is the right shape for a single-replica deployment; multi-replica deployments should swap the persistence layer for Redis or a shared DB (replace `src/sessions.js` with the matching adapter — its public exports are the only API the rest of the codebase relies on).
 
 ## Request validation & OpenAPI
 

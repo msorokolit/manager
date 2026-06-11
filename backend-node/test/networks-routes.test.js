@@ -22,6 +22,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { signToken } from '../src/jwt.js';
+import { withRole, resetSessions } from './helpers/auth-helper.js';
 
 // ---------- Shared fakes ----------
 
@@ -123,11 +124,8 @@ function buildApp() {
   return app;
 }
 
-function withRole(role) {
-  return `Bearer ${signToken({ sub: role, role }).token}`;
-}
-
 beforeEach(() => {
+  resetSessions();
   fakeNetworks.clear();
   fakeContainers.length = 0;
   removeMock.mockReset();
