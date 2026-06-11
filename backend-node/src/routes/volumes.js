@@ -10,6 +10,7 @@ import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
 import { asyncHandler, boolQuery, HttpError } from '../util.js';
 import { createApiRouter } from '../route-builder.js';
+import { logger as appLogger } from '../logger.js';
 import {
   CreateVolumeRequest,
   NameParam,
@@ -66,7 +67,7 @@ function pickContainerName(names) {
 // big volumes — that's why Docker's own `docker volume ls` doesn't show
 // it by default. We make the call best-effort and ship null sizes if
 // it fails / times out, so the volume list is always responsive.
-export async function diskUsageMap(logger = console) {
+export async function diskUsageMap(logger = appLogger) {
   try {
     const df = await getClient().df();
     const out = new Map();
@@ -78,8 +79,12 @@ export async function diskUsageMap(logger = console) {
   } catch (err) {
     // Don't fail the whole list — but DO surface the problem so operators
     // can distinguish "slow" from "broken" without inspecting access logs.
+    // Logged through pino so the line carries request_id + actor.
     if (logger && logger.warn) {
-      logger.warn(`[volumes] /system/df failed: ${err.message || err}`);
+      logger.warn(
+        { err: err.message || String(err), kind: 'docker_df' },
+        '/system/df failed',
+      );
     }
     return new Map();
   }

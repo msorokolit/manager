@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import cors from 'cors';
 import helmet from 'helmet';
+import morgan from 'morgan';
 import swaggerUi from 'swagger-ui-express';
 import { WebSocketServer } from 'ws';
 
@@ -14,8 +15,11 @@ import { settings, VERSION } from './config.js';
 import { sendError } from './util.js';
 import { buildOpenApiSpec } from './openapi.js';
 import { globalLimiter, loginLimiter } from './rate-limit.js';
+import { logger } from './logger.js';
+import { requestContext } from './request-context.js';
 
 import authApi from './routes/auth.js';
+import auditApi from './routes/audit.js';
 import systemApi from './routes/system.js';
 import containersApi from './routes/containers.js';
 import imagesApi from './routes/images.js';
@@ -35,6 +39,7 @@ import execApi, { handleExecWebSocket } from './routes/exec.js';
 // flow from this list.
 const apis = [
   authApi,
+  auditApi,
   systemApi,
   containersApi,
   imagesApi,
@@ -51,6 +56,48 @@ const app = express();
 // Trust the first hop so Express handles X-Forwarded-* correctly when run
 // behind a reverse proxy (Caddy / Traefik / nginx / an ingress).
 app.set('trust proxy', 1);
+
+// ---------- Per-request context (correlation ID + ALS) ----------
+//
+// Must be the very first middleware so the AsyncLocalStorage frame
+// wraps every subsequent middleware + handler. Mints `req.requestId`,
+// echoes `X-Request-Id` on the response, populates the ALS store the
+// logger reads via its `mixin`.
+app.use(requestContext);
+
+// ---------- HTTP access log (morgan → pino) ----------
+//
+// One line per request, structured. We use a custom token set so the
+// fields land as a single info-level log record. The body stream pipes
+// trimmed lines straight into the pino logger so the access log shares
+// the same destination + formatting as the application log — one
+// stream out to journald / docker logs / a sidecar shipper.
+//
+// The format isn't morgan's `combined` — fields are pre-split because
+// pino's structured output beats a unified text format for indexing.
+morgan.token('id', (req) => req.requestId || '-');
+morgan.token('user', (req) => (req.user && req.user.username) || '-');
+morgan.token('role', (req) => (req.user && req.user.role) || '-');
+// Slim format because every line lands inside the JSON wrapper from
+// pino — including request_id from the ALS mixin is redundant but kept
+// in the format string so the line stays self-describing if pino's
+// transport is bypassed (e.g. when piping to stderr from a sidecar).
+const morganFormat =
+  ':id :remote-addr :user(:role) :method :url :status :res[content-length]b :response-time ms';
+app.use(morgan(morganFormat, {
+  // /api/health is hammered by docker healthchecks + kubernetes
+  // liveness probes — skipping it keeps the access log readable.
+  // Same for /api/system/events/stream which intentionally holds the
+  // request open for minutes.
+  skip: (req) => {
+    if (req.path === '/api/health') return true;
+    if (req.path === '/api/system/events/stream') return true;
+    return false;
+  },
+  stream: {
+    write: (msg) => logger.info({ kind: 'http' }, msg.trim()),
+  },
+}));
 
 // ---------- Security headers (helmet) ----------
 //
@@ -228,10 +275,24 @@ if (existsSync(staticDir)) {
 // 404 for unmatched API paths
 app.use('/api', (_req, res) => res.status(404).json({ detail: 'Not Found' }));
 
-// Central error handler
+// Central error handler.
+//
+// Every error worth logging (5xx, or unexpected throws) is recorded at
+// the right level before being serialised to the client. 4xx errors
+// are intentionally NOT logged — they're caller mistakes (validation,
+// auth, not-found), not server-side problems, and they'd swamp the
+// log otherwise. The audit trail still captures them via the per-route
+// `auditMiddleware`.
 app.use((err, req, res, _next) => {
   if (err && err.type === 'entity.too.large') {
     return res.status(413).json({ detail: 'Request body too large' });
+  }
+  const status = err && err.status;
+  if (!status || status >= 500) {
+    logger.error(
+      { err: err && (err.stack || err.message) || String(err), path: req.path, method: req.method },
+      'request failed',
+    );
   }
   sendError(res, err);
 });
@@ -277,20 +338,23 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(settings.port, settings.host, () => {
-  // eslint-disable-next-line no-console
-  console.log(
-    `[docker-manager] listening on http://${settings.host}:${settings.port} (backend=node, version=${VERSION})`,
-  );
+  logger.info({
+    host: settings.host,
+    port: settings.port,
+    version: VERSION,
+    audit_enabled: settings.auditEnabled,
+    audit_file: settings.auditEnabled ? settings.auditFile : null,
+    log_level: logger.level,
+  }, 'docker-manager listening');
   // Pre-pull the volume-browser image in the background so the first
   // browse request doesn't pay the docker-pull cost. Best-effort; if
   // it fails, the first per-op container will retry the pull.
-  ensureBrowserImage(console).catch(() => {});
+  ensureBrowserImage(logger).catch(() => {});
 });
 
 // Graceful shutdown
 function shutdown() {
-  // eslint-disable-next-line no-console
-  console.log('[docker-manager] shutting down');
+  logger.info('shutting down');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 }

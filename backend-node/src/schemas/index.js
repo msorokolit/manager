@@ -2,6 +2,7 @@
 // generator can `import { LoginRequest, ... } from '../schemas/index.js'`.
 export * from './_common.js';
 export * from './auth.js';
+export * from './audit.js';
 export * from './containers.js';
 export * from './images.js';
 export * from './networks.js';

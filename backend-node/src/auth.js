@@ -6,6 +6,7 @@ import { Buffer } from 'node:buffer';
 import { timingSafeEqual } from 'node:crypto';
 import { settings } from './config.js';
 import { verifyToken } from './jwt.js';
+import { patchContext } from './logger.js';
 
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -19,7 +20,21 @@ function safeEqual(a, b) {
 }
 
 function unauthorized(res, detail = 'Authentication required') {
+  // Thread the rejection reason into the audit row when one is being
+  // collected for this request (the audit middleware sets
+  // `res.locals.auditCaptureError` on relevant routes). Quiet no-op
+  // for routes that aren't being audited.
+  if (res.locals && typeof res.locals.auditCaptureError === 'function') {
+    try { res.locals.auditCaptureError(detail); } catch {}
+  }
   return res.status(401).json({ detail });
+}
+
+function forbidden(res, detail) {
+  if (res.locals && typeof res.locals.auditCaptureError === 'function') {
+    try { res.locals.auditCaptureError(detail); } catch {}
+  }
+  return res.status(403).json({ detail });
 }
 
 /**
@@ -64,6 +79,9 @@ export function authenticate(req, res, next) {
   const user = parseBearer(req);
   if (!user) return unauthorized(res, 'Invalid or missing bearer token');
   req.user = user;
+  // Tag the request's ALS context so every downstream log line and the
+  // morgan access-log line include the authenticated user/role.
+  patchContext({ user });
   next();
 }
 
@@ -80,7 +98,7 @@ export function authenticate(req, res, next) {
 export function requireAdmin(req, res, next) {
   if (!req.user) return unauthorized(res);
   if (req.user.role !== 'admin') {
-    return res.status(403).json({ detail: 'Admin role required for this action' });
+    return forbidden(res, 'Admin role required for this action');
   }
   next();
 }
@@ -95,9 +113,7 @@ export function requireAdmin(req, res, next) {
  */
 export function requireDestructive(req, res, next) {
   if (!settings.allowDestructive) {
-    return res
-      .status(403)
-      .json({ detail: 'Destructive actions are disabled (ALLOW_DESTRUCTIVE=false)' });
+    return forbidden(res, 'Destructive actions are disabled (ALLOW_DESTRUCTIVE=false)');
   }
   next();
 }

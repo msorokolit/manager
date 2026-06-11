@@ -41,6 +41,25 @@ const ajvCoerce = new Ajv({
 });
 addFormats(ajvCoerce);
 
+// Validators reject directly with res.status(400).json(...) — they
+// don't go through the central error middleware. So the audit
+// middleware's captureError hook never fires from them. We thread a
+// short summary through `res.locals.auditCaptureError` so the audit
+// row for the failed request gets a useful `error` field.
+function notifyAudit(res, summary) {
+  if (res.locals && typeof res.locals.auditCaptureError === 'function') {
+    try { res.locals.auditCaptureError(summary); } catch { /* never fail responding */ }
+  }
+}
+
+function summariseErrors(errs) {
+  if (!errs || !errs.length) return 'validation failed';
+  const first = errs[0];
+  const path = first.path || '<root>';
+  return `validation failed: ${path}: ${first.message}` +
+    (errs.length > 1 ? ` (+${errs.length - 1} more)` : '');
+}
+
 function jsonPointerToPath(pointer) {
   if (!pointer) return '';
   // "/users/0/email" -> "users.0.email"
@@ -94,10 +113,9 @@ export function validateBody(schema) {
   return (req, res, next) => {
     const data = req.body == null ? {} : req.body;
     if (!validator(data)) {
-      return res.status(400).json({
-        detail: 'Validation failed',
-        errors: (validator.errors || []).map(formatError),
-      });
+      const errs = (validator.errors || []).map(formatError);
+      notifyAudit(res, summariseErrors(errs));
+      return res.status(400).json({ detail: 'Validation failed', errors: errs });
     }
     req.body = data;
     next();
@@ -112,10 +130,9 @@ export function validateQuery(schema) {
     // here, matching the declared schema.
     const data = req.query == null ? {} : { ...req.query };
     if (!validator(data)) {
-      return res.status(400).json({
-        detail: 'Validation failed',
-        errors: (validator.errors || []).map(formatError),
-      });
+      const errs = (validator.errors || []).map(formatError);
+      notifyAudit(res, summariseErrors(errs));
+      return res.status(400).json({ detail: 'Validation failed', errors: errs });
     }
     req.validatedQuery = data;
     next();
@@ -127,10 +144,9 @@ export function validateParams(schema) {
   return (req, res, next) => {
     const data = req.params == null ? {} : { ...req.params };
     if (!validator(data)) {
-      return res.status(400).json({
-        detail: 'Invalid path parameter',
-        errors: (validator.errors || []).map(formatError),
-      });
+      const errs = (validator.errors || []).map(formatError);
+      notifyAudit(res, summariseErrors(errs));
+      return res.status(400).json({ detail: 'Invalid path parameter', errors: errs });
     }
     req.params = data;
     next();

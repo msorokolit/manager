@@ -85,6 +85,30 @@ export function settingsFromEnv(env = process.env) {
       100,
       parseInt(env.COMPOSE_KILL_GRACE_MS || '10000', 10),
     ),
+    // ---- Logging + audit ----
+    // Standard pino log levels: trace, debug, info, warn, error, fatal,
+    // silent. Default `info` is right for production; bump to `debug`
+    // for local troubleshooting.
+    logLevel: env.LOG_LEVEL || null,
+    // When true, output through pino-pretty (human-readable colour log
+    // lines) instead of raw JSON. Off by default — production wants JSON
+    // for log shippers.
+    logPretty: bool(env, 'LOG_PRETTY', false),
+    // Audit log: append-only JSONL record of every mutating action
+    // through the API. Stored separately from the app log so it can be
+    // retained / shipped independently.
+    auditEnabled: bool(env, 'AUDIT_ENABLED', true),
+    auditFile: env.AUDIT_FILE || path.join(dataDir, 'audit.log'),
+    // In-process size-based rotation. Set to 0 to disable rotation
+    // entirely (when a log shipper or external logrotate handles it).
+    auditMaxBytes: Math.max(
+      0,
+      parseInt(env.AUDIT_MAX_BYTES || String(10 * 1024 * 1024), 10),
+    ),
+    auditRotateKeep: Math.max(
+      1,
+      parseInt(env.AUDIT_ROTATE_KEEP || '5', 10),
+    ),
     // ---- Volume-browser one-shot containers ----
     // Wall-clock cap on any single helper-container operation. A hung
     // python script or runaway recursive chmod would otherwise pin

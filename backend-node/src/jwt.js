@@ -13,12 +13,24 @@ const ALG = 'HS256';
 let secret = settings.jwtSecret;
 if (!secret) {
   secret = randomBytes(32).toString('base64url');
-  // eslint-disable-next-line no-console
-  console.warn(
-    '[docker-manager] JWT_SECRET is not set; generated an ephemeral one. ' +
-      'Sessions will be invalidated on every restart. ' +
-      'Set JWT_SECRET in production.',
-  );
+  // Lazy-import the logger to avoid a startup-order cycle (config →
+  // logger → pino transports, all imported eagerly). Falling back to
+  // console.warn keeps the warning visible even if the logger module
+  // hasn't fully initialised yet.
+  try {
+    const { logger } = await import('./logger.js');
+    logger.warn(
+      'JWT_SECRET is not set; generated an ephemeral one. ' +
+        'Sessions will be invalidated on every restart. ' +
+        'Set JWT_SECRET in production.',
+    );
+  } catch {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[docker-manager] JWT_SECRET is not set; generated an ephemeral one. ' +
+        'Set JWT_SECRET in production.',
+    );
+  }
 }
 
 /**

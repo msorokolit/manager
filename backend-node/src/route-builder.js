@@ -35,6 +35,7 @@
 
 import { Router } from 'express';
 import { authenticate, requireAdmin, requireDestructive } from './auth.js';
+import { auditMiddleware } from './audit.js';
 import { validateBody, validateParams, validateQuery } from './validate.js';
 import { expensiveConcurrency } from './rate-limit.js';
 
@@ -66,6 +67,15 @@ export function createApiRouter(basePath, defaults = {}) {
 
     const mws = [];
     if (auth) mws.push(authenticate);
+    // Audit middleware comes AFTER authenticate (so we know the actor
+    // for the audit row) but BEFORE the policy gates (requireAdmin /
+    // requireDestructive). The reason: if requireAdmin rejects with
+    // 403, we still want a row in the audit log — "user X tried to
+    // delete this volume but didn't have permission" is exactly the
+    // kind of thing an enterprise audit log exists to record. The
+    // middleware registers a res.on('finish') listener; it fires for
+    // every response regardless of how the chain terminated.
+    mws.push(auditMiddleware({ ...spec, tags }));
     if (admin) mws.push(requireAdmin);
     // `destructive` is an opt-in second gate that checks ALLOW_DESTRUCTIVE.
     // Routes that mutate Docker state irreversibly (volume rm, container kill,
@@ -100,6 +110,9 @@ export function createApiRouter(basePath, defaults = {}) {
       responses: spec.responses,
       // Free-form extras (request/response content types, examples, etc.)
       extra: spec.extra,
+      // Per-route audit override (optional). Recorded so the OpenAPI
+      // generator could surface "this endpoint is audited" if we wanted.
+      audit: spec.audit,
     });
   }
 

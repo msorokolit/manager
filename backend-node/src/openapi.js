@@ -74,6 +74,9 @@ const COMPONENT_SCHEMAS = [
   S.RegistryRequest,
   S.RegistryUpdateRequest,
   S.RegistryBulkDeleteRequest,
+  // Audit log
+  S.AuditEntry,
+  S.AuditQueryResponse,
   S.RegistryPublic,
 ];
 

@@ -788,18 +788,28 @@ async function withScratchContainer(volume, fn, { readonly = false } = {}) {
  * Best-effort: failure is logged but never blocks startup, because a
  * later op will retry the pull (via createContainer's implicit pull).
  */
-export async function ensureBrowserImage(logger = console) {
+export async function ensureBrowserImage(logger) {
   const docker = getClient();
+  // pino's API (logger.info / logger.warn) is compatible with the
+  // `console`-shaped fallback we used to take. Callers can still pass
+  // a plain logger — we adapt either by detecting the `info` method.
+  const info = (msg, extra) =>
+    logger && typeof logger.info === 'function' ? logger.info(extra || {}, msg)
+    : logger && typeof logger.log === 'function' ? logger.log(msg)
+    : undefined;
+  const warn = (msg, extra) =>
+    logger && typeof logger.warn === 'function' ? (logger.warn.length >= 2 ? logger.warn(extra || {}, msg) : logger.warn(msg))
+    : undefined;
   try {
     await docker.getImage(settings.browserImage).inspect();
     return;
   } catch (err) {
     if (err.statusCode !== 404) {
-      logger.warn && logger.warn(`[volume-browser] image inspect failed: ${err.message}`);
+      warn(`volume-browser image inspect failed: ${err.message}`, { err: err.message });
       return;
     }
   }
-  logger.log && logger.log(`[volume-browser] pre-pulling ${settings.browserImage}…`);
+  info(`pre-pulling ${settings.browserImage}`, { image: settings.browserImage });
   try {
     await new Promise((resolve, reject) => {
       docker.pull(settings.browserImage, (e, stream) => {
@@ -807,9 +817,9 @@ export async function ensureBrowserImage(logger = console) {
         docker.modem.followProgress(stream, (e2) => (e2 ? reject(e2) : resolve()));
       });
     });
-    logger.log && logger.log('[volume-browser] image ready');
+    info('volume-browser image ready', { image: settings.browserImage });
   } catch (err) {
-    logger.warn && logger.warn(`[volume-browser] pre-pull failed (will retry on first browse): ${err.message}`);
+    warn(`volume-browser pre-pull failed (will retry on first browse): ${err.message}`, { err: err.message });
   }
 }
 

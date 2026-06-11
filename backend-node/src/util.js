@@ -18,6 +18,12 @@ export const asyncHandler = (fn) => (req, res, next) =>
 
 export function sendError(res, err) {
   if (res.headersSent) return;
+  // Let the audit middleware see the original error before we serialize
+  // it — the on('finish') hook can't read the response body, so we
+  // hand it the message directly.
+  if (res.locals && typeof res.locals.auditCaptureError === 'function') {
+    try { res.locals.auditCaptureError(err); } catch { /* never fail responding */ }
+  }
   if (err instanceof HttpError) {
     return res.status(err.status).json({ detail: err.detail });
   }
