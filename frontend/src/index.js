@@ -25,6 +25,9 @@ import { FitAddon } from '@xterm/addon-fit';
     { id: 'activity', label: 'Activity', icon: '📈' },
     { id: 'registries', label: 'Registries', icon: '🔑' },
     { id: 'sessions', label: 'Sessions', icon: '🪪' },
+    // 'Audit' is admin-only; the nav-render code hides items where
+    // `adminOnly` is true and the caller isn't admin (see render()).
+    { id: 'audit', label: 'Audit', icon: '📜', adminOnly: true },
     { id: 'system', label: 'System', icon: '⚙️' },
   ];
 
@@ -528,8 +531,16 @@ import { FitAddon } from '@xterm/addon-fit';
     const app = document.getElementById('app');
     app.replaceChildren(document.getElementById('shell-tpl').content.cloneNode(true));
 
+    // adminOnly nav entries (e.g. Audit) are hidden from viewer JWTs
+    // — the underlying API would 403 them, and surfacing a clickable
+    // link to a 403 page is bad UX. Server is still the source of
+    // truth: even if a viewer hand-edits the hash to `#audit`, the
+    // first GET fails and the page shows the error.
+    const isAdmin = state.auth && state.auth.role === 'admin';
+    const visibleNav = NAV.filter((n) => !n.adminOnly || isAdmin);
+
     const nav = app.querySelector('#nav');
-    NAV.forEach(({ id, label, icon }) => {
+    visibleNav.forEach(({ id, label, icon }) => {
       const a = document.createElement('a');
       const active = state.route === id;
       a.href = `#${id}`;
@@ -541,7 +552,7 @@ import { FitAddon } from '@xterm/addon-fit';
     });
 
     const mobile = app.querySelector('#mobile-nav');
-    NAV.forEach(({ id, label }) => {
+    visibleNav.forEach(({ id, label }) => {
       const opt = document.createElement('option');
       opt.value = id; opt.textContent = label;
       if (state.route === id) opt.selected = true;
@@ -597,7 +608,11 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   window.addEventListener('hashchange', () => {
-    const id = window.location.hash.replace('#', '');
+    // Allow `#route?key=val&…` cross-links — strip the query suffix
+    // when matching the nav id, then re-render. parseHashQuery()
+    // inside the target view picks up the params.
+    const raw = window.location.hash.replace('#', '');
+    const id = raw.split('?', 1)[0];
     if (NAV.some((n) => n.id === id)) { state.route = id; render(); }
   });
 
@@ -5275,7 +5290,10 @@ import { FitAddon } from '@xterm/addon-fit';
             <div>expires: ${escapeHtml(expires)}</div>
           </td>
           <td class="px-4 py-2 text-right">
-            <button data-act="revoke" data-id="${escapeHtml(s.id)}" data-current="${s.current ? '1' : '0'}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">${s.current ? 'Sign out' : 'Revoke'}</button>
+            <div class="flex justify-end gap-1">
+              ${isAdmin ? `<a href="#audit?session_id=${encodeURIComponent(s.id)}" data-act="audit" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs text-slate-200" title="Open the audit log filtered by this session">📜 Activity</a>` : ''}
+              <button data-act="revoke" data-id="${escapeHtml(s.id)}" data-current="${s.current ? '1' : '0'}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">${s.current ? 'Sign out' : 'Revoke'}</button>
+            </div>
           </td>
         </tr>`;
     }
@@ -5404,6 +5422,371 @@ import { FitAddon } from '@xterm/addon-fit';
     document.getElementById('refresh').onclick = reload;
     await reload();
   };
+
+  // ---------- Audit log browser (admin-only) ----------
+  //
+  // Reads from GET /api/audit — the same endpoint operators can curl,
+  // wrapped in a filter-and-paginate UI. Rich enough to investigate
+  // an incident without dropping to the shell: filter by actor,
+  // action glob, resource type, outcome, time window, request id,
+  // session id. Each row opens a detail modal with the raw JSON +
+  // one-click "filter by this" affordances.
+  //
+  // Cross-links with the Sessions page in both directions:
+  //   - Sessions row → "View activity" pre-filters audit by session_id
+  //   - Audit detail modal → "Open session" jumps back to the
+  //     Sessions tab (no auto-filter; the user already knows which
+  //     session)
+  //
+  // Pre-filtered open: navigating to `#audit?session_id=X` (or any
+  // other filter) hydrates the filter inputs from the hash before the
+  // first load. That's how cross-links land here.
+  views.audit = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+    if (!isAdmin) {
+      root.innerHTML = `<div class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-amber-200">The audit log is admin-only.</div>`;
+      return;
+    }
+
+    // Hydrate filter state from the location hash (e.g. ?session_id=…
+    // landed us here from the Sessions page).
+    const hashQuery = parseHashQuery();
+    const initial = {
+      actor: hashQuery.actor || '',
+      action: hashQuery.action || '',
+      resource_type: hashQuery.resource_type || '',
+      resource_id: hashQuery.resource_id || '',
+      outcome: hashQuery.outcome || '',
+      request_id: hashQuery.request_id || '',
+      session_id: hashQuery.session_id || '',
+      since: hashQuery.since || '',
+      until: hashQuery.until || '',
+      order: hashQuery.order || 'desc',
+    };
+
+    root.innerHTML = pageHeader(
+      'Audit log',
+      'Persistent record of every mutating API request',
+      `${btn('Live: off', { kind: 'ghost', id: 'audit-live' })}
+       ${btn('Download JSONL', { kind: 'ghost', id: 'audit-export' })}
+       ${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`,
+    );
+
+    // Filter controls
+    const filtersEl = document.createElement('div');
+    filtersEl.className = 'mb-3 grid gap-2 rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-xs lg:grid-cols-4';
+    filtersEl.innerHTML = `
+      <label class="block">
+        <span class="text-slate-400">Actor (exact username)</span>
+        <input id="f-actor" type="text" value="${escapeHtml(initial.actor)}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+      </label>
+      <label class="block">
+        <span class="text-slate-400">Action (glob: <code>container.*</code>, <code>*.bulk</code>)</span>
+        <input id="f-action" type="text" value="${escapeHtml(initial.action)}" placeholder="*" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+      </label>
+      <label class="block">
+        <span class="text-slate-400">Resource type</span>
+        <select id="f-rtype" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+          <option value="">(any)</option>
+          ${['container','image','volume','network','stack','registry','auth','system'].map((t) =>
+            `<option value="${t}" ${initial.resource_type === t ? 'selected' : ''}>${t}</option>`,
+          ).join('')}
+        </select>
+      </label>
+      <label class="block">
+        <span class="text-slate-400">Outcome</span>
+        <select id="f-outcome" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm">
+          <option value="">(any)</option>
+          <option value="ok" ${initial.outcome === 'ok' ? 'selected' : ''}>ok (2xx/3xx)</option>
+          <option value="error" ${initial.outcome === 'error' ? 'selected' : ''}>error (4xx/5xx)</option>
+        </select>
+      </label>
+      <label class="block">
+        <span class="text-slate-400">Since (ISO 8601 / browser local time)</span>
+        <input id="f-since" type="datetime-local" value="${escapeHtml(initial.since)}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+      </label>
+      <label class="block">
+        <span class="text-slate-400">Until</span>
+        <input id="f-until" type="datetime-local" value="${escapeHtml(initial.until)}" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/>
+      </label>
+      <label class="block lg:col-span-2">
+        <span class="text-slate-400">Resource ID</span>
+        <input id="f-rid" type="text" value="${escapeHtml(initial.resource_id)}" placeholder="container/volume/etc. id or name" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+      </label>
+      <label class="block lg:col-span-2">
+        <span class="text-slate-400">Request ID</span>
+        <input id="f-req" type="text" value="${escapeHtml(initial.request_id)}" placeholder="UUID v4 or upstream trace id" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+      </label>
+      <label class="block lg:col-span-2">
+        <span class="text-slate-400">Session ID</span>
+        <input id="f-sid" type="text" value="${escapeHtml(initial.session_id)}" placeholder="cross-linked from the Sessions page" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm font-mono"/>
+      </label>
+      <div class="flex items-end gap-2 lg:col-span-2">
+        <button id="f-apply" class="rounded bg-sky-500 hover:bg-sky-400 text-slate-950 px-3 py-2 text-xs font-medium">Apply filters</button>
+        <button id="f-clear" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2 text-xs text-slate-300">Clear</button>
+      </div>
+    `;
+    root.appendChild(filtersEl);
+
+    // Result summary bar
+    const summaryEl = document.createElement('div');
+    summaryEl.className = 'mb-2 flex items-center justify-between text-xs text-slate-400';
+    summaryEl.innerHTML = `<span id="audit-summary">—</span>`;
+    root.appendChild(summaryEl);
+
+    // Results table
+    const listEl = document.createElement('div');
+    root.appendChild(listEl);
+
+    // Pagination footer
+    const pagerEl = document.createElement('div');
+    pagerEl.className = 'mt-3 flex items-center justify-between text-xs text-slate-400';
+    pagerEl.innerHTML = `
+      <button id="pg-prev" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed">← Newer</button>
+      <span id="pg-status"></span>
+      <button id="pg-next" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed">Older →</button>
+    `;
+    root.appendChild(pagerEl);
+
+    let lastResponse = null;
+    let offset = parseInt(hashQuery.offset, 10) || 0;
+    const LIMIT = 100;
+    let live = false;
+    let liveTimer = null;
+
+    // Pull the current filter values off the DOM into the same shape
+    // the API expects (no empty fields, no zero-length strings).
+    function currentFilters() {
+      const f = {
+        actor: filtersEl.querySelector('#f-actor').value.trim(),
+        action: filtersEl.querySelector('#f-action').value.trim(),
+        resource_type: filtersEl.querySelector('#f-rtype').value,
+        resource_id: filtersEl.querySelector('#f-rid').value.trim(),
+        outcome: filtersEl.querySelector('#f-outcome').value,
+        request_id: filtersEl.querySelector('#f-req').value.trim(),
+        session_id: filtersEl.querySelector('#f-sid').value.trim(),
+        order: initial.order,
+      };
+      const since = filtersEl.querySelector('#f-since').value;
+      const until = filtersEl.querySelector('#f-until').value;
+      // datetime-local lacks a timezone — interpret as the user's
+      // browser timezone (what the input shows) and convert to ISO.
+      if (since) f.since = new Date(since).toISOString();
+      if (until) f.until = new Date(until).toISOString();
+      // Drop empty values so the URL stays short and the audit
+      // backend doesn't get noisy "field=" entries.
+      for (const k of Object.keys(f)) if (f[k] == null || f[k] === '') delete f[k];
+      return f;
+    }
+
+    function buildQuery(extra = {}) {
+      const params = new URLSearchParams();
+      const f = { ...currentFilters(), ...extra };
+      for (const [k, v] of Object.entries(f)) params.set(k, v);
+      return params;
+    }
+
+    async function load() {
+      const params = buildQuery({ limit: LIMIT, offset });
+      listEl.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        lastResponse = await api('/api/audit?' + params.toString());
+        renderResults();
+      } catch (e) {
+        listEl.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+        lastResponse = null;
+      }
+    }
+
+    function renderResults() {
+      const data = lastResponse;
+      if (!data) return;
+      const errCount = (data.entries || []).filter((e) => e.outcome === 'error').length;
+      summaryEl.querySelector('#audit-summary').innerHTML =
+        `Showing <strong>${data.entries.length}</strong> of <strong>${data.total}</strong> matching entries` +
+        (errCount ? ` · <span class="text-rose-300">${errCount} error${errCount === 1 ? '' : 's'} on this page</span>` : '');
+
+      pagerEl.querySelector('#pg-prev').disabled = offset === 0;
+      pagerEl.querySelector('#pg-next').disabled = !data.has_more;
+      pagerEl.querySelector('#pg-status').textContent =
+        `Page ${Math.floor(offset / LIMIT) + 1} of ${Math.max(1, Math.ceil(data.total / LIMIT))}`;
+
+      if (!data.entries.length) {
+        listEl.innerHTML = `<div class="rounded border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-400">No audit entries match the current filters.</div>`;
+        return;
+      }
+      const rows = data.entries.map((e, i) => {
+        const time = e.ts.replace('T', ' ').replace(/\.\d+Z?$/, '');
+        const actor = e.actor
+          ? `<code class="text-slate-300">${escapeHtml(e.actor.username)}</code>`
+          : '<span class="text-slate-600">—</span>';
+        const action = `<code class="text-sky-300">${escapeHtml(e.action || '')}</code>`;
+        const rid = e.resource_id
+          ? `<code class="text-[11px] text-slate-300">${escapeHtml(String(e.resource_id))}</code>`
+          : '<span class="text-slate-600">—</span>';
+        const outcomeBadge = e.outcome === 'ok'
+          ? `<span class="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">${e.status}</span>`
+          : `<span class="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] text-rose-300">${e.status}</span>`;
+        const dur = `<span class="text-slate-500 font-mono text-[11px]">${Math.round(e.duration_ms)}ms</span>`;
+        return `
+          <tr data-idx="${i}" class="vb-row hover:bg-slate-900/60 cursor-pointer">
+            <td class="px-3 py-1.5 font-mono text-[11px] text-slate-400 whitespace-nowrap">${escapeHtml(time)}</td>
+            <td class="px-3 py-1.5">${actor}</td>
+            <td class="px-3 py-1.5">${action}</td>
+            <td class="px-3 py-1.5 text-slate-400 text-xs">${escapeHtml(e.resource_type || '')}</td>
+            <td class="px-3 py-1.5">${rid}</td>
+            <td class="px-3 py-1.5">${outcomeBadge}</td>
+            <td class="px-3 py-1.5 text-right">${dur}</td>
+          </tr>`;
+      });
+      listEl.innerHTML = table(
+        ['Time (UTC)', 'Actor', 'Action', 'Type', 'Resource', 'Result', 'Duration'],
+        rows,
+      );
+      listEl.querySelectorAll('tr[data-idx]').forEach((tr) => {
+        tr.onclick = () => openDetail(data.entries[Number(tr.dataset.idx)]);
+      });
+    }
+
+    // Click-to-filter affordance used in the detail modal — sets one
+    // filter input and re-runs the query.
+    function setFilter(field, value) {
+      const map = {
+        actor: '#f-actor', action: '#f-action', resource_type: '#f-rtype',
+        resource_id: '#f-rid', outcome: '#f-outcome', request_id: '#f-req',
+        session_id: '#f-sid',
+      };
+      const el = filtersEl.querySelector(map[field]);
+      if (!el) return;
+      el.value = value;
+      offset = 0;
+      load();
+    }
+
+    function openDetail(entry) {
+      const wrap = document.createElement('div');
+      const chip = (label, action) =>
+        `<button data-flt="${escapeHtml(label)}" class="rounded bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/40 px-2 py-0.5 text-[11px] text-sky-300">${escapeHtml(action)}</button>`;
+      const chips = [];
+      if (entry.actor) chips.push(['actor:' + entry.actor.username, chip('actor:' + entry.actor.username, '→ filter by actor=' + entry.actor.username)]);
+      if (entry.action) {
+        chips.push(['action:' + entry.action, chip('action:' + entry.action, '→ exact action')]);
+        // Prefix shortcut: `container.start` → `container.*`
+        const dot = entry.action.indexOf('.');
+        if (dot > 0) {
+          const prefix = entry.action.slice(0, dot) + '.*';
+          chips.push(['action:' + prefix, chip('action:' + prefix, '→ filter by ' + prefix)]);
+        }
+      }
+      if (entry.request_id) chips.push(['request_id:' + entry.request_id, chip('request_id:' + entry.request_id, '→ same request')]);
+      if (entry.session_id) chips.push(['session_id:' + entry.session_id, chip('session_id:' + entry.session_id, '→ same session')]);
+      if (entry.resource_type) chips.push(['rtype:' + entry.resource_type, chip('rtype:' + entry.resource_type, '→ ' + entry.resource_type + 's')]);
+
+      wrap.innerHTML = `
+        <div class="mb-3 text-xs text-slate-400">Quick filters:</div>
+        <div class="mb-4 flex flex-wrap gap-2">${chips.map(([, html]) => html).join('') || '<span class="text-slate-600">(none)</span>'}</div>
+        <div class="mb-2 text-[11px] uppercase tracking-wider text-slate-500">Raw record</div>
+        <div id="detail-json"></div>
+        <div class="mt-3 flex flex-wrap gap-2">
+          ${entry.session_id ? `<button id="open-session" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 text-xs text-slate-200">🪪 Open Sessions tab</button>` : ''}
+        </div>`;
+      wrap.querySelector('#detail-json').appendChild(jsonView(entry));
+      wrap.addEventListener('click', (e) => {
+        const t = e.target.closest('[data-flt]');
+        if (!t) return;
+        const [field, value] = t.dataset.flt.split(':').reduce((acc, part, i, arr) => {
+          // Field is the first segment; value is everything after the
+          // first colon (request ids contain colons in some formats).
+          if (i === 0) acc.push(part);
+          else acc.push(arr.slice(i).join(':'));
+          return i === 0 ? acc : acc.slice(0, 2);
+        }, []);
+        // Map our display field to the filter field name (rtype → resource_type)
+        const real = field === 'rtype' ? 'resource_type' : field;
+        setFilter(real, value);
+        modalRef.close && modalRef.close(null);
+      });
+      const openSess = wrap.querySelector('#open-session');
+      if (openSess) openSess.onclick = () => {
+        modalRef.close && modalRef.close(null);
+        window.location.hash = '#sessions';
+      };
+      const modalRef = {};
+      modal({
+        title: `${entry.action || 'audit'} · ${entry.outcome} ${entry.status}`,
+        body: wrap, size: 'xl', ref: modalRef,
+      });
+    }
+
+    function startLive() {
+      if (liveTimer) return;
+      live = true;
+      document.getElementById('audit-live').textContent = 'Live: on';
+      document.getElementById('audit-live').classList.add('!bg-emerald-500/20', '!text-emerald-200');
+      // Poll every 5s. Reset offset so live view always shows the
+      // newest page.
+      liveTimer = setInterval(() => { offset = 0; load(); }, 5000);
+    }
+    function stopLive() {
+      if (!liveTimer) return;
+      live = false;
+      clearInterval(liveTimer); liveTimer = null;
+      document.getElementById('audit-live').textContent = 'Live: off';
+      document.getElementById('audit-live').classList.remove('!bg-emerald-500/20', '!text-emerald-200');
+    }
+
+    // Event wiring
+    filtersEl.querySelector('#f-apply').onclick = () => { offset = 0; load(); };
+    filtersEl.querySelector('#f-clear').onclick = () => {
+      ['#f-actor','#f-action','#f-rtype','#f-rid','#f-outcome','#f-req','#f-sid','#f-since','#f-until']
+        .forEach((sel) => { const el = filtersEl.querySelector(sel); if (el) el.value = ''; });
+      offset = 0; load();
+    };
+    pagerEl.querySelector('#pg-prev').onclick = () => { offset = Math.max(0, offset - LIMIT); load(); };
+    pagerEl.querySelector('#pg-next').onclick = () => { offset += LIMIT; load(); };
+    document.getElementById('refresh').onclick = () => load();
+    document.getElementById('audit-live').onclick = () => live ? stopLive() : startLive();
+    document.getElementById('audit-export').onclick = async () => {
+      // Re-run the current filters with a wider limit so the operator
+      // can hand off the resulting JSONL to a vendor or SOC during an
+      // incident without scraping the UI.
+      try {
+        const params = buildQuery({ limit: 1000, offset: 0 });
+        const out = await api('/api/audit?' + params.toString());
+        const blob = new Blob(
+          (out.entries || []).map((e) => JSON.stringify(e) + '\n'),
+          { type: 'application/x-ndjson' },
+        );
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `audit-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jsonl`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        toast(`Exported ${out.entries.length} of ${out.total} matching entries`, 'success');
+      } catch (e) { toast(`Export failed: ${e.message}`, 'error'); }
+    };
+
+    // Stop live polling when the view is replaced (route change).
+    const observer = new MutationObserver(() => {
+      if (!document.body.contains(root)) { stopLive(); observer.disconnect(); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    await load();
+  };
+
+  /**
+   * Parse a hash like `#audit?session_id=abc&action=container.*` into
+   * the query-string params it carries. Used by cross-link entry
+   * points (Sessions → Audit) to seed the filter inputs without an
+   * extra round-trip.
+   */
+  function parseHashQuery() {
+    const h = window.location.hash || '';
+    const q = h.indexOf('?');
+    if (q < 0) return {};
+    return Object.fromEntries(new URLSearchParams(h.slice(q + 1)).entries());
+  }
 
   // ---------- Activity (live events + per-container live stats) ----------
   views.activity = async (root) => {
@@ -5635,7 +6018,10 @@ import { FitAddon } from '@xterm/addon-fit';
 
   // ---------- Boot ----------
   state.auth = loadAuth();
-  const initial = window.location.hash.replace('#', '');
+  // Same query-stripping as the hashchange handler so a refresh on
+  // `#audit?session_id=…` lands on the audit page (not dashboard).
+  const initialRaw = window.location.hash.replace('#', '');
+  const initial = initialRaw.split('?', 1)[0];
   if (initial && NAV.some((n) => n.id === initial)) state.route = initial;
 
   (async () => {

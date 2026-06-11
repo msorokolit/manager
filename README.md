@@ -198,7 +198,9 @@ Two structured streams, both backed by [pino](https://getpino.io/):
 
 The `action` is derived from the route's tag + path segments (`/api/containers/:id/start` → `container.start`; `/api/networks/:id/connect` → `network.connect`; `/api/volumes/delete/bulk` → `volume.delete.bulk`). Routes can override by setting `audit: { action: '…', resourceType: '…', resourceIdFrom: 'params.foo' | 'body.bar' }` in their spec.
 
-The audit log is admin-queryable via `GET /api/audit`:
+The SPA exposes the audit log under an **Audit** tab (admin-only, hidden from viewer JWTs). The page has a full filter bar (actor / action glob / resource type / resource id / outcome / time window / request id / session id), pagination, a "Live" toggle that auto-refreshes every 5s, a "Download JSONL" button for sharing with a SOC during an incident, and per-row detail modals with one-click "filter by this" chips. From the **Sessions** tab, each row's `📜 Activity` button cross-links to the Audit page pre-filtered by that session's id.
+
+The audit log is also admin-queryable via `GET /api/audit`:
 
 ```bash
 # Last 50 actions by alice
