@@ -460,6 +460,62 @@ describe('CreateContainerRequest mem fields (M4)', () => {
   });
 });
 
+// ---------- Devices + GPUs ----------
+describe('CreateContainerRequest devices + GPUs', () => {
+  function isValid(p) {
+    return valid(S.CreateContainerRequest, { image: 'nginx', ...p });
+  }
+
+  it('devices: accepts host-only, host:container, and host:container:perms forms', () => {
+    expect(isValid({ devices: ['/dev/dri'] })).toBe(true);
+    expect(isValid({ devices: ['/dev/dri:/dev/dri'] })).toBe(true);
+    expect(isValid({ devices: ['/dev/dri:/dev/dri:rwm'] })).toBe(true);
+    expect(isValid({ devices: ['/dev/snd:/dev/snd:rw'] })).toBe(true);
+  });
+
+  it('devices: rejects malformed strings (typos that previously made the daemon error)', () => {
+    expect(isValid({ devices: ['no-leading-slash'] })).toBe(false);
+    expect(isValid({ devices: ['/dev/dri:'] })).toBe(false); // bare trailing colon
+    expect(isValid({ devices: ['/dev/dri:/dev/dri:xyz'] })).toBe(false); // bad perms
+    expect(isValid({ devices: ['/dev/dri:/dev/dri:rwmZ'] })).toBe(false); // too long perms
+    expect(isValid({ devices: ['/dev/$(rm -rf /)'] })).toBe(false); // shell metachar
+  });
+
+  it('devices: caps array at 64 items', () => {
+    const big = Array.from({ length: 65 }, (_, i) => `/dev/d${i}:/dev/d${i}`);
+    expect(isValid({ devices: big })).toBe(false);
+  });
+
+  it('gpu_device_ids: accepts numeric indices and GPU-… UUIDs', () => {
+    expect(isValid({ gpu_device_ids: ['0', '1'] })).toBe(true);
+    expect(isValid({ gpu_device_ids: ['GPU-fef8089b-bd1a-2db5-37bc-9c46b6fa1f72'] })).toBe(true);
+  });
+
+  it('gpu_device_ids: rejects shell-metachar input', () => {
+    expect(isValid({ gpu_device_ids: ['0; reboot'] })).toBe(false);
+    expect(isValid({ gpu_device_ids: ['$(id)'] })).toBe(false);
+  });
+
+  it('gpu_capabilities: lowercase identifiers only', () => {
+    expect(isValid({ gpu_capabilities: ['compute', 'utility', 'video'] })).toBe(true);
+    expect(isValid({ gpu_capabilities: ['Compute'] })).toBe(false);  // uppercase
+    expect(isValid({ gpu_capabilities: ['has space'] })).toBe(false);
+  });
+
+  it('runtime: alphanumeric + ._- only', () => {
+    expect(isValid({ runtime: 'nvidia' })).toBe(true);
+    expect(isValid({ runtime: 'kata-runtime' })).toBe(true);
+    expect(isValid({ runtime: 'crun' })).toBe(true);
+    expect(isValid({ runtime: 'nvidia container runtime' })).toBe(false);
+  });
+
+  it('gpus legacy: accepts "all", -1, or a positive integer', () => {
+    expect(isValid({ gpus: 'all' })).toBe(true);
+    expect(isValid({ gpus: -1 })).toBe(true);
+    expect(isValid({ gpus: 2 })).toBe(true);
+  });
+});
+
 // ---------- Bulk action plumbing (shared shapes + per-resource) ----------
 describe('Bulk action schemas', () => {
   it('BulkIdsRequest enforces minItems 1 and maxItems 500', () => {
