@@ -220,6 +220,68 @@ Filters: `since`, `until`, `actor`, `action` (glob: `container.*`, `*.bulk`, etc
 
 For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a path your log shipper watches (`vector` / `fluentbit` / `filebeat`) and disable in-process rotation with `AUDIT_MAX_BYTES=0`. The JSONL format is the lowest-common-denominator input for every aggregator we tested.
 
+## Live monitoring: stats, processes, top consumers
+
+The manager surfaces three monitoring views, each scoped to a different question.
+
+### Container inspect → Stats tab
+
+Streams `GET /api/containers/:id/stats/stream` (Docker's NDJSON stats endpoint) and renders four live KPI cards + four sparkline charts:
+
+- **CPU %** — `cpu_delta / system_delta × online_cpus × 100`, same formula `docker stats` uses
+- **Memory %** — `(usage − cache) / limit`, matches `docker stats` columns
+- **Network rate** — bytes/sec computed by differentiating cumulative `rx + tx` counters between consecutive samples
+- **Block I/O rate** — bytes/sec computed the same way over `io_service_bytes_recursive` (cgroupsv1; empty on cgroupsv2)
+
+On cgroupsv1 hosts a **per-CPU breakdown** also renders, one bar per core. On cgroupsv2 the panel is hidden because the kernel doesn't expose `percpu_usage` any more.
+
+Sparkline auto-scaling is per-metric: CPU% and Memory% are anchored to 100 (so multiple containers stay visually comparable), but net/blkio rates auto-scale to their own max sample (so a quiet container's spike isn't lost next to a busy one).
+
+The stats stream is torn down (`AbortController.abort()`) on any of: tab switch, inspect modal close, hashchange. Important because Docker holds a per-reader sampling slot — leaking these would slowly degrade daemon performance.
+
+### Container inspect → Processes tab
+
+Calls `GET /api/containers/:id/top?ps_args=<args>` which wraps Docker's `top` endpoint (a `ps` invocation inside the container's PID namespace). The response is column-headers + 2D string array — rendered as a dynamic table whose columns adapt to `ps_args`.
+
+Picker offers four common ps invocations:
+
+- `-ef` (default — full process tree, comma-separated UID/PID/PPID/C/STIME/TTY/TIME/CMD)
+- `aux` (BSD-style)
+- `-eo pid,user,pcpu,pmem,comm` (sorted output)
+- `axf` (process tree with parent/child indentation)
+
+`ps_args` is validated against a tight allowlist regex on the backend (no `|`, `&`, `;`, `$`, backticks, quotes, `<`, `>`, parens, `*`, `?`) so even with malicious input the daemon receives nothing it can interpret as a shell construct.
+
+Auto-refresh toggle polls every 5s. The button is read-only — viewer JWTs can fetch `top` because it's diagnostic data, no mutation.
+
+A `409` from the daemon (container not running) is mapped to a friendly error: *"Container is not running; start it before requesting process list"*.
+
+### Dashboard → Top consumers (live)
+
+Two panels side-by-side: **Top by CPU** and **Top by Memory**, polling `GET /api/system/stats/summary?limit=5` every 5 seconds.
+
+The summary endpoint:
+
+1. Calls `listContainers({all: false})` for the running set.
+2. Fans out two `stats({stream:false})` samples per container, **bounded to 8 concurrent** to avoid saturating the daemon.
+3. Computes the rate between the two samples (~1s gap) so the network / blkio numbers are throughput not lifetime totals.
+4. **Caches the result for 3 seconds** — polling at 1-2s would otherwise hammer the daemon when there are many containers. The response includes `cached: true|false` so the SPA can show staleness honestly.
+5. Per-container sampling failures (e.g. container exited between `listContainers` and the `stats` call) are silently dropped and logged at debug — the whole summary doesn't fail because of one missing container.
+
+Each row links to the container's inspect modal so clicking a top consumer takes you straight to its Stats tab.
+
+### Tuning knobs (backend)
+
+The cache TTL, concurrency, and sample gap are constants in `backend-node/src/routes/system.js`:
+
+| Constant | Default | What it controls |
+|---|---|---|
+| `SYSTEM_STATS_CACHE_TTL_MS` | 3000 | How long a snapshot is reused |
+| `SYSTEM_STATS_SAMPLE_GAP_MS` | 1000 | Wait between the two stats samples (longer = more accurate rate) |
+| `SYSTEM_STATS_CONCURRENCY` | 8 | Parallel containers sampled at once |
+
+Tune up the cache TTL if your dashboard polls more aggressively; tune down the concurrency on hosts with many small containers to spread the per-call latency.
+
 ## Container editing: live update, recreate, duplicate, rename
 
 Docker containers are largely immutable — once created, most settings can't change without recreating the container. The manager surfaces this honestly via three distinct workflows, each scoped to what's safely possible:

@@ -1,6 +1,70 @@
 import { Type } from '@sinclair/typebox';
 import { Opt, StringEnum } from './_common.js';
 
+/**
+ * One row in the SystemStatsSummaryResponse — a single container's
+ * live resource snapshot derived from a stats sample.
+ *
+ * Bytes-per-second fields are RATES, not totals — we compute deltas
+ * server-side between two consecutive stats samples so the SPA can
+ * show throughput without having to remember the previous sample.
+ */
+export const ContainerStatsSummary = Type.Object(
+  {
+    id: Type.String(),
+    name: Type.String(),
+    image: Opt(Type.String()),
+    cpu_pct: Type.Number({ minimum: 0 }),
+    mem_used_bytes: Type.Integer({ minimum: 0 }),
+    mem_limit_bytes: Type.Integer({ minimum: 0 }),
+    mem_pct: Type.Number({ minimum: 0 }),
+    net_rx_bytes_per_s: Type.Number({ minimum: 0 }),
+    net_tx_bytes_per_s: Type.Number({ minimum: 0 }),
+    blk_read_bytes_per_s: Type.Number({ minimum: 0 }),
+    blk_write_bytes_per_s: Type.Number({ minimum: 0 }),
+    pids: Opt(Type.Integer({ minimum: 0 })),
+  },
+  { $id: 'ContainerStatsSummary', additionalProperties: false },
+);
+
+/**
+ * GET /api/system/stats/summary — aggregate snapshot of every
+ * running container's resource usage at one point in time.
+ *
+ * `sampled_at` is the server's wall-clock when the sample completed
+ * (not the start) so the SPA can show "X seconds ago" honestly.
+ * Failures sampling individual containers are silently dropped from
+ * the result — they're recorded server-side but don't take down the
+ * whole summary.
+ *
+ * `cached` tells the SPA whether the data came from the in-memory
+ * cache (still <TTL old) or was freshly computed; useful for
+ * debugging UI staleness without exposing the TTL.
+ */
+export const SystemStatsSummaryResponse = Type.Object(
+  {
+    sampled_at: Type.String({ format: 'date-time' }),
+    cached: Type.Boolean(),
+    container_count: Type.Integer({ minimum: 0 }),
+    totals: Type.Object(
+      {
+        cpu_pct: Type.Number({ minimum: 0 }),
+        mem_used_bytes: Type.Integer({ minimum: 0 }),
+        mem_limit_bytes: Type.Integer({ minimum: 0 }),
+        net_rx_bytes_per_s: Type.Number({ minimum: 0 }),
+        net_tx_bytes_per_s: Type.Number({ minimum: 0 }),
+        blk_read_bytes_per_s: Type.Number({ minimum: 0 }),
+        blk_write_bytes_per_s: Type.Number({ minimum: 0 }),
+      },
+      { additionalProperties: false },
+    ),
+    top_cpu: Type.Array(Type.Ref(ContainerStatsSummary)),
+    top_memory: Type.Array(Type.Ref(ContainerStatsSummary)),
+    rows: Type.Array(Type.Ref(ContainerStatsSummary)),
+  },
+  { $id: 'SystemStatsSummaryResponse', additionalProperties: false },
+);
+
 export const PingResponse = Type.Object(
   {
     ok: Type.Boolean(),

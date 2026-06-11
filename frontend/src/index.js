@@ -435,6 +435,81 @@ import { FitAddon } from '@xterm/addon-fit';
     while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
     return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${u[i]}`;
   }
+  /** Format a bytes/sec rate. Reuses fmtBytes + " /s" suffix. */
+  function fmtRate(n) {
+    if (n == null) return '—';
+    return `${fmtBytes(n)}/s`;
+  }
+  /**
+   * Compute CPU% / memory / network / blkio derivatives from a
+   * single Docker stats sample (same formula as `docker stats`).
+   * Mirror of backend src/stats.js so the SPA can drive its own
+   * sparklines from the streaming endpoint without round-trips.
+   * Returns { cpu, memUsage, memLimit, memPct, netRx, netTx,
+   * blkR, blkW, perCpu[], onlineCpus, pids }.
+   */
+  function computeStatsFromSample(s) {
+    if (!s) return { cpu: 0, memUsage: 0, memLimit: 0, memPct: 0, netRx: 0, netTx: 0, blkR: 0, blkW: 0, perCpu: [], onlineCpus: 1, pids: 0 };
+    const cs = s.cpu_stats || {}, ps = s.precpu_stats || {}, ms = s.memory_stats || {};
+    const cd = (cs.cpu_usage?.total_usage || 0) - (ps.cpu_usage?.total_usage || 0);
+    const sd = (cs.system_cpu_usage || 0) - (ps.system_cpu_usage || 0);
+    const cores = cs.online_cpus || (cs.cpu_usage?.percpu_usage || []).length || 1;
+    const cpu = (sd > 0 && cd > 0) ? (cd / sd) * cores * 100 : 0;
+    const perCpu = [];
+    const pc = cs.cpu_usage?.percpu_usage, ppc = ps.cpu_usage?.percpu_usage;
+    if (Array.isArray(pc) && Array.isArray(ppc) && sd > 0) {
+      for (let i = 0; i < pc.length; i++) {
+        const d = (pc[i] || 0) - (ppc[i] || 0);
+        perCpu.push(d > 0 ? (d / sd) * pc.length * 100 : 0);
+      }
+    }
+    const memTotal = ms.usage || 0;
+    const memCache = (ms.stats?.cache != null) ? ms.stats.cache : (ms.stats?.inactive_file || 0);
+    const memUsage = Math.max(0, memTotal - memCache);
+    const memLimit = ms.limit || 0;
+    const memPct = memLimit ? (memUsage / memLimit) * 100 : 0;
+    let netRx = 0, netTx = 0;
+    for (const v of Object.values(s.networks || {})) {
+      netRx += v.rx_bytes || 0; netTx += v.tx_bytes || 0;
+    }
+    let blkR = 0, blkW = 0;
+    for (const e of (s.blkio_stats?.io_service_bytes_recursive || [])) {
+      const op = (e.op || '').toLowerCase();
+      if (op === 'read') blkR += e.value || 0;
+      else if (op === 'write') blkW += e.value || 0;
+    }
+    return { cpu, memUsage, memLimit, memPct, netRx, netTx, blkR, blkW, perCpu, onlineCpus: cores, pids: s.pids_stats?.current || 0 };
+  }
+  /**
+   * Tiny sparkline renderer on a 2D canvas. data[] is values; we
+   * scale to a fixed Y-max (so multiple sparks stay comparable).
+   * No deps — Chart.js / Recharts would be a 100kb hammer for
+   * what's a 20-line algorithm.
+   */
+  function drawSparkInto(canvas, data, yMax = 100, color = '#0ea5e9') {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!data || !data.length) return;
+    // Auto-scale yMax if data exceeds it (useful for net/blkio rates).
+    const M = Math.max(yMax, ...data.map((v) => v || 0)) || 1;
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = (i / Math.max(1, data.length - 1)) * w;
+      const y = h - ((v || 0) / M) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // Fill under the line — subtle gradient look without an actual
+    // gradient (which is more expensive per redraw).
+    ctx.fillStyle = `${color}26`; // ~15% alpha hex
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath(); ctx.fill();
+  }
   function fmtDate(s) {
     if (!s) return '—';
     const d = new Date(s);
@@ -720,6 +795,73 @@ import { FitAddon } from '@xterm/addon-fit';
         </dl>
       </div>`;
     root.appendChild(meta);
+
+    // Top consumers (live). Two side-by-side panels — top by CPU%
+    // and top by memory — polling /api/system/stats/summary every
+    // 5s. The endpoint caches for 3s server-side so this is cheap.
+    const topWrap = document.createElement('div');
+    topWrap.className = 'mt-6';
+    topWrap.innerHTML = `
+      <div class="mb-3 flex items-baseline justify-between">
+        <h3 class="text-sm font-semibold">Top consumers (live)</h3>
+        <span id="top-meta" class="text-xs text-slate-500">loading…</span>
+      </div>
+      <div class="grid gap-3 md:grid-cols-2">
+        <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+          <div class="mb-2 text-[11px] uppercase tracking-wider text-sky-400">Top by CPU</div>
+          <div id="top-cpu-list" class="space-y-1.5 text-xs"></div>
+        </div>
+        <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+          <div class="mb-2 text-[11px] uppercase tracking-wider text-emerald-400">Top by Memory</div>
+          <div id="top-mem-list" class="space-y-1.5 text-xs"></div>
+        </div>
+      </div>`;
+    root.appendChild(topWrap);
+    // A single shared inline-bar renderer for both panels — keeps
+    // the visual style identical even though the metric differs.
+    function renderTopList(el, rows, formatter, max) {
+      if (!rows.length) {
+        el.innerHTML = `<div class="text-slate-500">No running containers</div>`;
+        return;
+      }
+      el.innerHTML = rows.map((r) => {
+        const pct = max > 0 ? Math.min(100, (r.value / max) * 100) : 0;
+        return `<div class="flex items-center gap-2">
+          <a class="w-36 truncate text-sky-300 hover:underline" href="#containers" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</a>
+          <div class="flex-1 h-2 rounded bg-slate-800 overflow-hidden">
+            <div class="h-full ${r.color}" style="width:${pct.toFixed(1)}%"></div>
+          </div>
+          <span class="w-24 text-right font-mono text-slate-300">${formatter(r)}</span>
+        </div>`;
+      }).join('');
+    }
+    let topPollHandle = null;
+    async function pollTop() {
+      try {
+        const sum = await api('/api/system/stats/summary?limit=5');
+        topWrap.querySelector('#top-meta').textContent =
+          `${sum.container_count} running · ${sum.cached ? 'cached' : 'live'} · ${new Date(sum.sampled_at).toLocaleTimeString()}`;
+        renderTopList(
+          topWrap.querySelector('#top-cpu-list'),
+          sum.top_cpu.map((r) => ({ name: r.name, value: r.cpu_pct, color: 'bg-sky-500/80', display: r.cpu_pct })),
+          (r) => `${r.value.toFixed(1)} %`,
+          Math.max(100, ...sum.top_cpu.map((r) => r.cpu_pct)),
+        );
+        renderTopList(
+          topWrap.querySelector('#top-mem-list'),
+          sum.top_memory.map((r) => ({ name: r.name, value: r.mem_used_bytes, color: 'bg-emerald-500/80' })),
+          (r) => fmtBytes(r.value),
+          Math.max(1, ...sum.top_memory.map((r) => r.mem_used_bytes)),
+        );
+      } catch (e) {
+        topWrap.querySelector('#top-meta').textContent = `error: ${e.message}`;
+      }
+    }
+    pollTop();
+    topPollHandle = setInterval(pollTop, 5000);
+    // Stop polling when the user navigates away — otherwise we'd
+    // hammer the daemon forever after a SPA hash change.
+    window.addEventListener('hashchange', () => clearInterval(topPollHandle), { once: true });
 
     let containers = [];
     try { containers = await api('/api/containers?all=true'); } catch {}
@@ -1311,14 +1453,28 @@ import { FitAddon } from '@xterm/addon-fit';
     try { data = await api(`/api/containers/${id}`); }
     catch (e) { toast(e.message, 'error'); return; }
 
+    // 'stats' and 'processes' are live tabs — they don't return
+    // static HTML, instead they receive the pane element and own
+    // its lifecycle. paint() detects these via render returning a
+    // function (handle) and treats it as a cleanup callback.
     const TABS = [
       { id: 'overview',   label: 'Overview',     render: () => _ciOverview(data) },
+      { id: 'stats',      label: 'Stats',        render: 'live-stats' },
+      { id: 'processes',  label: 'Processes',    render: 'live-top' },
       { id: 'networking', label: 'Networking',   render: () => _ciNetworking(data) },
       { id: 'storage',    label: 'Storage',      render: () => _ciStorage(data) },
       { id: 'env',        label: 'Env & labels', render: () => _ciEnv(data) },
       { id: 'resources',  label: 'Resources',    render: () => _ciResources(data) },
       { id: 'raw',        label: 'Raw JSON',     render: () => null },
     ];
+    // Per-tab cleanup hooks (e.g. abort the stats stream). Stored
+    // by tab id so switching tabs / closing the modal tears down
+    // any open work.
+    const tabCleanups = {};
+    function runCleanup(tabId) {
+      const fn = tabCleanups[tabId];
+      if (fn) { try { fn(); } catch {} delete tabCleanups[tabId]; }
+    }
 
     const wrap = document.createElement('div');
     const cfg = data.Config || {}, st = data.State || {};
@@ -1350,12 +1506,21 @@ import { FitAddon } from '@xterm/addon-fit';
       </div>
       <div id="ci-pane" class="min-h-[200px]"></div>`;
 
+    let currentTabId = null;
     function paint(tabId) {
       const tab = TABS.find(t => t.id === tabId) || TABS[0];
+      // Tear down whatever the previous tab had running (stats
+      // stream, top poll, …) before swapping content.
+      if (currentTabId) runCleanup(currentTabId);
+      currentTabId = tab.id;
       const pane = wrap.querySelector('#ci-pane');
       pane.replaceChildren();
       if (tab.id === 'raw') pane.appendChild(jsonView(data));
-      else pane.innerHTML = tab.render();
+      else if (tab.render === 'live-stats') {
+        tabCleanups[tab.id] = mountContainerStatsTab(pane, id);
+      } else if (tab.render === 'live-top') {
+        tabCleanups[tab.id] = mountContainerTopTab(pane, id);
+      } else pane.innerHTML = tab.render();
 
       pane.querySelectorAll('[data-reveal]').forEach((b) => {
         b.onclick = () => {
@@ -1452,6 +1617,178 @@ import { FitAddon } from '@xterm/addon-fit';
       ref: modalRef,
       actions: [{ label: 'Close', value: null, kind: 'secondary' }],
     });
+    // Modal closed (any path) — tear down any live tab.
+    if (currentTabId) runCleanup(currentTabId);
+  }
+
+  /**
+   * Live stats tab. Streams /api/containers/:id/stats/stream and
+   * renders KPI cards + sparkline charts.
+   *
+   * Returns a teardown function (called by paint() on tab switch
+   * or by showContainerInspect on modal close). The teardown
+   * aborts the in-flight fetch so the SPA never leaves an
+   * orphaned NDJSON stream hanging on the daemon — important
+   * because Docker holds a sample slot per open stats reader.
+   *
+   * Sparklines are auto-scaling: CPU% is anchored to 100 for
+   * comparability across containers, but net/blkio rates auto-
+   * scale to their max sample (otherwise a busy container's
+   * "spike" would dwarf a quiet one's "spike" on the same y-axis).
+   */
+  function mountContainerStatsTab(pane, id) {
+    pane.innerHTML = `
+      <div class="grid gap-3 md:grid-cols-4 mb-3" id="stats-kpi"></div>
+      <div class="grid gap-3 md:grid-cols-2 mb-3">
+        ${_sparkBox('CPU %',         'cpu-spark',  'sky')}
+        ${_sparkBox('Memory %',      'mem-spark',  'emerald')}
+        ${_sparkBox('Network rate',  'net-spark',  'amber')}
+        ${_sparkBox('Block I/O rate','blk-spark',  'rose')}
+      </div>
+      <div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3" id="percpu-pane" hidden>
+        <div class="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Per-CPU usage (cgroupsv1 hosts only)</div>
+        <div id="percpu-bars" class="space-y-1"></div>
+      </div>`;
+    const hist = { cpu: [], mem: [], netRate: [], blkRate: [] };
+    let prev = null, prevAt = 0;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(`/api/containers/${encodeURIComponent(id)}/stats/stream`, {
+          headers: { Authorization: authHeader() }, signal: ctrl.signal,
+        });
+        if (!res.ok) throw new Error(`Stats stream failed (${res.status})`);
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const s = JSON.parse(line);
+              const m = computeStatsFromSample(s);
+              // Rate computation: differentiate cumulative
+              // counters against the previous sample.
+              const now = Date.now();
+              let netRate = 0, blkRate = 0;
+              if (prev && prevAt) {
+                const dt = (now - prevAt) / 1000;
+                if (dt > 0) {
+                  netRate = Math.max(0, ((m.netRx + m.netTx) - (prev.netRx + prev.netTx)) / dt);
+                  blkRate = Math.max(0, ((m.blkR + m.blkW) - (prev.blkR + prev.blkW)) / dt);
+                }
+              }
+              prev = m; prevAt = now;
+              hist.cpu.push(m.cpu); hist.mem.push(m.memPct);
+              hist.netRate.push(netRate); hist.blkRate.push(blkRate);
+              for (const k of Object.keys(hist)) if (hist[k].length > 120) hist[k].shift();
+              pane.querySelector('#stats-kpi').innerHTML = [
+                statCard('CPU',     `${m.cpu.toFixed(1)} %`,    `${m.onlineCpus} core${m.onlineCpus === 1 ? '' : 's'}`),
+                statCard('Memory',  `${fmtBytes(m.memUsage)} / ${fmtBytes(m.memLimit)}`, `${m.memPct.toFixed(1)} %`),
+                statCard('Network', `↓ ${fmtRate(netRate)}`,    `↑ ${fmtBytes(m.netTx)} total`),
+                statCard('Block IO',`R ${fmtRate(blkRate)}`,    `${fmtBytes(m.blkR + m.blkW)} total`),
+              ].join('');
+              drawSparkInto(pane.querySelector('#cpu-spark'), hist.cpu, 100,    '#0ea5e9');
+              drawSparkInto(pane.querySelector('#mem-spark'), hist.mem, 100,    '#10b981');
+              drawSparkInto(pane.querySelector('#net-spark'), hist.netRate, 0,  '#f59e0b');
+              drawSparkInto(pane.querySelector('#blk-spark'), hist.blkRate, 0,  '#f43f5e');
+              // Per-CPU bars (cgroupsv1 only). Hide the panel
+              // entirely on cgroupsv2 hosts where perCpu is empty.
+              if (m.perCpu && m.perCpu.length) {
+                const panel = pane.querySelector('#percpu-pane'); panel.hidden = false;
+                pane.querySelector('#percpu-bars').innerHTML = m.perCpu.map((v, i) => `
+                  <div class="flex items-center gap-2 text-xs">
+                    <span class="text-slate-500 w-8 text-right">${i}</span>
+                    <div class="flex-1 h-2 rounded bg-slate-800 overflow-hidden">
+                      <div class="h-full bg-sky-500/80" style="width:${Math.min(100, v).toFixed(1)}%"></div>
+                    </div>
+                    <span class="text-slate-400 w-12 text-right">${v.toFixed(1)} %</span>
+                  </div>`).join('');
+              }
+            } catch { /* ignore malformed line */ }
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          pane.insertAdjacentHTML('beforeend',
+            `<div class="mt-3 rounded border border-rose-500/30 bg-rose-500/10 p-2 text-xs text-rose-200">${escapeHtml(e.message)}</div>`,
+          );
+        }
+      }
+    })();
+    return () => ctrl.abort();
+  }
+
+  /**
+   * Process-list tab. Calls /top with a chosen ps_args, renders a
+   * dynamic table whose columns come from the daemon's response.
+   * Supports auto-refresh (5s) — when enabled, sets an interval
+   * that re-fetches and re-renders without rebuilding the controls.
+   */
+  function mountContainerTopTab(pane, id) {
+    pane.innerHTML = `
+      <div class="mb-3 flex flex-wrap items-center gap-2">
+        <label class="text-xs text-slate-400">ps args
+          <select id="top-args" class="ml-1 rounded border-slate-700 bg-slate-950 text-xs">
+            <option value="-ef">-ef (default)</option>
+            <option value="aux">aux</option>
+            <option value="-eo pid,user,pcpu,pmem,comm">-eo pid,user,pcpu,pmem,comm</option>
+            <option value="axf">axf (process tree)</option>
+          </select>
+        </label>
+        <button id="top-refresh" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-1 text-xs">↻ Refresh</button>
+        <label class="flex items-center gap-1 text-xs text-slate-400 ml-1">
+          <input id="top-auto" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Auto-refresh (5s)
+        </label>
+        <span id="top-meta" class="ml-auto text-xs text-slate-500"></span>
+      </div>
+      <div id="top-table" class="rounded-lg border border-slate-800 bg-slate-900/30 overflow-auto max-h-[60vh] scroll-thin"></div>`;
+    let intervalHandle = null;
+    let inflight = false;
+    async function fetchAndRender() {
+      if (inflight) return; inflight = true;
+      const psArgs = pane.querySelector('#top-args').value;
+      const table = pane.querySelector('#top-table');
+      const meta = pane.querySelector('#top-meta');
+      try {
+        const data = await api(`/api/containers/${encodeURIComponent(id)}/top?ps_args=${encodeURIComponent(psArgs)}`);
+        const titles = data.titles || [];
+        const rows = data.processes || [];
+        meta.textContent = `${rows.length} process${rows.length === 1 ? '' : 'es'} · ${new Date().toLocaleTimeString()}`;
+        table.innerHTML = `<table class="w-full text-xs">
+          <thead class="bg-slate-900/60 sticky top-0">
+            <tr>${titles.map((t) => `<th class="px-3 py-2 text-left font-semibold text-slate-300">${escapeHtml(t)}</th>`).join('')}</tr>
+          </thead>
+          <tbody>${rows.map((row) => `
+            <tr class="hover:bg-slate-900/60 border-t border-slate-800/40">
+              ${row.map((c, i) => `<td class="px-3 py-1 font-mono ${i === titles.length - 1 ? 'text-slate-300' : 'text-slate-400'}">${escapeHtml(String(c))}</td>`).join('')}
+            </tr>`).join('')}</tbody></table>`;
+      } catch (e) {
+        table.innerHTML = `<div class="p-4 text-sm text-rose-300">${escapeHtml(e.message)}</div>`;
+      } finally { inflight = false; }
+    }
+    pane.querySelector('#top-refresh').onclick = fetchAndRender;
+    pane.querySelector('#top-args').onchange = fetchAndRender;
+    pane.querySelector('#top-auto').onchange = (e) => {
+      if (e.target.checked && !intervalHandle) intervalHandle = setInterval(fetchAndRender, 5000);
+      else if (!e.target.checked && intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+    };
+    fetchAndRender();
+    return () => { if (intervalHandle) clearInterval(intervalHandle); };
+  }
+
+  function _sparkBox(label, canvasId, tone) {
+    const toneClass = {
+      sky: 'text-sky-400', emerald: 'text-emerald-400',
+      amber: 'text-amber-400', rose: 'text-rose-400',
+    }[tone] || 'text-slate-400';
+    return `<div class="rounded-lg border border-slate-800 bg-slate-900/30 p-3">
+      <div class="mb-2 flex items-center justify-between">
+        <div class="text-[11px] uppercase tracking-wider ${toneClass}">${escapeHtml(label)}</div>
+      </div>
+      <canvas id="${canvasId}" class="w-full" style="height: 64px;"></canvas>
+    </div>`;
   }
 
   async function showContainerLogs(id) {
