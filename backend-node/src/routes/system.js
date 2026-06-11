@@ -5,11 +5,18 @@ import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, intQuery, pipeNdjson, runBoundedParallel } from '../util.js';
+import { asyncHandler, HttpError, intQuery, pipeNdjson, runBoundedParallel } from '../util.js';
 import { createApiRouter, streamResponse } from '../route-builder.js';
-import { PassThroughObject, PingResponse, DeviceDiscoveryResponse, SystemStatsSummaryResponse } from '../schemas/index.js';
+import {
+  PassThroughObject, PingResponse, DeviceDiscoveryResponse, SystemStatsSummaryResponse,
+  EventHistoryQueryResponse, StatsHistoryQueryResponse,
+} from '../schemas/index.js';
+import { Opt, StringEnum } from '../schemas/_common.js';
 import { logger } from '../logger.js';
 import { computeRate } from '../stats.js';
+import { settings } from '../config.js';
+import { queryEvents } from '../event-history.js';
+import { queryStats } from '../stats-history.js';
 
 const r = createApiRouter('/api/system', { tag: 'system' });
 
@@ -585,6 +592,112 @@ r.get(
       top_cpu: snapshot.top_cpu.slice(0, limit),
       top_memory: snapshot.top_memory.slice(0, limit),
     });
+  }),
+);
+
+// ============================================================
+// Historical (persistent) monitoring queries
+// ============================================================
+//
+// /events/history and /stats/history read from the JSONL files
+// maintained by src/event-history.js and src/stats-history.js
+// respectively. Both are read-only, both viewer-allowed (it's
+// the same diagnostic data the live endpoints serve, just from
+// disk instead of the daemon).
+//
+// The 503 paths exist so the SPA can render "history disabled"
+// guidance instead of mysterious empty pages when an operator
+// has turned the recorder off via env var.
+
+const EventHistoryQuery = Type.Object(
+  {
+    since: Opt(Type.String({ description: 'ISO 8601 lower bound' })),
+    until: Opt(Type.String({ description: 'ISO 8601 upper bound' })),
+    // Docker event types: container | image | network | volume |
+    // plugin | daemon | service | node | secret | config
+    type: Opt(Type.String({ maxLength: 64 })),
+    // Glob-style: 'start', 'container.die', '*' — matches the
+    // audit query's action matcher.
+    action: Opt(Type.String({ maxLength: 64 })),
+    // Container ID prefix (short id works) OR name.
+    actor_id: Opt(Type.String({ maxLength: 128 })),
+    actor_name: Opt(Type.String({ maxLength: 256 })),
+    limit: Opt(Type.Integer({ minimum: 1, maximum: 1000, default: 100 })),
+    offset: Opt(Type.Integer({ minimum: 0, default: 0 })),
+    order: Opt(StringEnum(['asc', 'desc'])),
+  },
+  { additionalProperties: false },
+);
+
+r.get(
+  '/events/history',
+  {
+    summary: 'Past Docker events recorded by the manager (persistent JSONL store)',
+    description:
+      'Reads the manager\'s own persisted events file (and rotated siblings). Survives ' +
+      'daemon restarts, unlike the daemon\'s own /events endpoint. 503 when the recorder ' +
+      'is disabled (EVENTS_HISTORY_ENABLED=false).',
+    query: EventHistoryQuery,
+    responses: { 200: EventHistoryQueryResponse },
+  },
+  asyncHandler(async (req, res) => {
+    if (!settings.eventsHistoryEnabled) {
+      throw new HttpError(503, 'Events history is disabled (EVENTS_HISTORY_ENABLED=false)');
+    }
+    res.json(await queryEvents({
+      since: req.query.since,
+      until: req.query.until,
+      type: req.query.type,
+      action: req.query.action,
+      actor_id: req.query.actor_id,
+      actor_name: req.query.actor_name,
+      limit: intQuery(req.query.limit, 100, { min: 1, max: 1000 }),
+      offset: intQuery(req.query.offset, 0, { min: 0 }),
+      order: req.query.order || 'desc',
+    }));
+  }),
+);
+
+const StatsHistoryQuery = Type.Object(
+  {
+    since: Opt(Type.String({ description: 'ISO 8601 lower bound' })),
+    until: Opt(Type.String({ description: 'ISO 8601 upper bound' })),
+    // Filter rows whose top[] snapshot includes a container with
+    // this id prefix or this exact name. Drives the per-container
+    // "View history" panel.
+    container_id: Opt(Type.String({ maxLength: 256 })),
+    limit: Opt(Type.Integer({ minimum: 1, maximum: 10000, default: 1000 })),
+    offset: Opt(Type.Integer({ minimum: 0, default: 0 })),
+    order: Opt(StringEnum(['asc', 'desc'])),
+  },
+  { additionalProperties: false },
+);
+
+r.get(
+  '/stats/history',
+  {
+    summary: 'Past resource-usage samples (persistent JSONL store)',
+    description:
+      'Time-series snapshots of host + per-container resource usage, recorded at the ' +
+      `interval set by STATS_HISTORY_INTERVAL_SEC. 503 when the sampler is disabled.`,
+    query: StatsHistoryQuery,
+    responses: { 200: StatsHistoryQueryResponse },
+  },
+  asyncHandler(async (req, res) => {
+    if (!settings.statsHistoryEnabled) {
+      throw new HttpError(503, 'Stats history is disabled (STATS_HISTORY_ENABLED=false)');
+    }
+    res.json(await queryStats({
+      since: req.query.since,
+      until: req.query.until,
+      container_id: req.query.container_id,
+      limit: intQuery(req.query.limit, 1000, { min: 1, max: 10000 }),
+      offset: intQuery(req.query.offset, 0, { min: 0 }),
+      // Time-series → ascending by default. Charts need oldest-
+      // first to draw left-to-right; descending would force the
+      // SPA to reverse the array every request.
+      order: req.query.order || 'asc',
+    }));
   }),
 );
 

@@ -18,6 +18,10 @@ import { globalLimiter, loginLimiter } from './rate-limit.js';
 import { logger } from './logger.js';
 import { requestContext } from './request-context.js';
 import { loadFromDisk as loadSessionsFromDisk, _internals as sessionsInternals } from './sessions.js';
+import * as eventHistory from './event-history.js';
+import * as statsHistory from './stats-history.js';
+import { _internals as systemInternals } from './routes/system.js';
+import { getClient } from './docker-client.js';
 
 import authApi from './routes/auth.js';
 import auditApi from './routes/audit.js';
@@ -360,7 +364,36 @@ server.listen(settings.port, settings.host, async () => {
   // browse request doesn't pay the docker-pull cost. Best-effort; if
   // it fails, the first per-op container will retry the pull.
   ensureBrowserImage(logger).catch(() => {});
+
+  // ---- Persistent recorders ----
+  // Both are best-effort: a failure to subscribe or sample does NOT
+  // take down the HTTP server. The modules log via pino, and the
+  // SPA's History page surfaces a clear empty state when the
+  // recorders are disabled or never produced data.
+  try {
+    await eventHistory.start(getClient());
+  } catch (err) {
+    logger.warn({ err: err.message }, 'event-history: failed to start');
+  }
+  try {
+    statsHistory.start(() => systemInternals.buildStatsSummary(getClient()));
+  } catch (err) {
+    logger.warn({ err: err.message }, 'stats-history: failed to start');
+  }
 });
+
+// Graceful shutdown — stop the background recorders so the
+// JSONL writers flush and the file handles close cleanly.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    logger.info({ signal: sig }, 'shutting down recorders');
+    try { eventHistory.stop(); } catch {}
+    try { statsHistory.stop(); } catch {}
+    // Don't exit immediately — let in-flight requests finish.
+    // The default Node behaviour after the loop empties exits the
+    // process; for a hard kill the supervisor sends SIGKILL.
+  });
+}
 
 // Graceful shutdown
 function shutdown() {

@@ -65,6 +65,79 @@ export const SystemStatsSummaryResponse = Type.Object(
   { $id: 'SystemStatsSummaryResponse', additionalProperties: false },
 );
 
+/**
+ * One normalised entry in the persistent Docker events log.
+ *
+ * Schema is intentionally close to what Docker emits, with the
+ * irregular bits (free-form Attributes blob) carried through as a
+ * passthrough object so we don't lose drill-down detail (exit
+ * codes, signals, healthcheck transitions).
+ */
+export const EventHistoryEntry = Type.Object(
+  {
+    ts: Type.String({ format: 'date-time' }),
+    type: Type.String(),
+    action: Type.String(),
+    scope: Opt(Type.String()),
+    actor_id: Opt(Type.Union([Type.String(), Type.Null()])),
+    actor_name: Opt(Type.Union([Type.String(), Type.Null()])),
+    image: Opt(Type.Union([Type.String(), Type.Null()])),
+    attributes: Opt(Type.Record(Type.String(), Type.Any())),
+  },
+  { $id: 'EventHistoryEntry', additionalProperties: false },
+);
+
+export const EventHistoryQueryResponse = Type.Object(
+  {
+    total: Type.Integer({ minimum: 0 }),
+    returned: Type.Integer({ minimum: 0 }),
+    has_more: Type.Boolean(),
+    scanned: Opt(Type.Integer({ minimum: 0 })),
+    truncated: Opt(Type.Boolean()),
+    entries: Type.Array(Type.Ref(EventHistoryEntry)),
+  },
+  { $id: 'EventHistoryQueryResponse', additionalProperties: false },
+);
+
+/**
+ * One sample in the persistent stats log. Mirrors
+ * SystemStatsSummaryResponse but with a bounded `top[]` rather
+ * than `top_cpu` + `top_memory` + `rows[]` (we slice to the top-N
+ * heaviest on the way to disk so per-row size stays predictable).
+ */
+export const StatsHistoryEntry = Type.Object(
+  {
+    ts: Type.String({ format: 'date-time' }),
+    container_count: Type.Integer({ minimum: 0 }),
+    totals: Type.Object(
+      {
+        cpu_pct: Type.Number({ minimum: 0 }),
+        mem_used_bytes: Type.Integer({ minimum: 0 }),
+        mem_limit_bytes: Type.Integer({ minimum: 0 }),
+        net_rx_bytes_per_s: Type.Number({ minimum: 0 }),
+        net_tx_bytes_per_s: Type.Number({ minimum: 0 }),
+        blk_read_bytes_per_s: Type.Number({ minimum: 0 }),
+        blk_write_bytes_per_s: Type.Number({ minimum: 0 }),
+      },
+      { additionalProperties: false },
+    ),
+    top: Type.Array(Type.Ref(ContainerStatsSummary)),
+  },
+  { $id: 'StatsHistoryEntry', additionalProperties: false },
+);
+
+export const StatsHistoryQueryResponse = Type.Object(
+  {
+    total: Type.Integer({ minimum: 0 }),
+    returned: Type.Integer({ minimum: 0 }),
+    has_more: Type.Boolean(),
+    scanned: Opt(Type.Integer({ minimum: 0 })),
+    truncated: Opt(Type.Boolean()),
+    entries: Type.Array(Type.Ref(StatsHistoryEntry)),
+  },
+  { $id: 'StatsHistoryQueryResponse', additionalProperties: false },
+);
+
 export const PingResponse = Type.Object(
   {
     ok: Type.Boolean(),
