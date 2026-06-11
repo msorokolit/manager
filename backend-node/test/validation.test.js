@@ -460,6 +460,85 @@ describe('CreateContainerRequest mem fields (M4)', () => {
   });
 });
 
+// ---------- Bulk action plumbing (shared shapes + per-resource) ----------
+describe('Bulk action schemas', () => {
+  it('BulkIdsRequest enforces minItems 1 and maxItems 500', () => {
+    const v = (p) => valid(S.BulkIdsRequest, p);
+    expect(v({ ids: ['one'] })).toBe(true);
+    expect(v({ ids: [] })).toBe(false);
+    expect(v({ ids: Array(501).fill('x') })).toBe(false);
+    expect(v({})).toBe(false);
+    expect(v({ ids: ['a'], sneaky: 1 })).toBe(false);
+  });
+
+  it('BulkNamesRequest mirrors BulkIdsRequest with a different field', () => {
+    const v = (p) => valid(S.BulkNamesRequest, p);
+    expect(v({ names: ['one'] })).toBe(true);
+    expect(v({ names: [] })).toBe(false);
+  });
+
+  it('BulkResult accepts either id or name', () => {
+    const v = (p) => valid(S.BulkResult, p);
+    expect(v({ id: 'cid', ok: true })).toBe(true);
+    expect(v({ name: 'my-stack', ok: false, error: 'oops' })).toBe(true);
+    // additionalProperties:false rejects extras
+    expect(v({ id: 'cid', ok: true, surprise: 1 })).toBe(false);
+  });
+
+  it('BulkResponse summary shape', () => {
+    const v = (p) => valid(S.BulkResponse, p);
+    expect(v({ succeeded: 2, failed: 0, results: [{ id: 'a', ok: true }, { id: 'b', ok: true }] })).toBe(true);
+    expect(v({ succeeded: 0, failed: 1, results: [{ id: 'a', ok: false, error: 'x' }] })).toBe(true);
+    expect(v({ succeeded: 1, failed: 0 })).toBe(false); // missing results
+  });
+
+  // ---- Containers ----
+  it('ContainerBulkStopRequest: ids required + optional bounded timeout', () => {
+    const v = (p) => valid(S.ContainerBulkStopRequest, p);
+    expect(v({ ids: ['c1'] })).toBe(true);
+    expect(v({ ids: ['c1'], timeout: 10 })).toBe(true);
+    expect(v({ ids: ['c1'], timeout: 0 })).toBe(true);
+    expect(v({ ids: ['c1'], timeout: 600 })).toBe(true);
+    expect(v({ ids: ['c1'], timeout: 601 })).toBe(false);
+    expect(v({ ids: ['c1'], timeout: -1 })).toBe(false);
+    expect(v({ ids: ['c1'], timeout: 'soon' })).toBe(false);
+  });
+
+  it('ContainerBulkRemoveRequest: force + volumes optional booleans', () => {
+    const v = (p) => valid(S.ContainerBulkRemoveRequest, p);
+    expect(v({ ids: ['c1'] })).toBe(true);
+    expect(v({ ids: ['c1'], force: true, volumes: false })).toBe(true);
+    expect(v({ ids: ['c1'], force: 'yes' })).toBe(false);
+    expect(v({ ids: ['c1'], surprise: 1 })).toBe(false);
+  });
+
+  // ---- Images ----
+  it('ImageBulkRemoveRequest: long refs accepted up to 512 chars; force + noprune optional', () => {
+    const v = (p) => valid(S.ImageBulkRemoveRequest, p);
+    expect(v({ ids: ['nginx:1.27'] })).toBe(true);
+    expect(v({ ids: ['nginx:1.27'], force: true, noprune: true })).toBe(true);
+    // 512-char ref accepted (sha256:<64 hex> + tag etc.)
+    expect(v({ ids: ['a'.repeat(512)] })).toBe(true);
+    expect(v({ ids: ['a'.repeat(513)] })).toBe(false);
+  });
+
+  // ---- Stacks ----
+  it('StackBulkRequest: names + optional volumes; name length cap 63 (compose project naming)', () => {
+    const v = (p) => valid(S.StackBulkRequest, p);
+    expect(v({ names: ['my-app'] })).toBe(true);
+    expect(v({ names: ['my-app'], volumes: true })).toBe(true);
+    expect(v({ names: ['a'.repeat(63)] })).toBe(true);
+    expect(v({ names: ['a'.repeat(64)] })).toBe(false);
+    expect(v({ names: [] })).toBe(false);
+  });
+
+  // ---- Registries ----
+  it('RegistryBulkDeleteRequest = BulkNamesRequest', () => {
+    expect(valid(S.RegistryBulkDeleteRequest, { names: ['ghcr-prod'] })).toBe(true);
+    expect(valid(S.RegistryBulkDeleteRequest, { names: [] })).toBe(false);
+  });
+});
+
 // ---------- Networks (Portainer-parity) ----------
 
 describe('Network schemas', () => {
