@@ -162,6 +162,58 @@ All configuration is via environment variables.
 | `HELMET_DISABLED`    | `false`          | Disable [Helmet](https://helmetjs.github.io/) entirely. NOT recommended. |
 | `CSP_DISABLED`       | `false`          | Keep all other Helmet headers but drop the Content-Security-Policy header (useful if you proxy through a CDN that injects its own CSP). |
 | `CSP_EXTRA_SCRIPT_SRC` / `CSP_EXTRA_STYLE_SRC` / `CSP_EXTRA_CONNECT_SRC` | _(empty)_ | Comma-separated additional sources to allow if you fork the SPA to load assets from another CDN. |
+| `LOG_LEVEL`          | `info`           | Pino level: `trace` / `debug` / `info` / `warn` / `error` / `fatal` / `silent`. In tests defaults to `silent`. |
+| `LOG_PRETTY`         | `false`          | Pipe app + access logs through `pino-pretty` (human-readable colourised lines). Off by default — production wants raw JSON for log shippers. |
+| `AUDIT_ENABLED`      | `true`           | Persist a JSONL audit log of every mutating API request. Set `false` to disable entirely (then `/api/audit` returns 503). |
+| `AUDIT_FILE`         | `${DATA_DIR}/audit.log` | Path to the audit log. Mode is enforced to `0600` on each write. |
+| `AUDIT_MAX_BYTES`    | `10485760`       | Size cap on the live audit file. When exceeded, `audit.log` rotates to `audit.log.1`, `.1` → `.2`, etc. Set `0` to disable in-process rotation (when an external log shipper / `logrotate` handles it). |
+| `AUDIT_ROTATE_KEEP`  | `5`              | Number of rotated audit files to keep. The oldest is dropped when a new rotation happens. |
+
+## Logging & audit (enterprise)
+
+Two structured streams, both backed by [pino](https://getpino.io/):
+
+**1. Application + HTTP access log** — written to stdout as JSON-per-line. Every record carries a `request_id` (UUID v4, or the `X-Request-Id` header from an upstream proxy if it looks safe), plus the authenticated `user` / `role` and `source_ip` once auth has run. The same correlation ID is echoed back on the response as `X-Request-Id`, so an operator can trace `"what did user `alice` do at 14:23:11"` end-to-end across the proxy log, the app log, and the audit log with a single grep.
+
+```json
+{"level":30,"time":"2026-06-11T14:23:11.456Z","service":"docker-manager",
+ "request_id":"7c2d9f4a-…","user":"alice","role":"admin","source_ip":"10.0.0.5",
+ "kind":"http","msg":"7c2d9f4a-… 10.0.0.5 alice(admin) POST /api/containers/abc/start 200 -b 47.812 ms"}
+```
+
+[Morgan](https://github.com/expressjs/morgan) emits the HTTP access line; its stream is piped through pino so structured app logs and access logs share one transport. `/api/health` and `/api/system/events/stream` are skipped from the access log on purpose (probe hammering / long-lived SSE-style streams).
+
+**2. Audit log** — append-only JSONL file (`AUDIT_FILE`, default `${DATA_DIR}/audit.log`, mode `0600`). One row per mutating API request, including 401/403 rejections so attempted misuse is captured too. Each row:
+
+```json
+{"ts":"2026-06-11T14:23:11.501Z","request_id":"7c2d9f4a-…",
+ "actor":{"username":"alice","role":"admin"},"source_ip":"10.0.0.5",
+ "method":"POST","path":"/api/containers/abc/start","action":"container.start",
+ "resource_type":"container","resource_id":"abc",
+ "outcome":"ok","status":200,"duration_ms":47.81}
+```
+
+The `action` is derived from the route's tag + path segments (`/api/containers/:id/start` → `container.start`; `/api/networks/:id/connect` → `network.connect`; `/api/volumes/delete/bulk` → `volume.delete.bulk`). Routes can override by setting `audit: { action: '…', resourceType: '…', resourceIdFrom: 'params.foo' | 'body.bar' }` in their spec.
+
+The audit log is admin-queryable via `GET /api/audit`:
+
+```bash
+# Last 50 actions by alice
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://manager/api/audit?actor=alice&limit=50"
+
+# All failed container removals in a time window
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://manager/api/audit?action=container.remove*&outcome=error&since=2026-06-11T00:00:00Z"
+
+# Reconstruct everything that happened during one request
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://manager/api/audit?request_id=7c2d9f4a-…"
+```
+
+Filters: `since`, `until`, `actor`, `action` (glob: `container.*`, `*.bulk`, etc.), `resource_type`, `resource_id`, `outcome`, `request_id`, `limit` (max 1000), `offset`, `order` (`asc` / `desc`). The endpoint reads `AUDIT_FILE` plus all rotated siblings (`audit.log.1`, `audit.log.2`, …) so historical entries stay queryable after rotation.
+
+For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a path your log shipper watches (`vector` / `fluentbit` / `filebeat`) and disable in-process rotation with `AUDIT_MAX_BYTES=0`. The JSONL format is the lowest-common-denominator input for every aggregator we tested.
 
 ## Request validation & OpenAPI
 
