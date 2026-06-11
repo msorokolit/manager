@@ -462,9 +462,13 @@ import { FitAddon } from '@xterm/addon-fit';
     const perCpu = [];
     const pc = cs.cpu_usage?.percpu_usage, ppc = ps.cpu_usage?.percpu_usage;
     if (Array.isArray(pc) && Array.isArray(ppc) && sd > 0) {
+      // Multiplier is online_cpus (= `cores` above), NOT pc.length.
+      // percpu_usage can include offline cores on hot-pluggable
+      // VMs; using its length would over-report per-CPU bars and
+      // leave them inconsistent with the aggregate cpu% number.
       for (let i = 0; i < pc.length; i++) {
         const d = (pc[i] || 0) - (ppc[i] || 0);
-        perCpu.push(d > 0 ? (d / sd) * pc.length * 100 : 0);
+        perCpu.push(d > 0 ? (d / sd) * cores * 100 : 0);
       }
     }
     const memTotal = ms.usage || 0;
@@ -500,8 +504,15 @@ import { FitAddon } from '@xterm/addon-fit';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     if (!data || !data.length) return;
-    // Auto-scale yMax if data exceeds it (useful for net/blkio rates).
-    const M = Math.max(yMax, ...data.map((v) => v || 0)) || 1;
+    // yMax semantics:
+    //   number  — anchor at that value, auto-scale up if data exceeds it
+    //   'auto'  — pure auto-scale to the max sample (or 1 to avoid /0)
+    // The 'auto' sentinel reads better at call sites than `0`, which
+    // looked like an accidental magic number ("draw on a 0-height
+    // axis?").
+    const M = yMax === 'auto'
+      ? Math.max(1, ...data.map((v) => v || 0))
+      : Math.max(yMax, ...data.map((v) => v || 0)) || 1;
     ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
     data.forEach((v, i) => {
       const x = (i / Math.max(1, data.length - 1)) * w;
@@ -1136,9 +1147,21 @@ import { FitAddon } from '@xterm/addon-fit';
           // open the dialog empty so the operator can still create.
           let insp = null;
           try { insp = await api(`/api/containers/${encodeURIComponent(id)}`); } catch {}
+          // Suggest a unique name by probing the loaded container
+          // list. Falls back to a numeric suffix when -copy is
+          // already taken (-copy-2, -copy-3, …). Bounded loop so
+          // a malicious 100k existing copies can't hang the dialog.
+          const taken = new Set(containers.map((c) => c.name));
+          let candidate = `${t.dataset.name}-copy`;
+          if (taken.has(candidate)) {
+            for (let i = 2; i < 100; i++) {
+              const next = `${t.dataset.name}-copy-${i}`;
+              if (!taken.has(next)) { candidate = next; break; }
+            }
+          }
           const prefill = insp
-            ? { ...runOptionsFromInspect(insp), name: `${t.dataset.name}-copy` }
-            : { name: `${t.dataset.name}-copy` };
+            ? { ...runOptionsFromInspect(insp), name: candidate }
+            : { name: candidate };
           await runContainerDialog({ mode: 'duplicate', prefill });
           await load();
           return;
@@ -1601,18 +1624,38 @@ import { FitAddon } from '@xterm/addon-fit';
       };
       if (dupBtn) dupBtn.onclick = async () => {
         modalRef.close && modalRef.close(null);
+        // Probe existing names so we suggest a unique candidate
+        // rather than handing the operator a 409 on submit.
+        let candidate = `${titleName}-copy`;
+        try {
+          const list = await api('/api/containers?all=true');
+          const taken = new Set(list.map((c) => c.name));
+          if (taken.has(candidate)) {
+            for (let i = 2; i < 100; i++) {
+              const next = `${titleName}-copy-${i}`;
+              if (!taken.has(next)) { candidate = next; break; }
+            }
+          }
+        } catch { /* best-effort — fall back to plain -copy */ }
         await runContainerDialog({
           mode: 'duplicate',
-          prefill: { ...runOptionsFromInspect(data), name: `${titleName}-copy` },
+          prefill: { ...runOptionsFromInspect(data), name: candidate },
         });
       };
       if (recBtn && !composeProject) recBtn.onclick = async () => {
         // Two-stage confirm — the destructive consequences (id
-        // change, lost logs) deserve a deliberate click before we
-        // open the recreate dialog.
+        // change, lost logs, IP/port reassignment) deserve a
+        // deliberate click before we open the recreate dialog.
         const ok = await confirmModal(
-          `<strong class="text-amber-300">Recreate ${escapeHtml(titleName)}?</strong><br>` +
-          `The original container will be STOPPED, REMOVED, and replaced. Container id changes. Logs from the old container are lost. Named volumes are preserved.`,
+          `<strong class="text-amber-300">Recreate ${escapeHtml(titleName)}?</strong><br><br>` +
+          `<ul class="list-disc list-inside text-xs space-y-1">` +
+          `<li>The original container will be STOPPED, REMOVED, and replaced.</li>` +
+          `<li>Container <strong>ID changes</strong> — anything pinned to the ID elsewhere breaks.</li>` +
+          `<li><strong>Logs are lost</strong> (Docker drops them with the container).</li>` +
+          `<li>Auto-assigned <strong>IP addresses change</strong>; dynamically-published ports get new host ports.</li>` +
+          `<li>Named volumes are <strong>preserved</strong>; anonymous volumes are <strong>not</strong>.</li>` +
+          `<li>Additional (non-default) network attachments are <strong>re-connected best-effort</strong> after create. Failures are surfaced as a warning in the result.</li>` +
+          `</ul>`,
           { danger: true, confirmLabel: 'Continue to editor' },
         );
         if (!ok) return;
@@ -1706,8 +1749,8 @@ import { FitAddon } from '@xterm/addon-fit';
               ].join('');
               drawSparkInto(pane.querySelector('#cpu-spark'), hist.cpu, 100,    '#0ea5e9');
               drawSparkInto(pane.querySelector('#mem-spark'), hist.mem, 100,    '#10b981');
-              drawSparkInto(pane.querySelector('#net-spark'), hist.netRate, 0,  '#f59e0b');
-              drawSparkInto(pane.querySelector('#blk-spark'), hist.blkRate, 0,  '#f43f5e');
+              drawSparkInto(pane.querySelector('#net-spark'), hist.netRate, 'auto', '#f59e0b');
+              drawSparkInto(pane.querySelector('#blk-spark'), hist.blkRate, 'auto', '#f43f5e');
               // Per-CPU bars (cgroupsv1 only). Hide the panel
               // entirely on cgroupsv2 hosts where perCpu is empty.
               if (m.perCpu && m.perCpu.length) {
@@ -1932,12 +1975,30 @@ import { FitAddon } from '@xterm/addon-fit';
     const host = insp.HostConfig || {};
     const net = insp.NetworkSettings || {};
 
+    // Cmd / Entrypoint are EXEC-FORM arrays in inspect (the
+    // daemon doesn't preserve the original "shell-form" string).
+    // Naive join(' ') corrupts any container whose args contain
+    // whitespace — `["sh", "-c", "echo hello world"]` →
+    // `"sh -c echo hello world"`, which re-parses to 5 tokens
+    // instead of 3. We pass arrays through verbatim when they
+    // contain whitespace-having tokens, and only stringify-join
+    // for the boring all-safe case (which is what most users
+    // typed in the dialog originally).
+    const safeJoin = (arr) => {
+      if (!Array.isArray(arr) || !arr.length) return '';
+      const anyWhitespace = arr.some((a) => /\s/.test(String(a)));
+      // When ANY token has whitespace, keep the array form so the
+      // round-trip is lossless. The dialog's submit handler accepts
+      // both shapes — string (shell-form, split on whitespace) or
+      // array (exec-form, passed through).
+      return anyWhitespace ? arr.slice() : arr.join(' ');
+    };
     const out = {
       image: cfg.Image,
       // Strip the leading slash docker prefixes container names with.
       name: (insp.Name || '').replace(/^\//, ''),
-      command: Array.isArray(cfg.Cmd) ? cfg.Cmd.join(' ') : (cfg.Cmd || ''),
-      entrypoint: Array.isArray(cfg.Entrypoint) ? cfg.Entrypoint.join(' ') : (cfg.Entrypoint || ''),
+      command: Array.isArray(cfg.Cmd) ? safeJoin(cfg.Cmd) : (cfg.Cmd || ''),
+      entrypoint: Array.isArray(cfg.Entrypoint) ? safeJoin(cfg.Entrypoint) : (cfg.Entrypoint || ''),
       user: cfg.User || '',
       working_dir: cfg.WorkingDir || '',
       hostname: cfg.Hostname || '',
@@ -2596,11 +2657,41 @@ import { FitAddon } from '@xterm/addon-fit';
 
       // Basic scalars
       for (const f of [
-        'image', 'name', 'command', 'entrypoint', 'restart_policy',
+        'image', 'name', 'restart_policy',
         'network', 'network_mode', 'hostname', 'mac_address',
         'user', 'working_dir', 'stop_signal', 'cpuset_cpus',
         'shm_size', 'log_driver',
       ]) if (prefill[f] != null) setText(f, prefill[f]);
+
+      // Cmd / Entrypoint: array prefills can't display as a single
+      // input line losslessly, so we stash the array on the
+      // <input> as a data attribute and show a banner so the
+      // operator knows the form below is read-only-on-submit for
+      // that field. The submit handler reads the dataset back and
+      // sends the original array to the API.
+      for (const f of ['command', 'entrypoint']) {
+        const el = form.querySelector(`[name="${f}"]`);
+        if (!el || prefill[f] == null) continue;
+        if (Array.isArray(prefill[f])) {
+          // Display the JSON form so the operator sees the exact
+          // shape. The submit handler detects the JSON-array
+          // prefix and parses it back out (NOT the whitespace
+          // splitter, which would mangle the args).
+          el.value = JSON.stringify(prefill[f]);
+          el.dataset.execForm = '1';
+          el.title = 'Exec-form (array) — submit will send this as-is';
+          // Insert a small one-line banner above the field so the
+          // operator notices the shape change.
+          if (!el.parentElement.querySelector('.exec-form-banner')) {
+            const banner = document.createElement('div');
+            banner.className = 'exec-form-banner mt-0.5 text-[10px] text-amber-300';
+            banner.textContent = `Exec-form preserved (${prefill[f].length} args contain whitespace) — edit as JSON array.`;
+            el.parentElement.appendChild(banner);
+          }
+        } else {
+          el.value = prefill[f];
+        }
+      }
 
       // Numerics
       for (const f of ['cpus', 'cpu_shares', 'pids_limit', 'stop_grace_period']) {
@@ -2683,8 +2774,37 @@ import { FitAddon } from '@xterm/addon-fit';
 
           const payload = { image: text('image'), pull: bool('pull') };
           if (!payload.image) return showErr('Image is required');
-          for (const f of ['name','command','entrypoint','restart_policy','network','network_mode','hostname','mac_address','user','working_dir','stop_signal','cpuset_cpus','mem_limit','mem_reservation','memswap_limit','shm_size','log_driver']) {
+          for (const f of ['name','restart_policy','network','network_mode','hostname','mac_address','user','working_dir','stop_signal','cpuset_cpus','mem_limit','mem_reservation','memswap_limit','shm_size','log_driver']) {
             const v = text(f); if (v) payload[f] = v;
+          }
+          // command / entrypoint: respect exec-form if the field
+          // was prefilled from a multi-word-arg container. The
+          // string-shaped path keeps the original split-on-
+          // whitespace behaviour (preserves dialog backward
+          // compatibility for hand-typed input).
+          for (const f of ['command', 'entrypoint']) {
+            const el = get(f); if (!el) continue;
+            const v = (el.value || '').trim();
+            if (!v) continue;
+            if (el.dataset.execForm === '1') {
+              try {
+                const parsed = JSON.parse(v);
+                if (Array.isArray(parsed)) { payload[f] = parsed; continue; }
+              } catch { /* fall through to shell-form */ }
+            }
+            // Auto-detect: a JSON-array literal in the input is
+            // also accepted as exec-form even without the
+            // dataset hint (for users who manually type
+            // ["sh","-c","..."]).
+            if (/^\s*\[/.test(v)) {
+              try {
+                const parsed = JSON.parse(v);
+                if (Array.isArray(parsed) && parsed.every((x) => typeof x === 'string')) {
+                  payload[f] = parsed; continue;
+                }
+              } catch {}
+            }
+            payload[f] = v;
           }
           for (const f of ['init','tty','stdin_open','auto_remove','read_only','privileged']) {
             if (get(f) && get(f).checked) payload[f] = true;
@@ -2831,15 +2951,43 @@ import { FitAddon } from '@xterm/addon-fit';
                 logPane.textContent = buf;
                 logPane.scrollTop = logPane.scrollHeight;
               }
-              // The endpoint marks success with a final "OK new_id=..."
-              // line; anything else means a step failed (with the
-              // line above telling us exactly which one).
-              if (/\[recreate\] OK new_id=/.test(buf)) {
-                toast('Container recreated', 'success');
+              // Parse the final structured JSON line — the recreate
+              // endpoint appends one of these as the terminal
+              // record so we don't have to grep human-readable text
+              // to know what happened.
+              //
+              // Shape:
+              //   { status: 'ok',    new_id: '...', network_errors: [] }
+              //   { status: 'error', step: 'create' | 'stop' | 'remove' | 'start',
+              //                      detail: '<daemon message>',
+              //                      original_gone?: true, new_id?: '...' }
+              let result = null;
+              for (const line of buf.split('\n').reverse()) {
+                const t = line.trim();
+                if (!t || t[0] !== '{') continue;
+                try { result = JSON.parse(t); break; } catch { /* not JSON */ }
+              }
+              if (result && result.status === 'ok') {
+                if (result.network_errors && result.network_errors.length) {
+                  toast(
+                    `Container recreated, but ${result.network_errors.length} network(s) failed to reconnect — see log`,
+                    'warn',
+                  );
+                } else {
+                  toast('Container recreated', 'success');
+                }
               } else {
                 // Don't close the modal on failure — keep the form
-                // populated so the operator can fix + retry.
-                showErr('Recreate failed — see the log below. The dialog stays open so you can adjust and retry.');
+                // populated so the operator can fix + retry. Surface
+                // the structured step + detail so the error
+                // banner says "create: image not found" instead of
+                // the previous generic "Recreate failed".
+                const step = (result && result.step) || 'unknown';
+                const detail = (result && result.detail) || 'see log below';
+                const dangerNote = (result && result.original_gone)
+                  ? ' Original container is gone — re-submit to retry create.'
+                  : '';
+                showErr(`Recreate failed at ${step}: ${detail}.${dangerNote}`);
                 return false;
               }
             } else {
@@ -7145,16 +7293,12 @@ import { FitAddon } from '@xterm/addon-fit';
    */
   views.history = async (root) => {
     // Allow cross-links from elsewhere (container rows, stack
-    // inspect) to land on a pre-filtered tab.
-    const params = (() => {
-      const q = (location.hash.split('?')[1] || '');
-      const out = {};
-      for (const part of q.split('&')) {
-        const [k, v] = part.split('=');
-        if (k) out[decodeURIComponent(k)] = v == null ? '' : decodeURIComponent(v);
-      }
-      return out;
-    })();
+    // inspect) to land on a pre-filtered tab. URLSearchParams
+    // handles `+`-vs-space, repeated keys, and percent-encoded `=`
+    // correctly — no reason to roll our own splitter.
+    const params = Object.fromEntries(
+      new URLSearchParams(location.hash.split('?')[1] || ''),
+    );
     const initialTab = params.tab === 'resources' ? 'resources' : 'events';
 
     root.innerHTML = pageHeader('History',
@@ -7414,8 +7558,18 @@ import { FitAddon } from '@xterm/addon-fit';
       try {
         const resp = await api(`/api/system/stats/history?${qs.toString()}`);
         renderCharts(resp.entries || []);
-        pane.querySelector('#rs-meta').textContent =
-          `${resp.total} sample${resp.total === 1 ? '' : 's'} · since ${fmtDate(since)}`;
+        // Honor the server's has_more / truncated signals — the
+        // requested 7-day window can contain more samples than
+        // the API's per-call cap (10000), and the chart silently
+        // truncating was misleading. Surface the partial-view
+        // state in the meta line + warn the operator.
+        let meta = `${resp.entries.length} of ${resp.total} sample${resp.total === 1 ? '' : 's'} · since ${fmtDate(since)}`;
+        if (resp.has_more) {
+          meta += ' · ⚠ truncated — narrow the range';
+        } else if (resp.truncated) {
+          meta += ' · ⚠ scan limit hit';
+        }
+        pane.querySelector('#rs-meta').textContent = meta;
       } catch (e) {
         if (e.status === 503) {
           const empty = pane.querySelector('#rs-empty');
@@ -7439,10 +7593,10 @@ import { FitAddon } from '@xterm/addon-fit';
       const mem = entries.map((e) => e.totals.mem_used_bytes);
       const net = entries.map((e) => (e.totals.net_rx_bytes_per_s || 0) + (e.totals.net_tx_bytes_per_s || 0));
       const blk = entries.map((e) => (e.totals.blk_read_bytes_per_s || 0) + (e.totals.blk_write_bytes_per_s || 0));
-      drawSparkInto(pane.querySelector('#rs-cpu'), cpu, 100, '#0ea5e9');
-      drawSparkInto(pane.querySelector('#rs-mem'), mem, 0,   '#10b981');
-      drawSparkInto(pane.querySelector('#rs-net'), net, 0,   '#f59e0b');
-      drawSparkInto(pane.querySelector('#rs-blk'), blk, 0,   '#f43f5e');
+      drawSparkInto(pane.querySelector('#rs-cpu'), cpu, 100,    '#0ea5e9');
+      drawSparkInto(pane.querySelector('#rs-mem'), mem, 'auto', '#10b981');
+      drawSparkInto(pane.querySelector('#rs-net'), net, 'auto', '#f59e0b');
+      drawSparkInto(pane.querySelector('#rs-blk'), blk, 'auto', '#f43f5e');
 
       // Leaderboard: sum cpu_pct per container across all samples
       // in the window so consistently-busy containers float to the
