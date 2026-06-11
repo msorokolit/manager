@@ -154,6 +154,50 @@ export const CreateContainerRequest = Type.Object(
   { $id: 'CreateContainerRequest', additionalProperties: false },
 );
 
+/**
+ * Live-update request body for POST /api/containers/:id/update.
+ *
+ * The Docker daemon's `update` endpoint is intentionally narrow — it
+ * only changes cgroup-style runtime knobs (CPU shares, memory limits,
+ * restart policy, …). Anything else (image, env, ports, volumes,
+ * devices, network membership) requires a full recreate, exposed
+ * separately via POST /api/containers/:id/recreate.
+ *
+ * The split is the whole point: live-update is zero-downtime and
+ * preserves the container id + logs; recreate is destructive. Calling
+ * them out as different endpoints makes the trade-off visible at the
+ * API surface.
+ */
+export const ContainerLiveUpdateRequest = Type.Object(
+  {
+    cpus: Opt(Type.Number({ minimum: 0, maximum: 4096 })),
+    cpu_shares: Opt(Type.Integer({ minimum: 2, maximum: 262144 })),
+    cpuset_cpus: Opt(Type.String({ maxLength: 256, pattern: '^[0-9,-]*$' })),
+    mem_limit: Opt(MemSize),
+    mem_reservation: Opt(MemSize),
+    memswap_limit: Opt(MemSizeOrUnlimited),
+    pids_limit: Opt(Type.Integer({ minimum: -1, maximum: 1_000_000 })),
+    // Docker accepts: no / on-failure[:N] / always / unless-stopped.
+    // We expose the four canonical names; on-failure max-retries
+    // stays on the create surface (rarely changed live).
+    restart_policy: Opt(StringEnum(['no', 'always', 'unless-stopped', 'on-failure'])),
+    // BlkIO weight: 10-1000. Niche but harmless to expose.
+    blkio_weight: Opt(Type.Integer({ minimum: 10, maximum: 1000 })),
+  },
+  { $id: 'ContainerLiveUpdateRequest', additionalProperties: false },
+);
+
+/** Rename request — Docker's accepted name regex. */
+export const ContainerRenameRequest = Type.Object(
+  {
+    name: Type.String({
+      minLength: 1, maxLength: 255,
+      pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$',
+    }),
+  },
+  { $id: 'ContainerRenameRequest', additionalProperties: false },
+);
+
 export const ContainerSummary = Type.Object(
   {
     id: Type.String(),

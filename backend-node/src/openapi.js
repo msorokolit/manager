@@ -37,6 +37,8 @@ const COMPONENT_SCHEMAS = [
   S.ContainerSummary,
   S.ContainerBulkStopRequest,
   S.ContainerBulkRemoveRequest,
+  S.ContainerLiveUpdateRequest,
+  S.ContainerRenameRequest,
   S.PullRequest,
   S.ImageSummary,
   S.ImageBulkRemoveRequest,
