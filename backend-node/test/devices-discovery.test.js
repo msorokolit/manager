@@ -23,6 +23,45 @@ vi.hoisted(() => {
 import { signToken } from '../src/jwt.js';
 import { withRole, resetSessions } from './helpers/auth-helper.js';
 
+// Mock the filesystem APIs the /dev scanner uses. By default every
+// existsSync() returns false (no devices on the synthetic host); the
+// 'detects all host_device categories' test overrides this with a
+// curated /dev tree.
+let fakeFs = { exists: () => false, dirs: {} };
+vi.mock('node:fs', async () => {
+  const real = await vi.importActual('node:fs');
+  return {
+    ...real,
+    existsSync: (p) => !!fakeFs.exists(p),
+  };
+});
+vi.mock('node:fs/promises', async () => {
+  const real = await vi.importActual('node:fs/promises');
+  const fakeReaddir = async (p, opts) => {
+    const entries = fakeFs.dirs[p];
+    if (!entries) {
+      const err = new Error(`ENOENT: ${p}`); err.code = 'ENOENT';
+      throw err;
+    }
+    if (opts && opts.withFileTypes) {
+      return entries.map((e) => ({
+        name: typeof e === 'string' ? e : e.name,
+        isDirectory: () => typeof e !== 'string' && !!e.dir,
+      }));
+    }
+    return entries.map((e) => typeof e === 'string' ? e : e.name);
+  };
+  // routes/system.js does `import fs from 'node:fs/promises'`, so the
+  // default export is what callers reach for. Override readdir on
+  // BOTH the namespace and the default to cover named + default
+  // import styles.
+  return {
+    ...real,
+    default: { ...real.default, readdir: fakeReaddir },
+    readdir: fakeReaddir,
+  };
+});
+
 // We rewrite the dockerode .info() return value per-test.
 let dockerInfoResponse = null;
 
@@ -99,6 +138,7 @@ beforeEach(() => {
   systemInternals.resetCacheForTests();
   dockerInfoResponse = null;
   nvidiaSmiOutcome = { code: 'ENOENT' };
+  fakeFs = { exists: () => false, dirs: {} };
 });
 
 describe('GET /api/system/devices', () => {
@@ -211,5 +251,144 @@ describe('GET /api/system/devices', () => {
   it('rejects unauthenticated requests', async () => {
     const r = await request(buildApp()).get('/api/system/devices');
     expect(r.status).toBe(401);
+  });
+
+  // ---------- host_devices (categorised /dev scan) ----------
+
+  it('host_devices: every category appears with available:false when /dev is empty', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    expect(r.status).toBe(200);
+    // Sanity: every documented kind appears, sorted by the order in
+    // DEVICE_CATEGORIES. Hidden categories would mean the operator
+    // can't discover features that are POSSIBLE but require host
+    // changes (e.g. enabling TPM pass-through).
+    const kinds = r.body.host_devices.map((g) => g.kind);
+    expect(kinds).toEqual([
+      'gpu_amd', 'audio', 'usb', 'serial', 'video',
+      'tpu', 'tpm', 'watchdog',
+    ]);
+    for (const g of r.body.host_devices) {
+      expect(g.available).toBe(false);
+      expect(g.devices).toEqual([]);
+      expect(g.hint).toBeTruthy(); // every category surfaces its hint
+    }
+  });
+
+  it('host_devices: detects AMD ROCm (gpu_amd), serial (ttyUSB*), V4L (video*), TPM, watchdog', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    fakeFs = {
+      exists: (p) => p === '/dev/kfd' || p === '/dev',
+      dirs: {
+        '/dev': [
+          'kfd', 'ttyUSB0', 'ttyUSB1', 'ttyACM0', 'video0', 'video1',
+          'tpm0', 'tpmrm0', 'watchdog0',
+        ],
+      },
+    };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    const byKind = Object.fromEntries(r.body.host_devices.map((g) => [g.kind, g]));
+
+    expect(byKind.gpu_amd).toMatchObject({ available: true, devices: ['/dev/kfd'] });
+    expect(byKind.serial.available).toBe(true);
+    expect(byKind.serial.devices.sort()).toEqual([
+      '/dev/ttyACM0', '/dev/ttyUSB0', '/dev/ttyUSB1',
+    ]);
+    expect(byKind.video).toMatchObject({
+      available: true,
+      devices: ['/dev/video0', '/dev/video1'],
+    });
+    expect(byKind.tpm.available).toBe(true);
+    expect(byKind.tpm.devices.sort()).toEqual(['/dev/tpm0', '/dev/tpmrm0']);
+    expect(byKind.watchdog).toMatchObject({
+      available: true, devices: ['/dev/watchdog0'],
+    });
+    // Categories with no matching files stay false.
+    expect(byKind.audio.available).toBe(false);
+    expect(byKind.usb.available).toBe(false);
+    expect(byKind.tpu.available).toBe(false);
+  });
+
+  it('host_devices: walks /dev/bus/usb/<bus>/<dev> one level deep (recursive dir pattern)', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    fakeFs = {
+      exists: (p) => p === '/dev/bus/usb',
+      dirs: {
+        '/dev/bus/usb': [{ name: '001', dir: true }, { name: '002', dir: true }],
+        '/dev/bus/usb/001': ['001', '002'],
+        '/dev/bus/usb/002': ['001'],
+      },
+    };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    const usb = r.body.host_devices.find((g) => g.kind === 'usb');
+    expect(usb.available).toBe(true);
+    expect(usb.devices.sort()).toEqual([
+      '/dev/bus/usb/001/001', '/dev/bus/usb/001/002', '/dev/bus/usb/002/001',
+    ]);
+  });
+
+  it('host_devices: detects ML accelerators (Coral apex_*, Hailo hailo*, generic accel*)', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    fakeFs = {
+      exists: (p) => p === '/dev',
+      dirs: {
+        '/dev': ['apex_0', 'hailo0', 'accel0', 'accel1'],
+      },
+    };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    const tpu = r.body.host_devices.find((g) => g.kind === 'tpu');
+    expect(tpu.available).toBe(true);
+    expect(tpu.devices.sort()).toEqual([
+      '/dev/accel0', '/dev/accel1', '/dev/apex_0', '/dev/hailo0',
+    ]);
+  });
+
+  it('host_devices: dir kind (audio) discovers /dev/snd entries', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    fakeFs = {
+      exists: (p) => p === '/dev/snd',
+      dirs: {
+        '/dev/snd': [
+          'controlC0', 'pcmC0D0p', 'pcmC0D0c', 'seq', 'timer',
+          { name: 'by-id', dir: true },
+        ],
+        '/dev/snd/by-id': ['usb-Some-DAC'],
+      },
+    };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    const audio = r.body.host_devices.find((g) => g.kind === 'audio');
+    expect(audio.available).toBe(true);
+    // The recursive dir pattern picks up both top-level entries AND
+    // one level of subdirectory contents (by-id symlinks).
+    expect(audio.devices).toContain('/dev/snd/controlC0');
+    expect(audio.devices).toContain('/dev/snd/pcmC0D0p');
+    expect(audio.devices).toContain('/dev/snd/by-id/usb-Some-DAC');
+  });
+
+  it('host_devices: unreadable directories are skipped silently (no 500)', async () => {
+    dockerInfoResponse = { Runtimes: { runc: {} }, DefaultRuntime: 'runc' };
+    // /dev/bus/usb appears to exist but readdir throws → scanner
+    // should swallow + return [] for that pattern.
+    fakeFs = {
+      exists: (p) => p === '/dev/bus/usb',
+      dirs: { /* no '/dev/bus/usb' key → readdir throws ENOENT */ },
+    };
+    const r = await request(buildApp())
+      .get('/api/system/devices')
+      .set('Authorization', withRole('admin'));
+    expect(r.status).toBe(200);
+    const usb = r.body.host_devices.find((g) => g.kind === 'usb');
+    expect(usb.available).toBe(false);
+    expect(usb.devices).toEqual([]);
   });
 });

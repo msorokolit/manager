@@ -213,6 +213,156 @@ async function probeDri() {
   }
 }
 
+// ---------- Host /dev scanning ----------
+//
+// Docker's --device pass-through works on ANY character or block
+// device the host has — GPUs, audio, USB, serial, TPM, V4L cameras,
+// watchdog, ML accelerators (Coral / Hailo), AMD ROCm, …. The
+// frontend lets the operator type any /dev path, but it's a much
+// better UX to surface what's actually present on the host so they
+// can pick from a list instead of guessing.
+//
+// We scan a curated set of well-known paths per category. The
+// matcher is intentionally NOT a generic glob — it's a tiny dispatch
+// table with three primitives:
+//
+//   single   : the literal path is itself a device file
+//   prefix   : prefix*  → readdir of dirname, match filenames starting
+//              with the basename minus the trailing '*'
+//   dir      : the path is a directory; the entries below it (one
+//              level OR recursive) are the devices
+//
+// No recursion outside the parent directory of the pattern; no shell
+// out. The scanner runs from inside the manager container — if the
+// container can't see a device on the host, we report 'absent' (the
+// operator's fix is to bind-mount it or rerun the manager with
+// --privileged / a specific --device, depending on policy).
+
+const DEVICE_CATEGORIES = [
+  {
+    kind: 'gpu_amd', label: 'AMD GPU / ROCm',
+    paths: [{ type: 'single', value: '/dev/kfd' }],
+    hint: 'Mount /dev/kfd + the matching /dev/dri/renderD* for AMD ROCm workloads.',
+  },
+  {
+    kind: 'audio', label: 'Audio',
+    paths: [{ type: 'dir', value: '/dev/snd', recursive: true }],
+    hint: 'Whole /dev/snd is the simplest pass-through for ALSA / PulseAudio inside a container.',
+  },
+  {
+    kind: 'usb', label: 'USB',
+    paths: [{ type: 'dir', value: '/dev/bus/usb', recursive: true }],
+    hint: 'Pass /dev/bus/usb for broad USB access; pick a single bus/device path to scope tighter.',
+  },
+  {
+    kind: 'serial', label: 'Serial / TTY',
+    paths: [
+      { type: 'prefix', value: '/dev/ttyUSB*' },
+      { type: 'prefix', value: '/dev/ttyACM*' },
+      { type: 'prefix', value: '/dev/ttyS*' },
+    ],
+    hint: 'Use perms `rw` for read/write or `r` for log-only. ttyUSB / ttyACM are USB serial adapters; ttyS* are physical ports.',
+  },
+  {
+    kind: 'video', label: 'V4L2 cameras',
+    paths: [{ type: 'prefix', value: '/dev/video*' }],
+    hint: 'Each /dev/video* is one V4L2 endpoint; webcams typically expose 1–2 nodes per device.',
+  },
+  {
+    kind: 'tpu', label: 'ML accelerators',
+    paths: [
+      { type: 'prefix', value: '/dev/apex_*' },  // Google Coral PCIe / M.2
+      { type: 'prefix', value: '/dev/hailo*' },  // Hailo
+      { type: 'prefix', value: '/dev/accel*' },  // generic Linux accelerator class
+    ],
+    hint: 'Edge ML accelerators (Coral apex_*, Hailo hailo*, generic accel*).',
+  },
+  {
+    kind: 'tpm', label: 'TPM',
+    paths: [
+      { type: 'prefix', value: '/dev/tpm*' },
+      { type: 'prefix', value: '/dev/tpmrm*' },
+    ],
+    hint: 'TPM device for attestation / sealed secrets workloads.',
+  },
+  {
+    kind: 'watchdog', label: 'Watchdog',
+    paths: [{ type: 'prefix', value: '/dev/watchdog*' }],
+    hint: 'Hardware watchdog timer — typically passed to a system-management container.',
+  },
+];
+
+/**
+ * Tiny safe path-matcher. Returns an array of {path, kind?} from
+ * scanning one pattern. Never throws — missing paths return [].
+ *
+ * For dir patterns with `recursive:true` we walk one extra level
+ * (the only realistic case is /dev/bus/usb/<bus>/<device> and
+ * /dev/snd/by-{id,path,…} symlinks). That's bounded — no unlimited
+ * recursion, no symlink-following past the immediate read.
+ */
+async function scanPattern(pat) {
+  const out = [];
+  try {
+    if (pat.type === 'single') {
+      if (existsSync(pat.value)) out.push(pat.value);
+    } else if (pat.type === 'prefix') {
+      // "/dev/ttyUSB*" → dir=/dev, prefix=ttyUSB
+      const lastSlash = pat.value.lastIndexOf('/');
+      const dir = pat.value.slice(0, lastSlash);
+      const prefix = pat.value.slice(lastSlash + 1).replace(/\*$/, '');
+      if (!existsSync(dir)) return out;
+      const names = await fs.readdir(dir);
+      for (const n of names) {
+        if (n.startsWith(prefix)) out.push(`${dir}/${n}`);
+      }
+    } else if (pat.type === 'dir') {
+      if (!existsSync(pat.value)) return out;
+      const names = await fs.readdir(pat.value, { withFileTypes: true });
+      for (const e of names) {
+        const child = `${pat.value}/${e.name}`;
+        if (e.isDirectory() && pat.recursive) {
+          // One extra level — enough for /dev/bus/usb/<bus>/<dev>.
+          try {
+            const inner = await fs.readdir(child);
+            for (const n of inner) out.push(`${child}/${n}`);
+          } catch { /* unreadable subdir; skip */ }
+        } else {
+          out.push(child);
+        }
+      }
+    }
+  } catch (err) {
+    // Permission denied / transient I/O error — best-effort, skip.
+  }
+  return out;
+}
+
+/**
+ * Walk every device category. Returns
+ *   [{kind, label, hint, available, devices: ["/dev/...", ...]}, ...]
+ * with absent categories carrying available:false (so the SPA can
+ * render greyed-out rows + a 'how to enable' hint, instead of just
+ * hiding everything the operator might be looking for).
+ */
+async function probeHostDevices() {
+  const groups = [];
+  for (const cat of DEVICE_CATEGORIES) {
+    const found = new Set();
+    for (const p of cat.paths) {
+      for (const path of await scanPattern(p)) found.add(path);
+    }
+    groups.push({
+      kind: cat.kind,
+      label: cat.label,
+      hint: cat.hint,
+      available: found.size > 0,
+      devices: [...found].sort(),
+    });
+  }
+  return groups;
+}
+
 async function discoverDevices() {
   const docker = getClient();
   // Runtimes come from `docker info`. We pull the whole info blob
@@ -232,7 +382,11 @@ async function discoverDevices() {
   })).sort((a, b) => a.name.localeCompare(b.name));
   const defaultRuntime = (info && info.DefaultRuntime) || 'runc';
 
-  const [nvidia, dri] = await Promise.all([probeNvidia(), probeDri()]);
+  const [nvidia, dri, hostDevices] = await Promise.all([
+    probeNvidia(),
+    probeDri(),
+    probeHostDevices(),
+  ]);
 
   return {
     runtimes,
@@ -245,6 +399,11 @@ async function discoverDevices() {
       || null,
     nvidia,
     dri,
+    // Categorised /dev scan — AMD ROCm, audio, USB, serial, V4L,
+    // ML accelerators, TPM, watchdog. The Run dialog uses this to
+    // populate a "Suggested devices" picker; the System tab renders
+    // it as one panel per category.
+    host_devices: hostDevices,
     // Per-call timestamp lets callers see staleness if the cache TTL
     // changes; cheap and helpful for support.
     discovered_at: new Date().toISOString(),

@@ -31,6 +31,7 @@ const COMPONENT_SCHEMAS = [
   S.TicketResponse,
   S.RuntimeInfo,
   S.NvidiaGpu,
+  S.HostDeviceGroup,
   S.DeviceDiscoveryResponse,
   S.CreateContainerRequest,
   S.ContainerSummary,

@@ -66,6 +66,28 @@ export const NvidiaGpu = Type.Object(
   { $id: 'NvidiaGpu', additionalProperties: false },
 );
 
+/**
+ * One row in the "host devices" categorised scan. Each kind covers a
+ * common pass-through use case; `devices` is the list of `/dev/...`
+ * paths found, `hint` explains in one line how the operator typically
+ * uses the category. When the category exists on the host but the
+ * manager container can't see it, `available` is false and `devices`
+ * is empty — surfaced rather than hidden so the operator knows there
+ * IS such a thing as "TPM pass-through" they could enable.
+ */
+export const HostDeviceGroup = Type.Object(
+  {
+    kind: StringEnum([
+      'gpu_amd', 'audio', 'usb', 'serial', 'video', 'tpu', 'tpm', 'watchdog',
+    ]),
+    label: Type.String(),
+    hint: Opt(Type.String()),
+    available: Type.Boolean(),
+    devices: Type.Array(Type.String()),
+  },
+  { $id: 'HostDeviceGroup', additionalProperties: false },
+);
+
 export const DeviceDiscoveryResponse = Type.Object(
   {
     runtimes: Type.Array(RuntimeInfo),
@@ -93,6 +115,10 @@ export const DeviceDiscoveryResponse = Type.Object(
       },
       { additionalProperties: false },
     ),
+    /** Curated /dev scan, grouped by category. See HostDeviceGroup. */
+    host_devices: Type.Array(HostDeviceGroup, {
+      description: 'Categorised scan of common pass-through devices (AMD ROCm, audio, USB, serial, V4L, ML accelerators, TPM, watchdog).',
+    }),
     discovered_at: Type.String({ description: 'ISO timestamp; results are cached for 30s.' }),
   },
   { $id: 'DeviceDiscoveryResponse', additionalProperties: false },
