@@ -5,10 +5,11 @@ import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { Type } from '@sinclair/typebox';
 import { getClient } from '../docker-client.js';
-import { asyncHandler, intQuery, pipeNdjson } from '../util.js';
+import { asyncHandler, intQuery, pipeNdjson, runBoundedParallel } from '../util.js';
 import { createApiRouter, streamResponse } from '../route-builder.js';
-import { PassThroughObject, PingResponse, DeviceDiscoveryResponse } from '../schemas/index.js';
+import { PassThroughObject, PingResponse, DeviceDiscoveryResponse, SystemStatsSummaryResponse } from '../schemas/index.js';
 import { logger } from '../logger.js';
+import { computeRate } from '../stats.js';
 
 const r = createApiRouter('/api/system', { tag: 'system' });
 
@@ -429,10 +430,173 @@ r.get(
   }),
 );
 
+// ============================================================
+// Live system resource summary — aggregated stats across containers
+// ============================================================
+//
+// `docker stats` opens an N-second-long streaming connection per
+// container. For a "top consumers" dashboard polling every few
+// seconds, we want a SINGLE round-trip with bounded latency.
+//
+// Strategy:
+//   1. listContainers(running)
+//   2. For each, fan out (bounded concurrency 8) two stats samples
+//      ~1s apart with `stream:false` — Docker doesn't compute the
+//      delta for one-shot calls, so we collect two and compute it
+//      ourselves via computeRate().
+//   3. Sort, slice, return.
+//
+// We CACHE the result for SYSTEM_STATS_CACHE_TTL_MS (3s by default)
+// because polling at 1-2s would otherwise saturate the daemon when
+// there are many containers. Cached responses include a `cached:
+// true` flag so the SPA can show staleness honestly if it ever
+// matters.
+//
+// Per-container failures are isolated: we log + drop the failing
+// container from the result rather than failing the whole endpoint.
+const SYSTEM_STATS_CACHE_TTL_MS = 3000;
+const SYSTEM_STATS_SAMPLE_GAP_MS = 1000;
+const SYSTEM_STATS_CONCURRENCY = 8;
+
+let statsCache = null;
+let statsCacheAt = 0;
+
+async function _sampleContainer(client, summary) {
+  // dockerode's `stats({ stream: false })` returns a single sample
+  // without precpu, so we hit the API twice and compute the rate
+  // server-side. The two-sample gap also gives us a real network
+  // throughput number rather than lifetime bytes.
+  const c = client.getContainer(summary.Id);
+  const t0 = Date.now();
+  const a = await c.stats({ stream: false });
+  await new Promise((r) => setTimeout(r, SYSTEM_STATS_SAMPLE_GAP_MS));
+  const b = await c.stats({ stream: false });
+  const dt = (Date.now() - t0) / 1000;
+  const m = computeRate(a, b, dt);
+  return {
+    id: summary.Id,
+    name: (summary.Names && summary.Names[0]) ? summary.Names[0].replace(/^\//, '') : summary.Id.slice(0, 12),
+    image: summary.Image,
+    cpu_pct: m.cpu_pct,
+    mem_used_bytes: m.mem_used_bytes,
+    mem_limit_bytes: m.mem_limit_bytes,
+    mem_pct: m.mem_pct,
+    net_rx_bytes_per_s: m.net_rx_bytes_per_s,
+    net_tx_bytes_per_s: m.net_tx_bytes_per_s,
+    blk_read_bytes_per_s: m.blk_read_bytes_per_s,
+    blk_write_bytes_per_s: m.blk_write_bytes_per_s,
+    pids: m.pids,
+  };
+}
+
+async function buildStatsSummary(client) {
+  const containers = await client.listContainers({ all: false });
+  if (!containers.length) {
+    return {
+      sampled_at: new Date().toISOString(),
+      cached: false,
+      container_count: 0,
+      totals: {
+        cpu_pct: 0, mem_used_bytes: 0, mem_limit_bytes: 0,
+        net_rx_bytes_per_s: 0, net_tx_bytes_per_s: 0,
+        blk_read_bytes_per_s: 0, blk_write_bytes_per_s: 0,
+      },
+      top_cpu: [], top_memory: [], rows: [],
+    };
+  }
+
+  const results = await runBoundedParallel(
+    containers,
+    async (summary) => {
+      try { return await _sampleContainer(client, summary); }
+      catch (err) {
+        // Per-container failure is fine — could be a container that
+        // exited between listContainers and our stats call. Log at
+        // debug only so we don't spam logs every poll.
+        logger.debug({ container_id: summary.Id, err: err.message }, 'stats summary: per-container sample failed');
+        return null;
+      }
+    },
+    SYSTEM_STATS_CONCURRENCY,
+  );
+  const rows = results.filter(Boolean);
+
+  // Totals are SUMS across containers — useful for a host-wide
+  // dashboard ("47 % of 8 cores in use", "12 GB / 16 GB").
+  // mem_limit_bytes summed across containers can exceed host memory
+  // if limits are over-provisioned; that's expected and matches
+  // what `docker stats` shows.
+  const totals = rows.reduce((acc, r) => ({
+    cpu_pct: acc.cpu_pct + r.cpu_pct,
+    mem_used_bytes: acc.mem_used_bytes + r.mem_used_bytes,
+    mem_limit_bytes: acc.mem_limit_bytes + r.mem_limit_bytes,
+    net_rx_bytes_per_s: acc.net_rx_bytes_per_s + r.net_rx_bytes_per_s,
+    net_tx_bytes_per_s: acc.net_tx_bytes_per_s + r.net_tx_bytes_per_s,
+    blk_read_bytes_per_s: acc.blk_read_bytes_per_s + r.blk_read_bytes_per_s,
+    blk_write_bytes_per_s: acc.blk_write_bytes_per_s + r.blk_write_bytes_per_s,
+  }), {
+    cpu_pct: 0, mem_used_bytes: 0, mem_limit_bytes: 0,
+    net_rx_bytes_per_s: 0, net_tx_bytes_per_s: 0,
+    blk_read_bytes_per_s: 0, blk_write_bytes_per_s: 0,
+  });
+
+  return {
+    sampled_at: new Date().toISOString(),
+    cached: false,
+    container_count: rows.length,
+    totals,
+    top_cpu: [...rows].sort((a, b) => b.cpu_pct - a.cpu_pct),
+    top_memory: [...rows].sort((a, b) => b.mem_used_bytes - a.mem_used_bytes),
+    rows,
+  };
+}
+
+r.get(
+  '/stats/summary',
+  {
+    summary: 'Aggregated live stats across all running containers (top consumers)',
+    description:
+      'Server-side aggregate of one stats sample per running container, cached for ' +
+      `${SYSTEM_STATS_CACHE_TTL_MS / 1000}s. Returns totals, top_cpu (sorted desc), ` +
+      'top_memory (sorted desc), and the full row set. Per-container sampling failures ' +
+      'are silently dropped (logged at debug). Sampling fans out with bounded concurrency ' +
+      `(${SYSTEM_STATS_CONCURRENCY}) and each container needs ~${SYSTEM_STATS_SAMPLE_GAP_MS}ms ` +
+      'of sample gap to compute rates.',
+    query: Type.Object(
+      {
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 10 })),
+      },
+      { additionalProperties: false },
+    ),
+    responses: { 200: SystemStatsSummaryResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const limit = intQuery(req.query.limit, 10, { min: 1, max: 100 });
+    let snapshot;
+    if (statsCache && Date.now() - statsCacheAt < SYSTEM_STATS_CACHE_TTL_MS) {
+      snapshot = { ...statsCache, cached: true };
+    } else {
+      snapshot = await buildStatsSummary(getClient());
+      statsCache = snapshot;
+      statsCacheAt = Date.now();
+    }
+    res.json({
+      ...snapshot,
+      top_cpu: snapshot.top_cpu.slice(0, limit),
+      top_memory: snapshot.top_memory.slice(0, limit),
+    });
+  }),
+);
+
 // Visible-for-testing only.
 export const _internals = {
   discoverDevices,
-  resetCacheForTests() { deviceCache = null; deviceCacheAt = 0; },
+  resetCacheForTests() {
+    deviceCache = null; deviceCacheAt = 0;
+    statsCache = null; statsCacheAt = 0;
+  },
+  buildStatsSummary,
+  SYSTEM_STATS_SAMPLE_GAP_MS,
 };
 
 r.get(

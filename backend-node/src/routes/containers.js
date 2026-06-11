@@ -21,6 +21,7 @@ import {
   ContainerLiveUpdateRequest,
   ContainerRenameRequest,
   ContainerSummary,
+  ContainerTopResponse,
   CreateContainerRequest,
   PassThroughObject,
 } from '../schemas/index.js';
@@ -214,6 +215,63 @@ r.get(
   asyncHandler(async (req, res) =>
     res.json(await getClient().getContainer(req.params.id).stats({ stream: false })),
   ),
+);
+
+/**
+ * Per-process view: wraps Docker's `top` endpoint which runs `ps`
+ * inside the container's PID namespace. Returns a column-header row
+ * + a 2D string array — the same shape `docker top` emits.
+ *
+ * The `ps_args` query is forwarded verbatim to the daemon. We
+ * validate against a tight allowlist regex (printable ASCII minus
+ * shell metachars) so a hostile client can't smuggle command
+ * separators or backticks into the args; the daemon does its own
+ * exec/spawn but defense-in-depth keeps the attack surface small.
+ *
+ * Available to viewer + admin — read-only diagnostic data, no
+ * mutation involved.
+ */
+r.get(
+  '/:id/top',
+  {
+    summary: 'Per-process view inside the container (Docker `top`)',
+    params: IdParam,
+    query: Type.Object(
+      {
+        ps_args: Type.Optional(Type.String({
+          maxLength: 128,
+          // Allowed: letters, digits, dashes, dots, equals, comma,
+          // space. Deliberately excludes |, &, ;, $, `, \, quotes,
+          // <, >, parens, braces, brackets, *, ?.
+          pattern: '^[A-Za-z0-9_,= .\\-]+$',
+        })),
+      },
+      { additionalProperties: false },
+    ),
+    responses: { 200: ContainerTopResponse },
+  },
+  asyncHandler(async (req, res) => {
+    const c = getClient().getContainer(req.params.id);
+    const psArgs = (req.query.ps_args || '-ef').trim();
+    let raw;
+    try {
+      raw = await c.top({ ps_args: psArgs });
+    } catch (err) {
+      if (err.statusCode === 404) throw new HttpError(404, 'Container not found');
+      if (err.statusCode === 409) {
+        // Docker returns 409 when the container isn't running —
+        // `top` requires an active PID namespace. Make the error
+        // message actionable rather than passing the raw daemon text.
+        throw new HttpError(409, 'Container is not running; start it before requesting process list');
+      }
+      throw err;
+    }
+    // Daemon returns {Titles, Processes}. Normalise to our schema.
+    res.json({
+      titles: Array.isArray(raw.Titles) ? raw.Titles : [],
+      processes: Array.isArray(raw.Processes) ? raw.Processes : [],
+    });
+  }),
 );
 
 r.get(

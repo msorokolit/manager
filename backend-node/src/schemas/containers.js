@@ -198,6 +198,26 @@ export const ContainerRenameRequest = Type.Object(
   { $id: 'ContainerRenameRequest', additionalProperties: false },
 );
 
+/**
+ * Per-process view of a running container (Docker's GET /containers/:id/top).
+ *
+ * The shape mirrors what `docker top` returns: a column-header row
+ * plus a 2D array of cell strings. We pass it through verbatim — the
+ * column names depend on the `ps_args` (e.g. -ef vs aux vs forest)
+ * and locking down a fixed shape would force us to either re-parse
+ * the values or refuse legitimate variants.
+ */
+export const ContainerTopResponse = Type.Object(
+  {
+    titles: Type.Array(Type.String(), { description: 'ps column headers' }),
+    processes: Type.Array(
+      Type.Array(Type.String()),
+      { description: 'one row per process; cells align with `titles`' },
+    ),
+  },
+  { $id: 'ContainerTopResponse', additionalProperties: false },
+);
+
 export const ContainerSummary = Type.Object(
   {
     id: Type.String(),
