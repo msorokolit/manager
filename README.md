@@ -222,33 +222,54 @@ For deployments past a few hundred MB of audit data, point `AUDIT_FILE` at a pat
 
 ## GPUs & host devices
 
-The Run Container dialog exposes host devices + GPUs + alternate OCI runtimes as first-class fields. To avoid blind-guessing, the dialog calls `GET /api/system/devices` on open and renders:
+**Any host device under `/dev` can be passed through to a container** — GPUs, audio, USB, serial, V4L2 cameras, ML accelerators, TPM, watchdog, block devices, framebuffers — the same surface as `docker run --device`. The Run dialog and System tab make the common targets discoverable so the operator doesn't need to SSH into the host to find paths.
 
-- A device row editor (Host path / Container path / Perms) — typos are rejected at input time, not as opaque daemon errors two seconds later.
+The Run Container dialog exposes the surface as first-class fields. To avoid blind-guessing, the dialog calls `GET /api/system/devices` on open and renders:
+
+- A **device row editor** (Host path / Container path / Perms) — typos are rejected at input time, not as opaque daemon errors two seconds later — plus a **"Suggested from host"** dropdown grouped by category that adds a pre-filled row on click.
 - A **GPU mode picker** (None / All / Specific) backed by detected NVIDIA GPUs from `nvidia-smi`, with optional capability checkboxes (`compute`, `utility`, `video`, …).
 - A **Runtime select** populated from `docker info` Runtimes (`runc`, `nvidia`, `crun`, `kata-runtime`, …).
 - A banner that surfaces the host's accelerator state: `"2 GPUs detected: NVIDIA RTX A4000 · runtime nvidia available"`, or a friendly warning when the manager container can't see GPUs the host has.
 
-The **System** tab carries a dedicated *Accelerators & devices* panel with the runtime list, per-GPU details (model, VRAM, driver, UUID), and `/dev/dri` enumeration. Each GPU row has a *Use in container* shortcut that opens the Run dialog pre-populated with the matching index + nvidia runtime; `/dev/dri` gets the same shortcut for Intel/AMD VAAPI workloads.
+The **System** tab carries a dedicated *Accelerators & devices* panel:
+
+- OCI runtimes table.
+- Per-GPU details (model, VRAM, driver, UUID).
+- `/dev/dri` enumeration.
+- **Host devices grouped by category** with a *Use →* shortcut per device and *Use all in container* per category:
+
+| Category | Path patterns scanned | Typical use |
+|---|---|---|
+| AMD GPU / ROCm | `/dev/kfd` | AMD GPU compute workloads (combine with the matching `/dev/dri/renderD*`) |
+| Audio | `/dev/snd/**` (recursive) | ALSA / PulseAudio inside the container |
+| USB | `/dev/bus/usb/<bus>/<device>` (recursive) | USB pass-through |
+| Serial / TTY | `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*` | Arduino / 3D printers / IoT |
+| V4L2 cameras | `/dev/video*` | Webcams / capture cards |
+| ML accelerators | `/dev/apex_*`, `/dev/hailo*`, `/dev/accel*` | Coral, Hailo, generic Linux accel class |
+| TPM | `/dev/tpm*`, `/dev/tpmrm*` | Attestation / sealed secrets |
+| Watchdog | `/dev/watchdog*` | Hardware watchdog timer |
+
+Each category row carries a one-line hint explaining the typical pass-through pattern. Categories that exist as a *concept* but aren't detected on this host are shown greyed-out + collapsed — the operator knows the option *could* exist if they enabled it.
 
 Container **Inspect** → Resources tab gains a *GPU device requests* table alongside the existing Devices table, plus the container's effective Runtime line.
 
 ### Detection caveats
 
-GPU enumeration is best-effort and runs from inside the manager container, so:
+Discovery is best-effort and runs from inside the manager container, so:
 
 - **Runtimes** come from `docker info` — always accurate, the daemon is the source of truth.
 - **NVIDIA GPUs** require `nvidia-smi` to be available inside the manager container *and* the container to be able to read `/dev/nvidia*`. The simplest setup is running the manager itself with `--runtime=nvidia`. Without that, the discovery endpoint returns `nvidia.available: false` with a `note` explaining what's missing, and the Run dialog falls back to a manual "GPU indices" text input.
 - **`/dev/dri`** existence is a filesystem check inside the manager container; the device only shows up if it's bind-mounted in.
+- **Categorised /dev scan** likewise reads paths that exist *inside the manager container*. A bare-default install only sees the manager's own `/dev`; to surface the host's devices, run the manager with the host's `/dev` mounted (`--volume /dev:/dev:ro`) or bind-mount specific subtrees (`--volume /dev/bus/usb:/dev/bus/usb:ro`). Without that, every category reports `available: false` — *but the row editor still lets the operator type any path*.
 
-The dialog still works end-to-end without any of this — the runtime select is empty, GPU mode defaults to None, devices are entered as free-text rows. The discovery is a UX improvement, not a load-bearing dependency.
+The dialog still works end-to-end without any of this — the runtime select is empty, GPU mode defaults to None, devices are entered as free-text rows. Discovery is a UX improvement, not a load-bearing dependency.
 
 ### API additions
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/system/devices` | Runtimes + GPUs + `/dev/dri` + suggested gpu_runtime. Cached 30 s. |
-| `POST` | `/api/containers` | Now accepts `gpu_device_ids: [...]`, `gpu_capabilities: [...]`, `runtime: "..."`. The legacy `gpus: 'all' \| N` shorthand still works. Device strings (`devices: ["host:container:perms"]`) are now regex-validated. |
+| `GET` | `/api/system/devices` | Runtimes + NVIDIA GPUs + `/dev/dri` + categorised `host_devices` (AMD ROCm, audio, USB, serial, V4L, ML accelerators, TPM, watchdog) + suggested `gpu_runtime`. Cached 30 s. |
+| `POST` | `/api/containers` | Accepts `gpu_device_ids: [...]`, `gpu_capabilities: [...]`, `runtime: "..."`. Legacy `gpus: 'all' \| N` shorthand still works. Device strings (`devices: ["host:container:perms"]`) are regex-validated. |
 
 ## Sessions
 

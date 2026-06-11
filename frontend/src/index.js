@@ -1588,14 +1588,50 @@ import { FitAddon } from '@xterm/addon-fit';
           ${_renderDevicesBanner(devicesInfo)}
         </div>
 
-        <!-- Devices: structured row editor, [Add device] adds a new row. -->
+        <!-- Devices: structured row editor, [Add device] adds a new row.
+             "Suggested from host" picker is built from
+             /api/system/devices so the operator doesn't have to know
+             the path of every device they want to pass through. -->
         <div class="md:col-span-2">
-          <div class="flex items-center justify-between mb-1">
+          <div class="flex items-center justify-between gap-2 mb-1">
             <span class="text-xs text-slate-400">Host devices to expose (Host path / Container path / Perms)</span>
-            <button type="button" id="dev-add" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">+ Add device</button>
+            <div class="flex items-center gap-2">
+              ${(() => {
+                const allDevs = [];
+                if (devicesInfo) {
+                  // DRI surfaces under its own field; also include
+                  // in the picker for convenience.
+                  if (devicesInfo.dri && devicesInfo.dri.available) {
+                    for (const p of devicesInfo.dri.devices || []) allDevs.push({ kind: 'DRI', path: p });
+                  }
+                  for (const g of devicesInfo.host_devices || []) {
+                    if (!g.available) continue;
+                    for (const p of g.devices) allDevs.push({ kind: g.label, path: p });
+                  }
+                }
+                if (!allDevs.length) return '';
+                // Group options by kind so the dropdown is browseable.
+                const byKind = {};
+                for (const d of allDevs) (byKind[d.kind] ||= []).push(d.path);
+                const opts = Object.entries(byKind).map(([kind, paths]) =>
+                  `<optgroup label="${escapeHtml(kind)}">${paths.map((p) =>
+                    `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`,
+                  ).join('')}</optgroup>`,
+                ).join('');
+                return `
+                  <select id="dev-suggest" class="rounded border-slate-700 bg-slate-950 text-[11px]">
+                    <option value="">+ Suggested from host…</option>
+                    ${opts}
+                  </select>`;
+              })()}
+              <button type="button" id="dev-add" class="rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300">+ Add device</button>
+            </div>
           </div>
           <div id="dev-rows" class="space-y-1.5"></div>
-          <p class="mt-1 text-[11px] text-slate-500">Common: <code>/dev/dri</code> (Intel/AMD VAAPI), <code>/dev/snd</code> (audio), <code>/dev/ttyUSB0</code> (serial), <code>/dev/bus/usb</code> (USB).</p>
+          <p class="mt-1 text-[11px] text-slate-500">
+            Pass any character/block device with <code>--device</code>-equivalent semantics — GPUs, audio, USB, serial, V4L cameras, TPM, ML accelerators, NVMe block devices, framebuffers…
+            ${devicesInfo ? 'Use the "Suggested from host" dropdown for paths the manager has detected.' : ''}
+          </p>
         </div>
 
         <!-- GPUs: radio mode picker. 'Specific' reveals checkboxes of detected GPUs. -->
@@ -1723,6 +1759,22 @@ import { FitAddon } from '@xterm/addon-fit';
       devRowsEl.appendChild(row);
     }
     form.querySelector('#dev-add').onclick = () => addDeviceRow();
+
+    // "Suggested from host" picker — one click adds a row pre-filled
+    // (host path mirrored to container path, perms 'rwm'). The
+    // operator can still edit any field after.
+    const suggestEl = form.querySelector('#dev-suggest');
+    if (suggestEl) {
+      suggestEl.addEventListener('change', () => {
+        const path = suggestEl.value;
+        if (!path) return;
+        // Avoid double-adds if the user picks the same device twice.
+        const already = [...devRowsEl.querySelectorAll('[data-f="host"]')]
+          .some((inp) => inp.value === path);
+        if (!already) addDeviceRow({ host: path, container: path, perms: 'rwm' });
+        suggestEl.value = '';
+      });
+    }
     // Seed from caller (System tab "Use in container" passes
     // {prefill: {devices: [...]}}).
     if (prefill.devices && prefill.devices.length) {
@@ -6301,6 +6353,45 @@ import { FitAddon } from '@xterm/addon-fit';
     }
     wrap.appendChild(dri);
 
+    // ---------- Categorised /dev scan ----------
+    //
+    // Every category in DEVICE_CATEGORIES (backend) gets one row,
+    // even if empty — the operator should be able to discover
+    // "TPM pass-through is a thing I could enable" without already
+    // knowing it exists. Empty rows are greyed out + carry the hint.
+    if (Array.isArray(d.host_devices) && d.host_devices.length) {
+      const hd = document.createElement('div');
+      hd.className = 'mt-4';
+      const groups = d.host_devices.map((g) => {
+        const devicesHtml = g.available
+          ? `<div class="grid gap-1 mt-1">
+              ${g.devices.map((p) => `
+                <div class="flex items-center justify-between gap-2 rounded bg-slate-950/40 px-2 py-1 text-xs">
+                  <code class="text-slate-300 font-mono truncate">${escapeHtml(p)}</code>
+                  ${isAdmin ? `<button data-act="use-dev" data-path="${escapeHtml(p)}" data-kind="${escapeHtml(g.kind)}" class="shrink-0 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[10px] text-slate-200">Use →</button>` : ''}
+                </div>`).join('')}
+            </div>`
+          : `<p class="text-[11px] text-slate-500 italic">Not detected on this host.</p>`;
+        const useAllBtn = isAdmin && g.available && g.devices.length > 1
+          ? `<button data-act="use-all" data-kind="${escapeHtml(g.kind)}" class="ml-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[10px] text-slate-200">Use all in container</button>`
+          : '';
+        return `
+          <details class="rounded border border-slate-800 bg-slate-900/40 px-3 py-2 ${g.available ? '' : 'opacity-60'}" ${g.available ? 'open' : ''}>
+            <summary class="cursor-pointer text-xs">
+              <span class="font-medium text-slate-200">${escapeHtml(g.label)}</span>
+              <span class="ml-2 text-[11px] text-slate-500">${g.available ? `${g.devices.length} device${g.devices.length === 1 ? '' : 's'}` : 'absent'}</span>
+              ${useAllBtn}
+            </summary>
+            ${g.hint ? `<p class="mt-1 text-[11px] text-slate-500">${escapeHtml(g.hint)}</p>` : ''}
+            ${devicesHtml}
+          </details>`;
+      }).join('');
+      hd.innerHTML = `
+        <div class="mb-1 mt-3 text-[11px] uppercase tracking-wider text-slate-500">Host devices (categorised /dev scan)</div>
+        <div class="grid gap-2 lg:grid-cols-2">${groups}</div>`;
+      wrap.appendChild(hd);
+    }
+
     wrap.addEventListener('click', (e) => {
       const t = e.target.closest('[data-act]');
       if (!t) return;
@@ -6317,6 +6408,21 @@ import { FitAddon } from '@xterm/addon-fit';
         runContainerDialog({
           devices: ['/dev/dri:/dev/dri:rwm'],
         }).then((c) => { if (c) toast(`Container ${c.name || c.short_id} running`, 'success'); });
+      } else if (t.dataset.act === 'use-dev') {
+        // Single discovered device → one row in the editor.
+        runContainerDialog({
+          devices: [`${t.dataset.path}:${t.dataset.path}:rwm`],
+        }).then((c) => { if (c) toast(`Container ${c.name || c.short_id} running`, 'success'); });
+      } else if (t.dataset.act === 'use-all') {
+        // "Use all" on a category → one row per device. Audio +
+        // USB benefit from this (whole /dev/snd is the right
+        // pass-through for ALSA; the user shouldn't have to pick).
+        const group = d.host_devices.find((g) => g.kind === t.dataset.kind);
+        if (group) {
+          runContainerDialog({
+            devices: group.devices.map((p) => `${p}:${p}:rwm`),
+          }).then((c) => { if (c) toast(`Container ${c.name || c.short_id} running`, 'success'); });
+        }
       }
     });
 
