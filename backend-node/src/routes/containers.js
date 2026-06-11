@@ -222,15 +222,27 @@ r.get(
  * inside the container's PID namespace. Returns a column-header row
  * + a 2D string array — the same shape `docker top` emits.
  *
- * The `ps_args` query is forwarded verbatim to the daemon. We
- * validate against a tight allowlist regex (printable ASCII minus
- * shell metachars) so a hostile client can't smuggle command
- * separators or backticks into the args; the daemon does its own
- * exec/spawn but defense-in-depth keeps the attack surface small.
+ * The `ps_args` query is restricted to a small ENUM of safe preset
+ * strings — NOT a regex allowlist. The earlier regex permitted any
+ * `ps -eo` field, including `env`/`environ`, which would expose
+ * every process's environment variables (via /proc/<pid>/environ)
+ * to viewer-role users. Secrets routinely live in container env
+ * (DB_PASSWORD, API_KEY, …), so that was a real disclosure path.
+ *
+ * If you need a custom column set, add it to PS_ARGS_PRESETS after
+ * confirming it can't return env / cmdline secrets you care about.
+ * The four presets here mirror what the SPA's picker offers and
+ * cover the operator-diagnostic use cases.
  *
  * Available to viewer + admin — read-only diagnostic data, no
  * mutation involved.
  */
+const PS_ARGS_PRESETS = Object.freeze([
+  '-ef',                                  // default — uid/pid/ppid/c/stime/tty/time/cmd
+  'aux',                                  // BSD-style summary
+  '-eo pid,user,pcpu,pmem,comm',          // sortable summary (no full cmd, no env)
+  'axf',                                  // process tree
+]);
 r.get(
   '/:id/top',
   {
@@ -238,13 +250,10 @@ r.get(
     params: IdParam,
     query: Type.Object(
       {
-        ps_args: Type.Optional(Type.String({
-          maxLength: 128,
-          // Allowed: letters, digits, dashes, dots, equals, comma,
-          // space. Deliberately excludes |, &, ;, $, `, \, quotes,
-          // <, >, parens, braces, brackets, *, ?.
-          pattern: '^[A-Za-z0-9_,= .\\-]+$',
-        })),
+        ps_args: Type.Optional(Type.Union(
+          PS_ARGS_PRESETS.map((p) => Type.Literal(p)),
+          { description: 'Must be one of the preset ps argument strings' },
+        )),
       },
       { additionalProperties: false },
     ),
@@ -252,7 +261,7 @@ r.get(
   },
   asyncHandler(async (req, res) => {
     const c = getClient().getContainer(req.params.id);
-    const psArgs = (req.query.ps_args || '-ef').trim();
+    const psArgs = req.query.ps_args || '-ef';
     let raw;
     try {
       raw = await c.top({ ps_args: psArgs });
@@ -477,35 +486,73 @@ r.post(
     const newBody = { ...req.body };
     if (!newBody.name) newBody.name = oldName;
 
+    // Capture the source's network attachments BEFORE we remove
+    // it. Containers can sit on multiple non-default networks (a
+    // frontend + backend network in a manual setup). The new
+    // container is created on the body's `network` field only —
+    // we re-`connect` it to the others post-create so multi-net
+    // setups don't silently degrade to a single network.
+    //
+    // Default networks (bridge / host / none) are excluded — they
+    // come along automatically based on NetworkMode.
+    const sourceNetworks = Object.entries(((source.NetworkSettings || {}).Networks) || {})
+      .filter(([n]) => !['bridge', 'host', 'none'].includes(n))
+      .map(([name, ep]) => ({
+        name,
+        aliases: (ep && ep.Aliases) || undefined,
+        ipv4: (ep && ep.IPAMConfig && ep.IPAMConfig.IPv4Address) || undefined,
+        ipv6: (ep && ep.IPAMConfig && ep.IPAMConfig.IPv6Address) || undefined,
+      }));
+
     res.set('Content-Type', 'text/plain; charset=utf-8');
     res.set('Cache-Control', 'no-store');
     const log = (s) => { try { res.write(s + '\n'); } catch {} };
+    // Emit a final machine-readable JSON line so programmatic
+    // callers (curl scripts, future integrations, our own SPA)
+    // don't have to grep the text for success. The SPA branches
+    // on the parsed `status` field rather than regex-matching
+    // the log text.
+    const finish = (status, extra = {}) => {
+      try { res.write('\n' + JSON.stringify({ status, ...extra }) + '\n'); } catch {}
+      try { res.end(); } catch {}
+    };
 
     log(`[recreate] source: ${oldName} (${sourceId.slice(0, 12)}), running=${wasRunning}`);
+    if (sourceNetworks.length) {
+      log(`[recreate] preserving ${sourceNetworks.length} extra network attachment(s): ${sourceNetworks.map((n) => n.name).join(', ')}`);
+    }
+
+    let cleanlyStopped = false;
     if (wasRunning) {
       log('[recreate] stopping…');
       try {
         await docker.getContainer(sourceId).stop({ t: 10 });
         log('[recreate] stopped');
+        cleanlyStopped = true;
       } catch (err) {
-        if (err.statusCode === 304) log('[recreate] already stopped');
+        if (err.statusCode === 304) { log('[recreate] already stopped'); cleanlyStopped = true; }
         else {
           log(`[recreate] ERROR stopping: ${err.message}`);
-          res.end();
-          return;
+          return finish('error', { step: 'stop', detail: err.message });
         }
       }
     }
 
     log('[recreate] removing source container (named volumes preserved)…');
     try {
-      await docker.getContainer(sourceId).remove({ force: !wasRunning ? false : true, v: false });
+      // After a clean stop, prefer force:false — it'll error if
+      // the daemon thinks the container is still running, which
+      // is itself a useful signal (stop didn't fully take). Only
+      // fall back to force:true if we couldn't confirm a clean
+      // stop (e.g. wasRunning && stop returned 304 ambiguously
+      // — but that branch sets cleanlyStopped=true too).
+      const removeOpts = { force: !cleanlyStopped, v: false };
+      await docker.getContainer(sourceId).remove(removeOpts);
       log('[recreate] removed');
     } catch (err) {
       log(`[recreate] ERROR removing: ${err.message}`);
       log('[recreate] aborting — original container may still exist');
-      res.end();
-      return;
+      return finish('error', { step: 'remove', detail: err.message });
     }
 
     log(`[recreate] creating new container with name '${newBody.name}'…`);
@@ -529,8 +576,32 @@ r.post(
       // form populated for retry.
       log(`[recreate] ERROR creating: ${err.message}`);
       log('[recreate] ORIGINAL CONTAINER IS GONE. Re-run with the same body to retry create.');
-      res.end();
-      return;
+      return finish('error', { step: 'create', detail: err.message, original_gone: true });
+    }
+
+    // Re-attach any extra networks the source had before we start.
+    // Errors here are non-fatal — the container will start with
+    // whatever attachments succeeded, and we list the failures in
+    // the final JSON line so the caller can surface them.
+    const networkErrors = [];
+    for (const n of sourceNetworks) {
+      log(`[recreate] reconnecting to network '${n.name}'…`);
+      try {
+        const netCfg = { Container: newContainer.id };
+        if (n.aliases && n.aliases.length) netCfg.EndpointConfig = { Aliases: n.aliases };
+        if (n.ipv4 || n.ipv6) {
+          netCfg.EndpointConfig = netCfg.EndpointConfig || {};
+          netCfg.EndpointConfig.IPAMConfig = {
+            ...(n.ipv4 ? { IPv4Address: n.ipv4 } : {}),
+            ...(n.ipv6 ? { IPv6Address: n.ipv6 } : {}),
+          };
+        }
+        await docker.getNetwork(n.name).connect(netCfg);
+        log(`[recreate] connected to '${n.name}'`);
+      } catch (err) {
+        log(`[recreate] WARN: failed to reconnect to '${n.name}': ${err.message}`);
+        networkErrors.push({ network: n.name, detail: err.message });
+      }
     }
 
     log('[recreate] starting new container…');
@@ -540,12 +611,19 @@ r.post(
     } catch (err) {
       log(`[recreate] ERROR starting: ${err.message}`);
       log(`[recreate] new container exists (id=${newContainer.id.slice(0, 12)}) but failed to start`);
-      res.end();
-      return;
+      return finish('error', {
+        step: 'start',
+        detail: err.message,
+        new_id: newContainer.id,
+        network_errors: networkErrors,
+      });
     }
 
     log(`[recreate] OK new_id=${newContainer.id}`);
-    res.end();
+    finish('ok', {
+      new_id: newContainer.id,
+      network_errors: networkErrors,
+    });
   }),
 );
 

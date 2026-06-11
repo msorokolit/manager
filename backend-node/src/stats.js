@@ -58,13 +58,20 @@ export function computeStats(sample, { intervalSeconds } = {}) {
   if (sysDelta > 0 && cpuDelta > 0) cpuPct = (cpuDelta / sysDelta) * onlineCpus * 100;
 
   // Per-CPU breakdown (cgroups v1 only — v2 drops percpu_usage).
+  //
+  // Multiplier is online_cpus, NOT percpu.length. percpu_usage
+  // includes all CPUs the kernel ever exposed to the container,
+  // even ones currently offline (hot-pluggable VMs do this) — using
+  // its length would over-report per-CPU percentages. The aggregate
+  // cpu_pct formula above already uses online_cpus, so this keeps
+  // them consistent.
   const perCpuPct = [];
   const percpu = cs.cpu_usage?.percpu_usage;
   const prevPercpu = ps.cpu_usage?.percpu_usage;
   if (Array.isArray(percpu) && Array.isArray(prevPercpu) && sysDelta > 0) {
     for (let i = 0; i < percpu.length; i++) {
       const d = (percpu[i] || 0) - (prevPercpu[i] || 0);
-      perCpuPct.push(d > 0 ? (d / sysDelta) * percpu.length * 100 : 0);
+      perCpuPct.push(d > 0 ? (d / sysDelta) * onlineCpus * 100 : 0);
     }
   }
 

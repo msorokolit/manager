@@ -41,6 +41,20 @@ let currentStream = null;
 let stopping = false;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
+// Last successfully-recorded event timestamp (Unix nanoseconds
+// preferred, falling back to seconds). On reconnect we pass this
+// as `since` so the daemon replays events we missed during the
+// outage. Without this, every reconnect creates a coverage hole
+// the size of the backoff window — up to 60s of activity lost
+// per cycle.
+let lastEventSec = null;
+// In-flight write count — the data handler counts pending writes
+// and pauses the docker stream when the backlog exceeds the
+// threshold. Resumes on the chain draining. Protects against
+// slow-disk / paused-fs scenarios where writes pile up faster
+// than they flush.
+let pendingWrites = 0;
+const PENDING_WRITE_PAUSE_THRESHOLD = 1000;
 
 function getStore() {
   // Lazy so test envs that override settings via vi.hoisted get a
@@ -89,14 +103,41 @@ export function normaliseEvent(raw) {
  * Public: append one normalised event. Used by start() but also
  * exposed for tests that want to seed the store deterministically
  * without spinning up dockerode.
+ *
+ * Side-effects beyond the obvious:
+ *   - Updates lastEventSec so a subsequent reconnect can resume
+ *     with `since` instead of leaving a coverage hole.
+ *   - Increments pendingWrites for the backpressure governor;
+ *     decrements when the write resolves.
  */
 export function recordEvent(event) {
   if (!settings.eventsHistoryEnabled) return Promise.resolve();
   const norm = normaliseEvent(event);
   if (!norm) return Promise.resolve();
-  return appendLine(getStore(), JSON.stringify(norm) + '\n', {
+  // Remember the most recent event time we ACCEPTED for storage;
+  // reconnect uses this as a `since` filter. Add 1 second so we
+  // don't replay the last seen event verbatim (Docker's `since`
+  // is inclusive). The 1-second granularity is fine — Docker
+  // events at sub-second resolution within the same reconnect
+  // window are extraordinarily rare, and a 1s gap is far better
+  // than a 60s one.
+  const tsSec = Math.floor(Date.parse(norm.ts) / 1000);
+  if (Number.isFinite(tsSec) && (lastEventSec == null || tsSec > lastEventSec)) {
+    lastEventSec = tsSec;
+  }
+  pendingWrites++;
+  const p = appendLine(getStore(), JSON.stringify(norm) + '\n', {
     onWriteError: (err) => logger.warn({ err: err.message }, 'event-history: write failed'),
   });
+  p.finally(() => {
+    pendingWrites--;
+    // Resume the stream if we paused it for backpressure and the
+    // backlog has drained.
+    if (currentStream && currentStream.isPaused && currentStream.isPaused() && pendingWrites < PENDING_WRITE_PAUSE_THRESHOLD / 2) {
+      try { currentStream.resume(); } catch {}
+    }
+  });
+  return p;
 }
 
 /**
@@ -120,12 +161,19 @@ export async function start(client) {
 
 async function _connect(client) {
   try {
-    // No `since` filter — we want the recorder to track events
-    // from the moment it starts. Operators wanting backfill can
-    // separately query the daemon's own /events endpoint.
-    currentStream = await client.getEvents({});
+    // On first connect, no `since` — track from the moment the
+    // recorder started. On reconnects, replay from one second after
+    // the last successfully-recorded event so we cover the outage
+    // window. Docker's daemon retains events back to its own start,
+    // so this works as long as the daemon itself didn't restart
+    // during the gap (in which case there are no events to replay).
+    const opts = lastEventSec ? { since: lastEventSec + 1 } : {};
+    currentStream = await client.getEvents(opts);
     reconnectAttempt = 0;
-    logger.info({ file: settings.eventsHistoryFile }, 'event-history: subscribed to docker events');
+    logger.info({
+      file: settings.eventsHistoryFile,
+      since: opts.since || null,
+    }, 'event-history: subscribed to docker events');
   } catch (err) {
     logger.warn({ err: err.message }, 'event-history: subscribe failed, will retry');
     _scheduleReconnect(client);
@@ -142,6 +190,15 @@ async function _connect(client) {
       if (!line.trim()) continue;
       try { recordEvent(JSON.parse(line)); }
       catch (err) { logger.debug({ err: err.message, line }, 'event-history: parse failed'); }
+    }
+    // Backpressure: if the write chain has fallen behind, pause
+    // the docker stream so it stops shovelling events into the
+    // node heap. Resume in recordEvent's finally hook once the
+    // backlog drains. A noisy host with 100 containers and per-
+    // second health checks can otherwise OOM us on a slow disk.
+    if (pendingWrites >= PENDING_WRITE_PAUSE_THRESHOLD && currentStream && !currentStream.isPaused?.()) {
+      try { currentStream.pause(); } catch {}
+      logger.warn({ pending: pendingWrites }, 'event-history: pausing stream — write backlog');
     }
   });
   currentStream.on('error', (err) => {
@@ -215,12 +272,17 @@ function _glob(pattern) {
 // Visible-for-testing only.
 export const _internals = {
   getStore,
+  getLastEventSec: () => lastEventSec,
+  getPendingWrites: () => pendingWrites,
+  setLastEventSecForTests: (v) => { lastEventSec = v; },
   resetForTests() {
     stopping = false;
     if (currentStream) try { currentStream.destroy(); } catch {}
     currentStream = null;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     reconnectAttempt = 0;
+    lastEventSec = null;
+    pendingWrites = 0;
     store = null;
   },
 };

@@ -82,7 +82,18 @@ export const EventHistoryEntry = Type.Object(
     actor_id: Opt(Type.Union([Type.String(), Type.Null()])),
     actor_name: Opt(Type.Union([Type.String(), Type.Null()])),
     image: Opt(Type.Union([Type.String(), Type.Null()])),
-    attributes: Opt(Type.Record(Type.String(), Type.Any())),
+    // Docker event attributes are always primitives (names, image
+    // refs, exit codes, signal numbers, healthcheck text). Locking
+    // to a primitive union — instead of `Type.Any()` — gives us a
+    // belt-and-braces guard against accidentally writing nested
+    // structures we'd then have to escape for the SPA's <pre>
+    // detail view, and prevents the recorder from being abused as
+    // a generic blob store if anything ever feeds it user-tainted
+    // attribute payloads.
+    attributes: Opt(Type.Record(
+      Type.String(),
+      Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]),
+    )),
   },
   { $id: 'EventHistoryEntry', additionalProperties: false },
 );
