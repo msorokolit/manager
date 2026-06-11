@@ -24,6 +24,7 @@ import { FitAddon } from '@xterm/addon-fit';
     { id: 'volumes', label: 'Volumes', icon: '💾' },
     { id: 'activity', label: 'Activity', icon: '📈' },
     { id: 'registries', label: 'Registries', icon: '🔑' },
+    { id: 'sessions', label: 'Sessions', icon: '🪪' },
     { id: 'system', label: 'System', icon: '⚙️' },
   ];
 
@@ -80,7 +81,10 @@ import { FitAddon } from '@xterm/addon-fit';
     const { responseType: _ignored, ...fetchOpts } = opts;
     const res = await fetch(path, { ...fetchOpts, headers });
     if (res.status === 401) {
-      logout();
+      // The session is already gone server-side (revoked / expired
+      // / forged) — calling /logout would recurse 401 → logout →
+      // 401. Skip the round-trip and just clear local state.
+      logout({ silent: true });
       throw new Error('Unauthorized');
     }
     if (!res.ok) {
@@ -451,8 +455,31 @@ import { FitAddon } from '@xterm/addon-fit';
   }
 
   // ---------- Auth flow ----------
-  function logout() {
-    state.auth = null; saveAuth(null); render();
+  //
+  // logout() now hits the backend to revoke the server-side session
+  // FIRST, then clears local auth state. If the call fails (network
+  // down, server gone), we still clear locally — the user wanted to
+  // sign out and we shouldn't trap them in a stale logged-in state
+  // — but they may need an admin to revoke the now-orphaned session
+  // from the Sessions pane.
+  //
+  // `silent: true` skips the toast (useful for the auto-logout path
+  // from the api() 401 handler, which already implies the session
+  // is gone server-side).
+  async function logout({ silent = false } = {}) {
+    if (state.auth && state.auth.token) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${state.auth.token}` },
+        });
+      } catch (e) {
+        if (!silent) toast('Server-side logout failed; local session cleared anyway', 'warn');
+      }
+    }
+    state.auth = null; saveAuth(null);
+    if (!silent) toast('Signed out', 'success');
+    render();
   }
   async function login(username, password) {
     const res = await fetch('/api/auth/login', {
@@ -5163,6 +5190,220 @@ import { FitAddon } from '@xterm/addon-fit';
     });
     return success;
   }
+
+  // ---------- Sessions ----------
+  //
+  // Every viewer / admin gets a "your sessions" pane: list of devices
+  // currently signed in as you, with a per-row [Revoke] and a
+  // "Sign out everywhere" button.
+  //
+  // Admins additionally get an "All active sessions" table — every
+  // logged-in user across the system, with per-row [Revoke] and the
+  // big-red-button "Sign out everyone" for incident response.
+  //
+  // The current session is highlighted; revoking it logs the caller
+  // out (server-side already gone, SPA just clears local state).
+  views.sessions = async (root) => {
+    const isAdmin = state.auth && state.auth.role === 'admin';
+
+    root.innerHTML = pageHeader(
+      'Sessions',
+      'Server-side session store — sign out a single device or everywhere',
+      `${btn('Refresh', { kind: 'ghost', id: 'refresh' })}`,
+    );
+
+    // Our own sessions
+    const mineWrap = document.createElement('section');
+    mineWrap.className = 'mb-8';
+    mineWrap.innerHTML = `
+      <div class="mb-3 flex items-center justify-between gap-2">
+        <div>
+          <h3 class="text-sm font-semibold text-slate-100">Your sessions</h3>
+          <p class="text-xs text-slate-500">Devices currently signed in as <code>${escapeHtml(state.auth.user)}</code>.</p>
+        </div>
+        <div class="flex gap-2">
+          <button id="mine-logout-others" class="rounded bg-amber-500/80 hover:bg-amber-500 text-slate-950 px-3 py-1.5 text-xs font-medium">Sign out other devices</button>
+          <button id="mine-logout-all" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-3 py-1.5 text-xs font-medium">Sign out everywhere</button>
+        </div>
+      </div>
+      <div id="mine-list"></div>`;
+    root.appendChild(mineWrap);
+
+    // Admin: everyone else's sessions
+    let adminWrap = null;
+    if (isAdmin) {
+      adminWrap = document.createElement('section');
+      adminWrap.innerHTML = `
+        <div class="mb-3 flex items-center justify-between gap-2">
+          <div>
+            <h3 class="text-sm font-semibold text-slate-100">All active sessions</h3>
+            <p class="text-xs text-slate-500">Every logged-in user across the system. Revoke individually or wipe them all for incident response.</p>
+          </div>
+          <button id="admin-revoke-all" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-3 py-1.5 text-xs font-medium">Sign out everyone</button>
+        </div>
+        <div id="all-list"></div>`;
+      root.appendChild(adminWrap);
+    }
+
+    function fmtRow(s) {
+      const curBadge = s.current
+        ? `<span class="ml-2 inline-flex items-center rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">this session</span>`
+        : '';
+      const issued = fmtDate(s.issued_at);
+      const seen = fmtDate(s.last_seen);
+      const expires = fmtDate(s.expires_at);
+      const ua = s.user_agent
+        ? `<span class="font-mono text-[11px] text-slate-400 break-all">${escapeHtml(s.user_agent)}</span>`
+        : '<span class="text-slate-600">—</span>';
+      const ip = s.source_ip
+        ? `<code class="text-slate-300 font-mono text-xs">${escapeHtml(s.source_ip)}</code>`
+        : '<span class="text-slate-600">—</span>';
+      const roleBadge = s.role === 'admin'
+        ? `<span class="rounded bg-sky-500/20 px-1.5 py-0.5 text-[10px] text-sky-300">admin</span>`
+        : `<span class="rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-300">viewer</span>`;
+      return `
+        <tr class="hover:bg-slate-900/60 ${s.current ? 'bg-emerald-500/5' : ''}">
+          <td class="px-4 py-2">
+            <div class="font-medium">${escapeHtml(s.user)} ${roleBadge}${curBadge}</div>
+            <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(s.id)}</div>
+          </td>
+          <td class="px-4 py-2 text-slate-300">${ip}</td>
+          <td class="px-4 py-2">${ua}</td>
+          <td class="px-4 py-2 text-slate-400 text-xs">
+            <div>signed in: ${escapeHtml(issued)}</div>
+            <div>last seen: ${escapeHtml(seen)}</div>
+            <div>expires: ${escapeHtml(expires)}</div>
+          </td>
+          <td class="px-4 py-2 text-right">
+            <button data-act="revoke" data-id="${escapeHtml(s.id)}" data-current="${s.current ? '1' : '0'}" class="rounded bg-rose-500/80 hover:bg-rose-500 text-white px-2 py-1 text-xs">${s.current ? 'Sign out' : 'Revoke'}</button>
+          </td>
+        </tr>`;
+    }
+
+    async function loadMine() {
+      const host = mineWrap.querySelector('#mine-list');
+      host.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        const rows = await api('/api/auth/sessions');
+        host.innerHTML = rows.length
+          ? table(['User', 'IP', 'User agent', 'Timeline', ''], rows.map(fmtRow))
+          : `<div class="rounded border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">No active sessions.</div>`;
+      } catch (e) {
+        host.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function loadAll() {
+      if (!adminWrap) return;
+      const host = adminWrap.querySelector('#all-list');
+      host.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/30 p-6 text-sm text-slate-400">Loading…</div>`;
+      try {
+        const rows = await api('/api/auth/sessions/all');
+        host.innerHTML = rows.length
+          ? table(['User', 'IP', 'User agent', 'Timeline', ''], rows.map(fmtRow))
+          : `<div class="rounded border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">No active sessions.</div>`;
+      } catch (e) {
+        host.innerHTML = `<div class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-rose-200">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function reload() {
+      await Promise.all([loadMine(), loadAll()]);
+    }
+
+    // Wire row-level [Revoke] across both tables. We rebind after each
+    // reload because the rows are re-rendered.
+    function wireRowActions() {
+      const handler = async (e) => {
+        const t = e.target.closest('[data-act="revoke"]');
+        if (!t) return;
+        const id = t.dataset.id;
+        const isCurrent = t.dataset.current === '1';
+        const ok = await confirmModal(
+          isCurrent
+            ? 'Sign out this session? You\'ll be returned to the login page.'
+            : 'Revoke this session?',
+          { danger: true, confirmLabel: isCurrent ? 'Sign out' : 'Revoke' },
+        );
+        if (!ok) return;
+        try {
+          await api(`/api/auth/sessions/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
+          if (isCurrent) {
+            // Server-side already revoked our token; clear local
+            // state without an extra round-trip.
+            state.auth = null; saveAuth(null); toast('Signed out', 'success');
+            render();
+          } else {
+            toast('Session revoked', 'success');
+            await reload();
+          }
+        } catch (ex) { toast(ex.message, 'error'); }
+      };
+      mineWrap.addEventListener('click', handler);
+      if (adminWrap) adminWrap.addEventListener('click', handler);
+    }
+    wireRowActions();
+
+    mineWrap.querySelector('#mine-logout-others').onclick = async () => {
+      const ok = await confirmModal(
+        'Sign out every other device but keep <strong>this</strong> session signed in?',
+        { danger: false, confirmLabel: 'Sign out others' },
+      );
+      if (!ok) return;
+      try {
+        const out = await api('/api/auth/logout-all?keep_current=true', { method: 'POST' });
+        toast(`Signed out ${out.revoked} other session${out.revoked === 1 ? '' : 's'}`, 'success');
+        await reload();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    mineWrap.querySelector('#mine-logout-all').onclick = async () => {
+      const ok = await confirmModal(
+        'Sign out of <strong>every</strong> device, including this one? You\'ll be returned to the login page.',
+        { danger: true, confirmLabel: 'Sign out everywhere' },
+      );
+      if (!ok) return;
+      try {
+        await api('/api/auth/logout-all', { method: 'POST' });
+        state.auth = null; saveAuth(null); toast('Signed out everywhere', 'success'); render();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    if (adminWrap) {
+      adminWrap.querySelector('#admin-revoke-all').onclick = async () => {
+        // Two-stage confirm because this is the kind of button an
+        // admin only clicks in an incident.
+        const choice = await modal({
+          title: 'Sign out every user',
+          size: 'sm',
+          body: `<p class="text-sm text-slate-300">This revokes <strong>every active session</strong> across the system. Every operator currently signed in (including over the API with a long-lived token) will be forced through re-login.</p>
+            <p class="mt-2 text-xs text-slate-500">Use case: a credential leak, JWT secret rotation, or post-incident lockout.</p>
+            <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+              <input id="incl-self" type="checkbox" class="rounded border-slate-700 bg-slate-950 text-rose-500"/>
+              Also include my own current session (I\'ll be logged out too)
+            </label>`,
+          actions: [
+            { label: 'Cancel', value: null, kind: 'secondary' },
+            { label: 'Sign out everyone', value: 'go', kind: 'danger' },
+          ],
+        });
+        if (choice !== 'go') return;
+        const includeSelf = !!document.querySelector('#incl-self')?.checked;
+        try {
+          const out = await api(`/api/auth/sessions/revoke-all?include_self=${includeSelf}`, { method: 'POST' });
+          if (includeSelf) {
+            state.auth = null; saveAuth(null); toast(`Revoked ${out.revoked} sessions (including yours)`, 'warn'); render();
+          } else {
+            toast(`Revoked ${out.revoked} sessions (yours kept)`, 'warn');
+            await reload();
+          }
+        } catch (e) { toast(e.message, 'error'); }
+      };
+    }
+
+    document.getElementById('refresh').onclick = reload;
+    await reload();
+  };
 
   // ---------- Activity (live events + per-container live stats) ----------
   views.activity = async (root) => {
