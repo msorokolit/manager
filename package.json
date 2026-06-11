@@ -1,0 +1,31 @@
+{
+  "name": "docker-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hostable web UI for managing enterprise systems running on a Docker engine.",
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "backend-node"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=frontend",
+    "start": "npm start --workspace=backend-node",
+    "preview": "npm run build && npm start --workspace=backend-node",
+    "dev": "concurrently -n 'webpack,server' -c 'cyan,magenta' --kill-others-on-fail 'npm:dev:frontend' 'npm:dev:backend'",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:backend": "npm run dev --workspace=backend-node",
+    "clean": "rm -rf frontend/dist frontend/node_modules backend-node/node_modules node_modules"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/msorokolit/manager.git"
+  }
+}
