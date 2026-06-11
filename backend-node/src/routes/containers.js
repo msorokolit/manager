@@ -414,10 +414,35 @@ function buildCreateOptions(o) {
   const restartPolicy = o.restart_policy ? { Name: o.restart_policy } : undefined;
   const extraHosts = o.extra_hosts ? Object.entries(o.extra_hosts).map(([h, ip]) => `${h}:${ip}`) : undefined;
   const ulimits = (o.ulimits || []).map((u) => ({ Name: u.name, Soft: u.soft, Hard: u.hard }));
+
+  // ---- GPU device requests ----
+  //
+  // Three input shapes, in increasing order of specificity:
+  //
+  //   gpu_device_ids: ["0", "GPU-…"]   →  Capabilities + DeviceIDs
+  //   gpus: 'all' | N                  →  Capabilities + Count (legacy)
+  //   neither                          →  no DeviceRequests entry
+  //
+  // gpu_device_ids wins when both are set — explicit > vague.
+  // gpu_capabilities defaults to ["gpu"] (the docker CLI default for
+  // `--gpus`) when not supplied; the runtime then picks the
+  // NVIDIA-style ["compute","utility"] under the hood. Operators who
+  // need NVENC/NVDEC pass ["video"] etc explicitly.
   const deviceRequests = [];
-  if (o.gpus !== undefined && o.gpus !== null && o.gpus !== '' && o.gpus !== 0) {
-    const count = String(o.gpus).toLowerCase() === 'all' || Number(o.gpus) === -1 ? -1 : Number(o.gpus);
-    deviceRequests.push({ Count: count, Capabilities: [['gpu']] });
+  const caps = (o.gpu_capabilities && o.gpu_capabilities.length)
+    ? o.gpu_capabilities
+    : ['gpu'];
+  if (Array.isArray(o.gpu_device_ids) && o.gpu_device_ids.length) {
+    deviceRequests.push({
+      Driver: '',  // empty = runtime default (nvidia when present)
+      DeviceIDs: o.gpu_device_ids.map(String),
+      Capabilities: [caps],
+    });
+  } else if (o.gpus !== undefined && o.gpus !== null && o.gpus !== '' && o.gpus !== 0) {
+    const count = String(o.gpus).toLowerCase() === 'all' || Number(o.gpus) === -1
+      ? -1
+      : Number(o.gpus);
+    deviceRequests.push({ Count: count, Capabilities: [caps] });
   }
   const endpointsConfig = {};
   if (o.network) endpointsConfig[o.network] = {};
@@ -472,6 +497,11 @@ function buildCreateOptions(o) {
       Ulimits: ulimits.length ? ulimits : undefined,
       LogConfig: logConfig,
       DeviceRequests: deviceRequests.length ? deviceRequests : undefined,
+      // Alternate OCI runtime (`nvidia`, `crun`, `kata-runtime`, …).
+      // Undefined → daemon picks DefaultRuntime (typically `runc`).
+      // The daemon validates against `docker info` runtimes; an
+      // unknown name returns 400 from the create call.
+      Runtime: o.runtime || undefined,
       NanoCpus: o.cpus != null && o.cpus !== '' ? Math.floor(Number(o.cpus) * 1_000_000_000) : undefined,
       CpuShares: o.cpu_shares != null ? Number(o.cpu_shares) : undefined,
       CpusetCpus: o.cpuset_cpus || undefined,
@@ -494,5 +524,8 @@ function buildCreateOptions(o) {
   }
   return clean(create);
 }
+
+// Visible-for-testing only.
+export const _internals = { buildCreateOptions };
 
 export default r;

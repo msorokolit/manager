@@ -97,8 +97,48 @@ export const CreateContainerRequest = Type.Object(
     pids_limit: Opt(Type.Integer()),
     shm_size: Opt(MemSize),
     ulimits: Opt(Type.Array(Ulimit)),
-    devices: Opt(Type.Array(Type.String())),
+    // Host devices to expose inside the container.
+    //
+    // Each entry is `<host>[:<container>[:<perms>]]` (perms is
+    // any combination of r / w / m; m = mknod). The regex pins it
+    // tight so a typo (forgotten slash, weird perm letter) is
+    // rejected at the API boundary instead of producing an opaque
+    // daemon error two seconds later.
+    devices: Opt(Type.Array(Type.String({
+      pattern: '^/[A-Za-z0-9._/-]+(:/[A-Za-z0-9._/-]+(:[rwm]{1,3})?)?$',
+      maxLength: 512,
+      description: 'host[:container[:perms]] — e.g. "/dev/dri:/dev/dri", "/dev/snd:/dev/snd:rw"',
+    }), { maxItems: 64 })),
+    // Legacy single-knob GPU spec. Kept for backwards compat:
+    //   gpus: 'all'    →  expose every GPU the runtime can see
+    //   gpus: N        →  expose any N GPUs (the daemon picks)
+    // For finer-grained control prefer gpu_device_ids /
+    // gpu_capabilities below — those translate to the same Docker
+    // DeviceRequests, just with explicit indices + capability set.
     gpus: Opt(Type.Union([Type.Integer(), Type.String()])),
+    // Specific GPU indices to expose. Strings (not ints) because
+    // dockerode forwards them verbatim to the runtime, and some
+    // runtimes (e.g. MIG slices on NVIDIA Hopper) use UUIDs like
+    // "GPU-fef8089b-…" rather than plain integers.
+    gpu_device_ids: Opt(Type.Array(Type.String({
+      minLength: 1, maxLength: 64,
+      pattern: '^[A-Za-z0-9_.:-]+$',
+    }), { maxItems: 64 })),
+    // GPU capabilities. NVIDIA's defaults are ["compute","utility"];
+    // common additions are "graphics" (Vulkan/OpenGL), "video"
+    // (NVENC/NVDEC), "display". Unknown values pass through — the
+    // daemon is the source of truth.
+    gpu_capabilities: Opt(Type.Array(Type.String({
+      maxLength: 32,
+      pattern: '^[a-z][a-z0-9_-]*$',
+    }), { maxItems: 16 })),
+    // Optional alternate OCI runtime (`runc` by default; `nvidia`
+    // when the NVIDIA Container Toolkit is installed; `crun` /
+    // `kata-runtime` / etc.). Validated against /system/devices
+    // runtimes client-side; server passes it straight through.
+    runtime: Opt(Type.String({ minLength: 1, maxLength: 64,
+      pattern: '^[A-Za-z0-9_.-]+$',
+    })),
 
     privileged: Opt(Type.Boolean()),
     cap_add: Opt(Type.Array(Type.String())),
