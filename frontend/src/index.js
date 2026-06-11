@@ -3810,20 +3810,82 @@ import { FitAddon } from '@xterm/addon-fit';
     restart: unless-stopped
 `;
     const wrap = document.createElement('div');
+    // We host CodeMirror inside fixed-height divs so the editor's own
+    // height: 100% rule resolves. The plain textareas fall back if the
+    // editor chunk fails to load (handled below).
     wrap.innerHTML = `
       <div class="grid gap-3">
         <label class="block"><span class="text-xs text-slate-400">Stack name *</span>
           <input id="s-name" required placeholder="my-app" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-sm"/></label>
-        <label class="block"><span class="text-xs text-slate-400">docker-compose.yml *</span>
-          <textarea id="s-compose" rows="14" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(sample)}</textarea></label>
+
+        <div>
+          <div class="mb-1 flex items-center justify-between text-xs text-slate-400">
+            <span>docker-compose.yml *</span>
+            <span class="text-[10px] text-slate-500">YAML · Ctrl+S to create · Ctrl+F to search</span>
+          </div>
+          <div id="s-compose-host" class="rounded border border-slate-700 bg-slate-950 overflow-hidden" style="height: 50vh;"></div>
+          <textarea id="s-compose-fallback" hidden>${escapeHtml(sample)}</textarea>
+        </div>
+
         <details>
           <summary class="text-xs text-slate-400 cursor-pointer">Optional .env file</summary>
-          <textarea id="s-env" rows="4" class="mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono" placeholder="KEY=value"></textarea>
+          <div id="s-env-host" class="mt-1 rounded border border-slate-700 bg-slate-950 overflow-hidden" style="height: 14vh;"></div>
+          <textarea id="s-env-fallback" hidden></textarea>
         </details>
+
         <label class="flex items-center gap-2 text-xs text-slate-300">
           <input id="s-deploy" type="checkbox" checked class="rounded border-slate-700 bg-slate-950 text-sky-500"/> Deploy immediately (docker-compose up -d)
         </label>
       </div>`;
+
+    // Lazy-mount CodeMirror after the modal is in the DOM. Same lazy
+    // chunk the volume file editor uses — no extra bundle cost.
+    let composeEditor = null;
+    let envEditor = null;
+    // Ctrl+S handler: find the primary action button (last in the
+    // action list) and click it. The modal() helper builds buttons
+    // with the action's label as textContent, so we look it up by
+    // role+text. Defined as a function so the editor wires it up once
+    // and it stays valid for the lifetime of the modal.
+    const triggerSubmit = () => {
+      const buttons = [...document.querySelectorAll('#modal-host button')];
+      // Newest modal in the stack owns the last few buttons.
+      const create = buttons.reverse().find((b) => b.textContent.trim() === 'Create');
+      if (create) create.click();
+    };
+    // setTimeout fires right after modal() attaches `wrap` to
+    // #modal-host. CodeMirror needs the host to have layout
+    // (offsetWidth > 0) before mounting, which is true after the
+    // current tick.
+    setTimeout(async () => {
+      try {
+        const cm = await import(/* webpackChunkName: "editor" */ './editor.js');
+        composeEditor = cm.mountEditor(
+          wrap.querySelector('#s-compose-host'),
+          sample,
+          { filename: 'docker-compose.yml', onSave: triggerSubmit },
+        );
+        envEditor = cm.mountEditor(
+          wrap.querySelector('#s-env-host'),
+          '',
+          { filename: '.env', onSave: triggerSubmit },
+        );
+      } catch (e) {
+        // Hard failure: reveal the textareas so the user can still
+        // create a stack from a basic editor.
+        wrap.querySelector('#s-compose-host').style.display = 'none';
+        wrap.querySelector('#s-env-host').style.display = 'none';
+        wrap.querySelector('#s-compose-fallback').hidden = false;
+        wrap.querySelector('#s-compose-fallback').rows = 14;
+        wrap.querySelector('#s-compose-fallback').className =
+          'mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono';
+        wrap.querySelector('#s-env-fallback').hidden = false;
+        wrap.querySelector('#s-env-fallback').rows = 4;
+        wrap.querySelector('#s-env-fallback').className =
+          'mt-1 w-full rounded border-slate-700 bg-slate-950 text-xs font-mono';
+      }
+    }, 0);
+
     let success = false;
     await modal({
       title: 'New stack',
@@ -3831,10 +3893,16 @@ import { FitAddon } from '@xterm/addon-fit';
       actions: [
         { label: 'Cancel', value: false, kind: 'secondary' },
         { label: 'Create', kind: 'primary', value: true, onClick: async () => {
+          const composeText = composeEditor
+            ? composeEditor.state.doc.toString()
+            : wrap.querySelector('#s-compose-fallback').value;
+          const envText = envEditor
+            ? envEditor.state.doc.toString()
+            : wrap.querySelector('#s-env-fallback').value;
           const payload = {
             name: wrap.querySelector('#s-name').value.trim(),
-            compose: wrap.querySelector('#s-compose').value,
-            env: wrap.querySelector('#s-env').value || null,
+            compose: composeText,
+            env: envText || null,
             deploy: wrap.querySelector('#s-deploy').checked,
           };
           if (!payload.name) return false;
@@ -3870,6 +3938,11 @@ import { FitAddon } from '@xterm/addon-fit';
         }},
       ],
     });
+    // Tear the editors down on every exit path (Cancel / Create /
+    // overlay-click / X). onBeforeClose only fires on the dismiss
+    // paths, so we do it here unconditionally.
+    try { composeEditor && composeEditor.destroy(); } catch {}
+    try { envEditor && envEditor.destroy(); } catch {}
     return success;
   }
 
@@ -3947,13 +4020,18 @@ import { FitAddon } from '@xterm/addon-fit';
             <div>
               <div class="mb-1 flex items-center justify-between">
                 <h4 class="text-xs uppercase tracking-wider text-slate-400">docker-compose.yml</h4>
-                <span id="s-validate-status" class="text-[11px] text-slate-500"></span>
+                <span class="flex items-center gap-2">
+                  <span class="text-[10px] text-slate-500">YAML · Ctrl+S to save · Ctrl+F to search</span>
+                  <span id="s-validate-status" class="text-[11px] text-slate-500"></span>
+                </span>
               </div>
-              <textarea id="s-compose" spellcheck="false" rows="20" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono leading-relaxed" style="tab-size:2">${escapeHtml(stack.compose || '')}</textarea>
+              <div id="s-compose-host" class="rounded border border-slate-700 bg-slate-950 overflow-hidden" style="height: 55vh;"></div>
+              <textarea id="s-compose-fallback" hidden>${escapeHtml(stack.compose || '')}</textarea>
             </div>
             <div>
               <h4 class="mb-1 text-xs uppercase tracking-wider text-slate-400">.env</h4>
-              <textarea id="s-env" spellcheck="false" rows="5" class="w-full rounded border-slate-700 bg-slate-950 text-xs font-mono">${escapeHtml(stack.env || '')}</textarea>
+              <div id="s-env-host" class="rounded border border-slate-700 bg-slate-950 overflow-hidden" style="height: 14vh;"></div>
+              <textarea id="s-env-fallback" hidden>${escapeHtml(stack.env || '')}</textarea>
             </div>
           </div>` : ''}
         <div>
@@ -3972,18 +4050,68 @@ import { FitAddon } from '@xterm/addon-fit';
         </div>
       </div>`;
 
-    // Tab inserts a real tab character in the YAML editor. Compose forbids tabs, but
-    // some users prefer them to indent — we just keep the editor predictable.
-    const ta = wrap.querySelector('#s-compose');
-    if (ta) {
-      ta.addEventListener('keydown', (e) => {
-        if (e.key === 'Tab') {
-          e.preventDefault();
-          const s = ta.selectionStart, eend = ta.selectionEnd;
-          ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(eend);
-          ta.selectionStart = ta.selectionEnd = s + 2;
+    // CodeMirror handles tab-as-indent natively (the indentWithTab key
+    // binding in editor.js), so we no longer need the textarea hack.
+    // composeEditor / envEditor are mounted via the lazy chunk just
+    // below and stay null when the chunk fails to load (in which case
+    // the fallback textareas are revealed).
+    let composeEditor = null;
+    let envEditor = null;
+
+    function readCompose() {
+      return composeEditor
+        ? composeEditor.state.doc.toString()
+        : (wrap.querySelector('#s-compose-fallback') || {}).value || '';
+    }
+    function readEnv() {
+      return envEditor
+        ? envEditor.state.doc.toString()
+        : (wrap.querySelector('#s-env-fallback') || {}).value || '';
+    }
+
+    // Find the primary save button by its label so the editor's
+    // onSave (Ctrl+S) can click it programmatically.
+    const triggerSave = () => {
+      const buttons = [...document.querySelectorAll('#modal-host button')].reverse();
+      const save = buttons.find((b) => b.textContent.trim() === 'Save changes');
+      if (save) save.click();
+    };
+
+    if (stack.managed) {
+      setTimeout(async () => {
+        try {
+          const cm = await import(/* webpackChunkName: "editor" */ './editor.js');
+          composeEditor = cm.mountEditor(
+            wrap.querySelector('#s-compose-host'),
+            stack.compose || '',
+            { filename: 'docker-compose.yml', onSave: triggerSave },
+          );
+          envEditor = cm.mountEditor(
+            wrap.querySelector('#s-env-host'),
+            stack.env || '',
+            { filename: '.env', onSave: triggerSave },
+          );
+        } catch {
+          // Hard failure — reveal the textareas as a working fallback.
+          const cHost = wrap.querySelector('#s-compose-host');
+          const eHost = wrap.querySelector('#s-env-host');
+          if (cHost) cHost.style.display = 'none';
+          if (eHost) eHost.style.display = 'none';
+          const cFb = wrap.querySelector('#s-compose-fallback');
+          const eFb = wrap.querySelector('#s-env-fallback');
+          if (cFb) {
+            cFb.hidden = false; cFb.rows = 20;
+            cFb.className = 'w-full rounded border-slate-700 bg-slate-950 text-xs font-mono leading-relaxed';
+            cFb.spellcheck = false;
+            cFb.style.tabSize = '2';
+          }
+          if (eFb) {
+            eFb.hidden = false; eFb.rows = 5;
+            eFb.className = 'w-full rounded border-slate-700 bg-slate-950 text-xs font-mono';
+            eFb.spellcheck = false;
+          }
         }
-      });
+      }, 0);
     }
 
     wrap.addEventListener('click', async (e) => {
@@ -4027,7 +4155,7 @@ import { FitAddon } from '@xterm/addon-fit';
           // First save the current text to disk so the validator sees it.
           await api(`/api/stacks/${encodeURIComponent(name)}`, {
             method: 'PUT',
-            body: JSON.stringify({ compose: ta.value, env: wrap.querySelector('#s-env').value }),
+            body: JSON.stringify({ compose: readCompose(), env: readEnv() }),
           });
           const r = await api(`/api/stacks/${encodeURIComponent(name)}/validate`, { method: 'POST' });
           if (r.ok) {
@@ -4046,17 +4174,21 @@ import { FitAddon } from '@xterm/addon-fit';
     const actions = [{ label: 'Close', value: false, kind: 'secondary' }];
     if (stack.managed) {
       actions.push({ label: 'Save changes', kind: 'primary', value: true, onClick: async () => {
-        const payload = {
-          compose: ta.value,
-          env: wrap.querySelector('#s-env').value,
-        };
+        const payload = { compose: readCompose(), env: readEnv() };
         try {
           await api(`/api/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify(payload) });
           toast('Saved (run "Up" to apply)', 'success');
         } catch (e) { toast(e.message, 'error'); return false; }
       }});
     }
-    return await modal({ title: `Stack: ${name}`, body: wrap, size: 'xl', actions }) === true;
+    const result = await modal({ title: `Stack: ${name}`, body: wrap, size: 'xl', actions });
+    // Tear the CodeMirror views down on every exit path — Save /
+    // Close / overlay-click / X all funnel through here. Avoids
+    // EditorView listener leaks when the operator opens many stack
+    // dialogs in one session.
+    try { composeEditor && composeEditor.destroy(); } catch {}
+    try { envEditor && envEditor.destroy(); } catch {}
+    return result === true;
   }
 
   // ---------- Volume file manager (Portainer-style) ----------
